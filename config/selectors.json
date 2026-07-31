@@ -1,0 +1,20 @@
+{
+    "panel": {
+        "username": "#username",
+        "amount": "#amount",
+        "remark": "textarea",
+        "submit": "#btn-submit",
+        "payment_dropdown": "select[name='payment'], #payment",
+        "currency_dropdown": "select[name='currency'], #currency",
+        "success_alert": "div.alert.alert-success"
+    },
+    "defaults": {
+        "payment": "Bank Transfer",
+        "currency": "Indonesia Rupiah"
+    },
+    "success_text": "Deposit telah disubmit",
+    "timeouts": {
+        "field_wait_ms": 8000,
+        "success_wait_ms": 15000
+    }
+}

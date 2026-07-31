@@ -1,0 +1,44 @@
+{
+    "google_credentials": "credentials/service_account.json",
+    "sqlite_path": "processed.db",
+    "panel_url": "",
+    "spreadsheet_url": "",
+    "sheet_names": {
+        "master": "MASTER",
+        "manual_bonus_reload": "MANUAL BONUS RELOAD"
+    },
+    "columns": {
+        "user_id":     2,
+        "sheet_data":  4,
+        "time_stamp":  5,
+        "true_amount": 6,
+        "tx_id":       9
+    },
+    "required_headers": {
+        "user_id":     "USER ID",
+        "sheet_data":  "SHEET DATA",
+        "time_stamp":  "TIME STAMP",
+        "true_amount": "TRUE AMOUNT",
+        "tx_id":       "TX_ID"
+    },
+    "bonus_rules": {
+        "daily_limit": 10000,
+        "tiers": [
+            { "min_deposit": 100000, "bonus": 10000 },
+            { "min_deposit": 50000,  "bonus": 5000 }
+        ]
+    },
+    "batch_size": 100,
+    "manual_reload_interval_sec": 90,
+    "polling_delay_sec": 2,
+    "monitoring_interval_sec": 10,
+    "remark": "BONUS RELOAD AUTO",
+    "browser": {
+        "headless": false,
+        "viewport": { "width": 1366, "height": 768 },
+        "user_data_dir": "browser_profile_bonus_reload"
+    },
+    "live_log_max_lines": 500,
+    "allowed_results": ["SUCCESS", "FAILED", "LIMIT", "INVALID", "MANUAL BONUS"],
+    "version": "v1.0.0"
+}

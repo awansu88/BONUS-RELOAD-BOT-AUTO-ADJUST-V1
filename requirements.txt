@@ -1,0 +1,5 @@
+PySide6==6.10.3
+playwright==1.55.0
+gspread==6.1.2
+google-auth==2.34.0
+google-auth-oauthlib==1.2.1

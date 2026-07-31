@@ -99,11 +99,43 @@ from PySide6.QtWidgets import QApplication, QMessageBox     # noqa: E402
 from core.database import DatabaseService                    # noqa: E402
 from core.diagnostics import run_diagnostics                 # noqa: E402
 from core.logger import AppLogger                            # noqa: E402
+from core.crash_state import CrashState, CrashStateStore     # noqa: E402
+from core.recovery import safe_run                           # noqa: E402
+from core.maintenance import MaintenanceService              # noqa: E402
 from ui.dashboard import Dashboard                           # noqa: E402
 
 
 CONFIG_PATH = APP_DIR / "config" / "config.json"
 SELECTORS_PATH = APP_DIR / "config" / "selectors.json"
+CRASH_STATE_PATH = APP_DIR / "runtime_state.json"
+
+
+def _install_uncaught_exception_handler(logger: AppLogger) -> None:
+    """B-6: log every un-caught exception before Python's default hook.
+
+    This never suppresses the exception — it only adds a timestamped
+    entry with module + stack trace to the app log so post-mortem
+    debugging on the operator's machine has full context.
+    """
+    original_hook = sys.excepthook
+
+    def _hook(exc_type, exc_value, exc_tb):  # type: ignore[no-untyped-def]
+        try:
+            import traceback as _tb
+
+            stack = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+            logger.error(
+                f"UNCAUGHT {exc_type.__name__}: {exc_value}"
+            )
+            logger.error(stack.rstrip())
+        except Exception:  # pragma: no cover
+            pass
+        try:
+            original_hook(exc_type, exc_value, exc_tb)
+        except Exception:  # pragma: no cover
+            pass
+
+    sys.excepthook = _hook
 
 
 def _load_json(path: Path) -> dict:
@@ -153,6 +185,21 @@ def main() -> int:
         f"| app={APP_DIR} | res={RESOURCE_DIR}"
     )
 
+    # v1.2 B-6: capture every uncaught exception before Python's default
+    # hook so post-mortem debugging always has a stack trace in the app log.
+    _install_uncaught_exception_handler(logger)
+
+    # v1.2 B-7 / B-8: crash-state store — marks the process as running,
+    # remembers the URL / window geometry across restarts.
+    crash_store = CrashStateStore(CRASH_STATE_PATH)
+    previous_state = crash_store.load()
+    crash_store.mark_dirty(version=str(config.get("version", "")))
+    if not previous_state.clean_exit and previous_state.saved_at:
+        logger.warn(
+            f"Previous session did NOT exit cleanly "
+            f"(last saved at {previous_state.saved_at}) — recovering."
+        )
+
     # -----------------------------------------------------------------
     # Startup diagnostics (BUG-014)
     # WARN-only: missing / read-only paths never stop the app.
@@ -185,13 +232,41 @@ def main() -> int:
 
     AppLogger.get().info(f"SQLite ready: {db_path.name} ({db.total_count():,} rows)")
 
+    # v1.2 C-3: automatic startup maintenance (checkpoint + optimize).
+    # Never blocking, never VACUUM, never interrupts monitoring.
+    if bool(config.get("hardening", {}).get("auto_startup_maintenance", True)):
+        maintenance_startup = MaintenanceService(
+            db=db,
+            logs_dir=APP_DIR / "logs",
+            screenshots_dir=APP_DIR / "screenshots",
+        )
+        report = safe_run(
+            maintenance_startup.startup_maintenance,
+            module="startup_maintenance",
+            recovery_action="continue without startup optimize",
+            logger=logger,
+        )
+        if report is not None:
+            for line in report.summary().splitlines():
+                logger.info(line)
+
     window = Dashboard(
         config=config, selectors=selectors,
         config_path=CONFIG_PATH, db=db,
+        app_dir=APP_DIR, resource_dir=RESOURCE_DIR,
+        credentials_path=cred_path,
+        crash_store=crash_store, previous_state=previous_state,
     )
     window.show()
     exit_code = app.exec()
     db.close()
+
+    # v1.2 B-7: graceful shutdown checkpoint. Flushing the crash-state
+    # file is what tells the NEXT launch this was a clean exit.
+    try:
+        crash_store.mark_clean_exit()
+    except Exception:
+        pass
     return exit_code
 
 

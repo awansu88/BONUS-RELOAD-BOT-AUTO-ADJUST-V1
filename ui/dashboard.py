@@ -57,6 +57,10 @@ from core.panel_service import PanelService
 from core.queue_manager import QueueItem, QueueManager
 from core.sheet_service import SheetService
 from core.validator import Validator
+from core.recovery import RetryExhausted, retry_with_ladder, safe_run
+from core.health import HealthMonitor, LeakThresholds
+from core.maintenance import MaintenanceService
+from core.crash_state import CrashState, CrashStateStore
 
 
 # -------------------------------------------------------------------- theme
@@ -459,7 +463,12 @@ class Dashboard(QMainWindow):
     log_line = Signal(str)
 
     def __init__(self, config: dict, selectors: dict, config_path: Path,
-                 db: DatabaseService) -> None:
+                 db: DatabaseService,
+                 app_dir: Optional[Path] = None,
+                 resource_dir: Optional[Path] = None,
+                 credentials_path: Optional[Path] = None,
+                 crash_store: Optional[CrashStateStore] = None,
+                 previous_state: Optional[CrashState] = None) -> None:
         super().__init__()
         self.setWindowTitle("Bonus Reload Automation")
         self.resize(1280, 780)
@@ -468,6 +477,19 @@ class Dashboard(QMainWindow):
         self.config = config
         self.selectors = selectors
         self.config_path = config_path
+
+        # v1.2 hardening plumbing (optional so existing tests that
+        # construct Dashboard(config, selectors, config_path, db) keep
+        # passing without changes).
+        self.app_dir: Path = Path(app_dir) if app_dir else Path.cwd()
+        self.resource_dir: Path = Path(resource_dir) if resource_dir else self.app_dir
+        self.credentials_path: Path = (
+            Path(credentials_path)
+            if credentials_path
+            else self.app_dir / config.get("google_credentials", "credentials/service_account.json")
+        )
+        self.crash_store: Optional[CrashStateStore] = crash_store
+        self.previous_state: Optional[CrashState] = previous_state
 
         self.logger = AppLogger.get()
         self.logger.add_listener(lambda line: self.log_line.emit(line))
@@ -524,8 +546,156 @@ class Dashboard(QMainWindow):
         self.metrics_timer.setInterval(1000)
         self.metrics_timer.timeout.connect(self._refresh_metrics)
 
+        # v1.2 hardening infrastructure ----------------------------------
+        hardening_cfg = self.config.get("hardening", {}) or {}
+        retry_ladder = tuple(
+            int(x) for x in hardening_cfg.get("google_retry_ladder_sec", [5, 10, 20, 40, 60])
+        )
+        self._retry_ladder: tuple = retry_ladder
+
+        # Maintenance service — shared with MaintenanceCenter dialog.
+        self.maintenance_service = MaintenanceService(
+            db=self.db,
+            logs_dir=self.app_dir / "logs",
+            screenshots_dir=self.app_dir / "screenshots",
+        )
+
+        # Health monitor. Callables read live state from `self`; the
+        # monitor itself never mutates anything.
+        thresholds_cfg = hardening_cfg.get("leak_thresholds", {}) or {}
+        self.health_monitor = HealthMonitor(
+            db_probe=lambda: self.db.is_open(),
+            google_probe=lambda: self.sheet.is_connected,
+            panel_probe=lambda: 1 if self.panel.is_alive() else 0,
+            worker_state_probe=lambda: self.state,
+            queue_size_probe=lambda: self.queue.ready_count() if self.queue else 0,
+            qtimer_count_probe=self._count_active_qtimers,
+            thresholds=LeakThresholds(
+                memory_mb_max=float(thresholds_cfg.get("memory_mb_max", 800)),
+                thread_count_max=int(thresholds_cfg.get("thread_count_max", 60)),
+                handle_count_max=int(thresholds_cfg.get("handle_count_max", 800)),
+                browser_contexts_max=int(thresholds_cfg.get("browser_contexts_max", 1)),
+                qtimer_count_max=int(thresholds_cfg.get("qtimer_count_max", 20)),
+            ),
+        )
+
+        # Watchdog QTimer (B-3, B-5). Runs on the Qt event loop — no
+        # background thread.
+        self.watchdog_timer = QTimer(self)
+        watchdog_interval = int(hardening_cfg.get("watchdog_interval_sec", 30)) * 1000
+        self.watchdog_timer.setInterval(max(5_000, watchdog_interval))
+        self.watchdog_timer.timeout.connect(self._watchdog_tick)
+        self.watchdog_timer.start()
+        self._last_watchdog_warnings: list[str] = []
+
+        self._auto_recover_panel: bool = bool(hardening_cfg.get("auto_recover_panel", True))
+
         self._build_ui()
         self._refresh_stats()
+        # v1.2 B-8: restore last URL / window geometry.
+        self._restore_previous_state()
+
+    # ---------------------------------------------------------------- v1.2 helpers
+    def _count_active_qtimers(self) -> int:
+        """Count QTimer instances owned by this window. Cheap; no reflection."""
+        return sum(
+            1 for name in dir(self)
+            if isinstance(getattr(self, name, None), QTimer)
+        )
+
+    def _watchdog_tick(self) -> None:
+        """Category B watchdog step (B-3, B-5). Never raises, logs warnings
+        only on state changes to keep the log clean."""
+        snap = safe_run(
+            self.health_monitor.snapshot,
+            module="watchdog",
+            recovery_action="skip snapshot",
+            logger=self.logger,
+        )
+        if snap is None:
+            return
+        # De-dup warnings so a stable condition doesn't spam the log.
+        new_warnings = [w for w in snap.warnings if w not in self._last_watchdog_warnings]
+        for w in new_warnings:
+            self.logger.warn(f"Watchdog: {w}")
+        if not snap.warnings and self._last_watchdog_warnings:
+            self.logger.info("Watchdog: all metrics back within thresholds")
+        self._last_watchdog_warnings = list(snap.warnings)
+
+        # B-2 auto-recover: panel was previously attached but is now
+        # dead; try one gentle reopen using the persistent profile so
+        # cookies survive.
+        if (
+            self._auto_recover_panel
+            and self._panel_was_open
+            and not self.panel.is_alive()
+            and self.state in ("running", "monitoring")
+        ):
+            self._attempt_panel_recovery()
+
+    def _attempt_panel_recovery(self) -> None:
+        """B-2 — one attempt per watchdog tick to bring the browser back."""
+        url = self.config.get("panel_url", "").strip()
+        if not url:
+            return
+        self.logger.warn("Panel appears dead — attempting auto-recovery")
+        try:
+            self.panel.open_panel(url)
+            # Re-attach so submit_deposit works again.
+            self.panel.attach()
+            self._set_dot(self.dot_panel, "ok")
+            self.txt_panel.setText("Recovered")
+            self._panel_was_open = True
+            self.logger.info("Panel auto-recovered (persistent profile reused)")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(f"Panel auto-recovery failed: {exc}")
+
+    def _restore_previous_state(self) -> None:
+        """B-8: reinstate the last spreadsheet URL / window geometry
+        after a clean or crash exit. Never automatically presses
+        CONNECT SHEET — that stays operator-driven."""
+        prev = self.previous_state
+        if not prev:
+            return
+        try:
+            if prev.spreadsheet_url and not self.url_input.text().strip():
+                self.url_input.setText(prev.spreadsheet_url)
+            if prev.window_geometry:
+                try:
+                    self.restoreGeometry(bytes.fromhex(prev.window_geometry))
+                except Exception:
+                    pass
+            if prev.window_state:
+                try:
+                    self.restoreState(bytes.fromhex(prev.window_state))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _persist_crash_state(self, *, clean_exit: bool) -> None:
+        if not self.crash_store:
+            return
+        try:
+            geom = self.saveGeometry().toHex().data().decode()
+        except Exception:
+            geom = ""
+        try:
+            state_bytes = self.saveState().toHex().data().decode()
+        except Exception:
+            state_bytes = ""
+        overrides = dict(
+            version=str(self.config.get("version", "")),
+            spreadsheet_url=self.url_input.text().strip() if hasattr(self, "url_input") else "",
+            monitoring_active=self.state == "monitoring",
+            window_geometry=geom,
+            window_state=state_bytes,
+            last_panel_url=self.config.get("panel_url", ""),
+        )
+        if clean_exit:
+            self.crash_store.mark_clean_exit(**overrides)
+        else:
+            self.crash_store.mark_dirty(**overrides)
 
     # ---------------------------------------------------------------- build
     def _build_ui(self) -> None:
@@ -560,12 +730,17 @@ class Dashboard(QMainWindow):
         db_btn.setObjectName("database-btn")
         db_btn.clicked.connect(self._open_database)
 
+        maint_btn = QPushButton("MAINTENANCE")
+        maint_btn.setObjectName("maintenance-btn")
+        maint_btn.clicked.connect(self._open_maintenance_center)
+
         top.addWidget(title)
         top.addWidget(subtitle)
         top.addStretch(1)
         top.addWidget(self.top_sync)
         top.addWidget(self.top_version)
         top.addWidget(db_btn)
+        top.addWidget(maint_btn)
         top.addWidget(settings_btn)
         root.addLayout(top)
 
@@ -1012,13 +1187,34 @@ class Dashboard(QMainWindow):
         if not url:
             QMessageBox.warning(self, "Missing URL", "Paste the Google Spreadsheet URL first.")
             return
-        info = self.sheet.connect(url)
-        if not info.ok:
+
+        # v1.2 B-1: wrap the initial connect in the retry ladder so a
+        # transient Google outage no longer forces the operator to click
+        # CONNECT SHEET again. Each retry emits a WARN with the delay.
+        def _do_connect():
+            info = self.sheet.connect(url)
+            if not info.ok:
+                # Raise so the ladder retries. `RuntimeError` is caught
+                # by the ladder's default `retry_on=(Exception,)`.
+                raise RuntimeError(info.error or "Connection failed")
+            return info
+
+        def _on_retry(attempt: int, delay: int, exc: BaseException) -> None:
+            self.logger.warn(
+                f"Google connect attempt {attempt} failed ({exc}); retrying in {delay}s"
+            )
+
+        try:
+            info = retry_with_ladder(
+                _do_connect,
+                ladder=self._retry_ladder,
+                on_retry=_on_retry,
+            )
+        except RetryExhausted as exc:
             self._set_dot(self.dot_sheet, "err")
             self.txt_sheet.setText("Error")
-            self.logger.error(f"Connect failed: {info.error}")
-            QMessageBox.critical(self, "Connection failed", info.error)
-            # Ensure START stays disabled when validation fails.
+            self.logger.error(f"Connect failed after retry ladder: {exc.last_error}")
+            QMessageBox.critical(self, "Connection failed", str(exc.last_error))
             self.btn_start.setEnabled(False)
             self.btn_refresh.setEnabled(False)
             self.btn_preview.setEnabled(False)
@@ -1571,6 +1767,30 @@ class Dashboard(QMainWindow):
         dlg = DatabaseDialog(self.db, worker_running=running, parent=self)
         dlg.exec()
 
+    def _open_maintenance_center(self) -> None:
+        """v1.2 C-1 entry-point."""
+        # Local import to avoid a circular import at module load time
+        # (ui.maintenance_center imports from core.* only).
+        from ui.maintenance_center import MaintenanceCenter
+
+        running = self.state in ("running", "monitoring", "stopping")
+        dlg = MaintenanceCenter(
+            parent=self,
+            maintenance=self.maintenance_service,
+            health=self.health_monitor,
+            worker_running=running,
+            app_dir=self.app_dir,
+            resource_dir=self.resource_dir,
+            config_path=self.config_path,
+            selectors_path=self.app_dir / "config" / "selectors.json",
+            credentials_path=self.credentials_path,
+            sqlite_path=Path(str(self.db.path)),
+            browser_profile_dir=Path(self.config.get("browser", {}).get("user_data_dir", "browser_profile_bonus_reload")),
+            logs_dir=self.app_dir / "logs",
+            screenshots_dir=self.app_dir / "screenshots",
+        )
+        dlg.exec()
+
     def _export_log(self, fmt: str) -> None:
         lines = self.logger.buffer()
         if not lines:
@@ -1600,12 +1820,36 @@ class Dashboard(QMainWindow):
 
     # =============================================================
     def closeEvent(self, event) -> None:
-        self.manual_timer.stop()
-        self.worker_timer.stop()
-        self.panel_timer.stop()
-        self.metrics_timer.stop()
+        # v1.2 B-7: graceful shutdown checklist.
+        # Stop timers first so nothing races us.
+        for name in (
+            "manual_timer", "worker_timer", "panel_timer",
+            "metrics_timer", "watchdog_timer",
+        ):
+            t = getattr(self, name, None)
+            if isinstance(t, QTimer):
+                try:
+                    t.stop()
+                except Exception:
+                    pass
+
+        # Checkpoint WAL so a hard OS shutdown after this cannot leave a
+        # partially-written journal.
+        try:
+            self.db.checkpoint_wal("FULL")
+        except Exception:
+            pass
+
+        # Close browser.
         try:
             self.panel.close()
         except Exception:
             pass
+
+        # Persist current URL / window geometry as a clean-exit snapshot.
+        try:
+            self._persist_crash_state(clean_exit=True)
+        except Exception:
+            pass
+
         super().closeEvent(event)

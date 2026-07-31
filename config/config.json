@@ -40,5 +40,20 @@
     },
     "live_log_max_lines": 500,
     "allowed_results": ["SUCCESS", "FAILED", "LIMIT", "INVALID", "MANUAL BONUS"],
-    "version": "v1.0.0"
+    "hardening": {
+        "google_retry_ladder_sec": [5, 10, 20, 40, 60],
+        "watchdog_interval_sec": 30,
+        "screenshot_retention_days": 14,
+        "log_retention_days": 30,
+        "auto_startup_maintenance": true,
+        "auto_recover_panel": true,
+        "leak_thresholds": {
+            "memory_mb_max": 800,
+            "thread_count_max": 60,
+            "handle_count_max": 800,
+            "browser_contexts_max": 1,
+            "qtimer_count_max": 20
+        }
+    },
+    "version": "v1.2.0"
 }

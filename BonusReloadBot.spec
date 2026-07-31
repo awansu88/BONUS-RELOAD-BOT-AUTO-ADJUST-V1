@@ -62,13 +62,21 @@ hiddenimports = [
     "core.validator",
     "core.panel_service",
     "core.logger",
+    # v1.2 production-hardening modules
+    "core.recovery",
+    "core.health",
+    "core.maintenance",
+    "core.config_validator",
+    "core.crash_state",
     "ui.dashboard",
+    "ui.maintenance_center",
     "gspread",
     "google.auth",
     "google.oauth2.service_account",
     "playwright",
     "playwright.sync_api",
     "playwright._impl",
+    "psutil",
 ]
 
 

@@ -325,3 +325,41 @@ class DatabaseService:
             self._conn.close()
         except Exception:
             pass
+
+    # ---------------------------------------------------------------- v1.2 helpers
+    # Additive safe helpers used by the Maintenance Center + Health
+    # Watchdog (Production Hardening v1.2). They wrap the SAME connection
+    # already used by the engine — no new connection is opened.
+    def checkpoint_wal(self, mode: str = "PASSIVE") -> None:
+        """Run PRAGMA wal_checkpoint(<mode>). Never raises."""
+        try:
+            self._conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchall()
+        except Exception:
+            pass
+
+    def integrity_check(self) -> str:
+        """Return the raw result of PRAGMA integrity_check (typically 'ok')."""
+        rows = self._conn.execute("PRAGMA integrity_check").fetchall()
+        return "; ".join(str(r[0]) for r in rows)
+
+    def optimize(self) -> None:
+        """PRAGMA optimize + update statistics. Never raises."""
+        try:
+            self._conn.execute("PRAGMA optimize").fetchall()
+        except Exception:
+            pass
+
+    def count_older_than(self, days: int) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM processed_transactions "
+            "WHERE date(processed_at) < date('now', 'localtime', ?)",
+            (f"-{int(days)} days",),
+        ).fetchone()
+        return int(row[0] if row else 0)
+
+    def is_open(self) -> bool:
+        try:
+            self._conn.execute("SELECT 1").fetchone()
+            return True
+        except Exception:
+            return False

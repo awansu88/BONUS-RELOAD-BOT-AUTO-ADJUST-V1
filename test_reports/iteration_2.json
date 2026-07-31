@@ -1,0 +1,18 @@
+{
+  "summary": "BUG-016 verification: shell-level reproduction of clean-clone flow. Copied /app/repo -> /tmp/verify, removed node_modules/yarn.lock/package-lock.json, ran `npm install` (exit 0, no ERESOLVE, no --force, no --legacy-peer-deps, 1493 packages added in 49s), then `CI=true npm run build` (Compiled successfully.), then `npm ls | grep -iE 'peer|invalid'` (0 matching lines), then `python -m pytest tests/` in /app/repo (32 passed, 1 skipped - matches iteration_1 baseline). Verified package.json pins react-day-picker@9.14.0 and date-fns@4.1.0 (unchanged). Verified /app/repo/frontend/package-lock.json exists (769KB, 20441 lines) and pins react-day-picker@9.14.0. frontend/ directory still contains src/, package.json, package-lock.json, craco.config.js, tailwind.config.js. All 7 acceptance criteria PASS.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": ["/app/test_reports/iteration_1.json"],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "npm audit reports 75 vulnerabilities (6 low, 5 moderate, 64 high) — all inherited from react-scripts@5.0.1 toolchain (nth-check, postcss@7, svgo@1). Per review-request scope note, these are explicitly out-of-scope for BUG-016 and would violate smallest-compatible-change constraint. Documented, not blocking.",
+    "Numerous deprecation warnings during install (Q, glob@7, eslint@8.57.1, svgo@1, workbox-*, uuid@8, sourcemap-codec) — all transitive via react-scripts@5.0.1. Out of scope."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (32/32 pytest passed, 1 documented skip)", "frontend": "N/A (frontend testing skipped per request; shell-level install+build verification = 100%)"},
+  "seed_data_creation": "None",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "BUG-016 (react-day-picker peer-dep conflict with react@19 and date-fns@4) is fully resolved via bump to react-day-picker@9.14.0 + calendar.jsx v9 API migration. Fresh `npm install` on clean copy succeeds without any peer-dep flags. Do NOT flag the 75 npm audit findings — they are pre-existing react-scripts@5.0.1 toolchain issues, explicitly out of scope. If a future iteration needs to address them, it would require ejecting from CRA or migrating to Vite. Python regression suite is stable at 32 passed / 1 skipped (PySide6 skip is environmental).",
+  "rca of the issue": "Root cause: package.json pinned react-day-picker@8.10.1, which declares peer deps `react ^16-18` and `date-fns ^2.28.0 || ^3.0.0`. But the app uses react@19.0.0 and date-fns@4.1.0, producing two simultaneous ERESOLVE errors on any fresh `npm install`. Fix: bumped react-day-picker to 9.14.0 (which accepts React 19 and consumes date-fns v4 as a DIRECT dependency instead of a peer). Migrated the sole consumer (frontend/src/components/ui/calendar.jsx) from v8's `IconLeft`/`IconRight` + old classNames to v9's `Chevron` slot + new classNames (month_caption, button_previous, button_next, day_button, weekdays, weekday, week, month_grid, selected, today, outside, range_middle, range_start, range_end, hidden, disabled). No other package versions touched. package-lock.json regenerated. Verification confirmed on clean copy: install + build + peer-check + pytest all green."
+}

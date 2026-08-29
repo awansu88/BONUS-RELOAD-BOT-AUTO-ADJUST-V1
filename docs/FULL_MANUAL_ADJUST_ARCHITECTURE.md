@@ -275,8 +275,9 @@ but dedicated tables and repository methods. Do not add mode columns or rows to
 `processed_transactions`. Enable foreign keys for the repository connection
 and perform snapshot/transition writes in explicit transactions.
 
-Three tables are required because preserving *all* duplicate/invalid source
-rows conflicts with having exactly one executable row per username:
+Four tables are required because preserving *all* duplicate/invalid source
+rows conflicts with having exactly one executable row per username, while
+financial retries require a permanent record for every attempt:
 
 ```sql
 CREATE TABLE manual_adjust_cycles (
@@ -334,30 +335,55 @@ CREATE TABLE manual_adjust_transactions (
     status              TEXT NOT NULL CHECK(status IN
       ('PENDING','SUBMITTING','SUCCESS','FAILED_NOT_SUBMITTED','UNKNOWN','CANCELLED')),
     attempt_count       INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
-    attempt_id          TEXT,
-    claimed_at          TEXT,
-    submit_clicked_at   TEXT,
+    current_attempt_id  TEXT REFERENCES manual_adjust_attempts(attempt_id),
     processed_at        TEXT,
-    error_detail        TEXT,
-    evidence_detail     TEXT,
     reconciled_at       TEXT,
     reconciled_by       TEXT,
     resolution_note     TEXT NOT NULL DEFAULT '',
     UNIQUE(cycle_id, username_key)
 );
 
+CREATE TABLE manual_adjust_attempts (
+    attempt_id          TEXT PRIMARY KEY,
+    transaction_id     INTEGER NOT NULL
+                         REFERENCES manual_adjust_transactions(transaction_id),
+    attempt_no          INTEGER NOT NULL CHECK(attempt_no > 0),
+    executor_id         TEXT NOT NULL,
+    claimed_at          TEXT NOT NULL,
+    submit_started_at   TEXT,
+    submit_clicked_at   TEXT,
+    finished_at         TEXT,
+    result              TEXT NOT NULL CHECK(result IN
+      ('IN_PROGRESS','SUCCESS','FAILED_NOT_SUBMITTED','UNKNOWN')),
+    click_crossed       INTEGER CHECK(click_crossed IN (0,1)),
+    submission_phase    TEXT NOT NULL,
+    error_detail        TEXT,
+    evidence_detail     TEXT,
+    created_at          TEXT NOT NULL,
+    UNIQUE(transaction_id, attempt_no)
+);
+
 CREATE INDEX idx_manual_cycle_status
     ON manual_adjust_transactions(cycle_id, status, source_row_id);
 CREATE INDEX idx_manual_source_class
     ON manual_adjust_source_rows(cycle_id, classification, source_row);
+CREATE INDEX idx_manual_attempt_transaction
+    ON manual_adjust_attempts(transaction_id, attempt_no);
 ```
 
 The unique executable constraint is the final per-cycle duplicate barrier.
-Source rows retain duplicates/invalids for audit. Counts should normally be
-derived in queries; cached cycle aggregates are updated in the same transaction
-and verified before confirmation/completion. Store money as SQLite INTEGER and
-reject values above the application's explicitly tested safe maximum (at most
-signed 64-bit); never use float.
+Source rows retain duplicates/invalids for audit. Every claim inserts a new
+`manual_adjust_attempts` row; a retry increments `attempt_count` and creates the
+next `attempt_no` instead of reusing or overwriting earlier evidence. Attempt
+rows are permanent: they are never deleted or reused, and after an attempt is
+finished its result, phase, timestamps, error and evidence are immutable. The
+only permitted update is monotonic completion of that attempt's own
+`IN_PROGRESS` record. Repository APIs must reject changes to any finished or
+older attempt. Counts should normally be derived in queries; cached cycle
+aggregates are updated in the same transaction and verified before
+confirmation/completion. Store money as SQLite INTEGER and reject values above
+the application's explicitly tested safe maximum (at most signed 64-bit); never
+use float.
 
 Schema installation must be additive and versioned in a dedicated migration
 record (for example `_meta.manual_adjust_schema_version`). `CREATE TABLE/INDEX
@@ -396,7 +422,9 @@ IF NOT EXISTS` must not modify or backfill `processed_transactions`.
 ### 6.2 Transaction states
 
 - `PENDING -> SUBMITTING`: atomic durable claim immediately before panel work;
-  assigns attempt ID, increments attempt count, commits before form submission.
+  increments attempt count, inserts a new permanent attempt row with a unique
+  attempt ID/number and `IN_PROGRESS`, sets `current_attempt_id`, and commits
+  all of this before form submission. Only PENDING can be claimed.
 - `SUBMITTING -> SUCCESS`: explicit site success observed and result committed.
 - `SUBMITTING -> FAILED_NOT_SUBMITTED`: failure is proven to have occurred
   before submit click (browser unavailable, field validation/navigation failure).
@@ -435,10 +463,12 @@ exception where phase cannot be durably established resolves to UNKNOWN.
 4. **Database:** `UNIQUE(cycle_id, username_key)` is authoritative and survives
    process loss. No `INSERT OR REPLACE`; first insert wins.
 5. **Immediately pre-submit:** in one `BEGIN IMMEDIATE` transaction, verify
-   cycle ownership/state, transaction PENDING (or explicitly retried terminal
-   failure), absence of another nonterminal operation for the same key, and
-   atomically change it to SUBMITTING. Only the row returned by this claim may
-   reach the panel.
+   cycle ownership/state, require the transaction to be exactly PENDING, verify
+   absence of another nonterminal operation for the same key, create a new
+   attempt record, and atomically change it to SUBMITTING. An explicitly retried
+   FAILED_NOT_SUBMITTED row must first become PENDING through FAILURE_REVIEW;
+   there is no direct terminal-failure bypass. Only the row returned by this
+   claim may reach the panel.
 6. **Cross cycle:** cycle ID is part of the unique key, so the same normalized
    username is intentionally allowed once in a different cycle.
 
@@ -454,12 +484,14 @@ Therefore local code alone cannot prove the result if power is lost between the
 remote acceptance and the local SUCCESS commit. The safe containment policy is
 **never automatically retry an attempt that might have crossed submit**.
 
-Before touching the panel, commit SUBMITTING with a unique attempt ID. The
-manual panel path records its phase in memory and, where possible, commits
-`submit_clicked_at` immediately before clicking. This timestamp improves the
-audit trail but cannot eliminate the micro-window between click and DB write.
-Thus *every stale SUBMITTING*, with or without `submit_clicked_at`, becomes
-UNKNOWN at recovery, never PENDING/FAILED.
+Before touching the panel, atomically commit SUBMITTING and a new IN_PROGRESS
+attempt row with a unique attempt ID. The manual panel path advances that
+attempt's phase and, where possible, records `submit_clicked_at` immediately
+before clicking. This timestamp improves the audit trail but cannot eliminate
+the micro-window between click and DB write. Thus *every stale SUBMITTING*, with
+or without `submit_clicked_at`, becomes UNKNOWN at recovery, and its current
+attempt is monotonically finished as UNKNOWN. It never becomes PENDING/FAILED.
+All prior finished attempts remain unchanged and available for reconciliation.
 
 If the site provides an authoritative transaction history, search it using the
 username, exact amount, dedicated manual remark, attempt/cycle correlation text
@@ -485,9 +517,12 @@ must assume neither until integration testing proves it.
 
 At startup, acquire a single-instance/executor lock and inspect nonterminal
 cycles. A cycle whose lease is stale changes to REVIEW_REQUIRED if any row is
-SUBMITTING; those rows become UNKNOWN in one transaction. Untouched PENDING
-rows remain safe, SUCCESS remains immutable, and definite failures remain
-terminal.
+SUBMITTING; those rows and their current IN_PROGRESS attempts become UNKNOWN in
+one transaction. Recovery validates that attempt numbers are contiguous,
+`attempt_count` matches history, and no transaction has multiple IN_PROGRESS
+attempts. It never edits a finished earlier attempt. Untouched PENDING rows
+remain safe, SUCCESS remains immutable, and definite failures remain available
+for the FAILURE_REVIEW decision.
 
 Incomplete cycles are **selectively resumable**, never blindly resumable:
 
@@ -596,6 +631,11 @@ staging panel and the complete frozen AUTO suite passes.
 - Direct concurrent/hostile duplicate inserts fail at UNIQUE constraint.
 - Same user once in two different cycles is allowed.
 - Snapshot transaction rollback leaves no partial executable cycle.
+- Each PENDING claim atomically creates exactly one new attempt with the next
+  attempt number; explicit retry preserves every field of all earlier attempts.
+- Finished attempt rows cannot be updated or deleted through repository APIs;
+  attempt-count/history mismatches and multiple IN_PROGRESS attempts are
+  detected and stop execution for review.
 - Migration on fresh and existing v1.2 DB; repeat migration idempotence; AUTO
   table schema/data/query plans/results unchanged.
 
@@ -631,7 +671,8 @@ errors at every transition and UI freeze/forced close.
 Expected invariants: untouched stays PENDING; committed SUCCESS never retries;
 every stale SUBMITTING becomes UNKNOWN; no UNKNOWN automatically retries;
 review evidence is mandatory; resume uses persisted snapshot; DB failure after
-remote success stops new submissions.
+remote success stops new submissions; every retry has a new attempt ID/number;
+and completed evidence from prior attempts remains byte-for-byte unchanged.
 
 ### 11.6 Scale and endurance
 
@@ -658,6 +699,9 @@ stop, browser recovery, maintenance and portable restart.
   from post-click failures. Manual cannot reuse its coarse result contract.
 - **Concurrent execution:** two application instances could double-adjust
   without an executor lease/DB claim. Single-cycle ownership is mandatory.
+- **Attempt-evidence loss:** reusing transaction-level attempt fields could
+  overwrite the reason and click phase of an earlier try. Dedicated permanent
+  attempt rows, monotonic completion and immutability tests are mandatory.
 - **Mode leakage:** reusing Dashboard worker/monitoring state could reread the
   sheet or apply Validator. Separate controller/queue/timer is mandatory.
 
@@ -690,7 +734,7 @@ stop, browser recovery, maintenance and portable restart.
    including source-order assertions around Dashboard final validation.
 2. Add manual status models, strict raw parser and normalization unit tests.
 3. Add isolated repository/schema migration, constraints, transactional
-   snapshot API and migration compatibility tests.
+   snapshot API, append-only attempt history and migration compatibility tests.
 4. Add one-shot loader and immutable persisted preview; test validation,
    duplicates, totals, cross-cycle behavior and scale. No panel integration.
 5. Add finite ManualAdjustQueue reading only persisted PENDING rows; prove zero
@@ -737,10 +781,12 @@ stop, browser recovery, maintenance and portable restart.
 7. **Snapshot location:** all rows and executable winners in dedicated SQLite
    Manual tables, atomically committed before preview.
 8. **Duplicate layers:** normalized seen-map at load; queue from persisted
-   winners only; UNIQUE cycle/key; atomic state/ownership claim immediately
-   before submission.
-9. **Crash survival:** durable rows, unique constraint and SUBMITTING claim are
-   committed before panel work; recovery never rebuilds from RAM/sheet.
+   winners only; UNIQUE cycle/key; an exactly-PENDING-only atomic claim that
+   creates a new attempt immediately before submission. A selected failure must
+   first return to PENDING through FAILURE_REVIEW.
+9. **Crash survival:** durable rows, unique constraint, SUBMITTING claim and new
+   attempt record are committed before panel work; recovery never rebuilds from
+   RAM/sheet and never overwrites finished attempt evidence.
 10. **No AUTO amount contamination:** no Manual rows in
     `processed_transactions`; no calls to AUTO daily queries/cache/Validator.
 11. **Panel reuse:** yes, browser and selectors can be shared through a new
@@ -755,11 +801,13 @@ stop, browser recovery, maintenance and portable restart.
     explicitly finalizes the cycle with those failures.
 15. **Certainty classification:** committed/reconciled evidence = SUCCESS;
     proven pre-click/authoritative negative = definitely not submitted; any
-    crossed-or-uncertain click boundary = UNKNOWN.
-16. **Protective model:** cycle/source/executable tables, unique cycle/key,
-    immutable SUCCESS, durable PENDING -> SUBMITTING claim, distinct
+    crossed-or-uncertain click boundary = UNKNOWN. The complete evidence and
+    phase for each try remains in its own permanent attempt row.
+16. **Protective model:** cycle/source/executable/attempt tables, unique
+    cycle/key and transaction/attempt-number constraints, immutable SUCCESS,
+    durable PENDING -> SUBMITTING plus new-attempt claim, distinct
     FAILED_NOT_SUBMITTED and UNKNOWN, FAILURE_REVIEW retry-or-finalize decision,
-    and ownership/attempt/evidence fields.
+    and immutable finished attempt evidence.
 17. **UI switch:** mutually exclusive coordinator; switching only at idle safe
     boundary; separate controllers/timers/models; no automatic resume/refill.
 18. **Tests before money:** all loader, duplicate, cycle, execution,

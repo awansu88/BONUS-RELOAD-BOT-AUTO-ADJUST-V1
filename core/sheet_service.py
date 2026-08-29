@@ -24,6 +24,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
+from .manual_adjust_models import RawManualAdjustRow
+
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
@@ -214,6 +216,28 @@ class SheetService:
                 if uid:
                     out.add(uid)
         return out
+
+    def read_manual_adjust_snapshot(self) -> List[RawManualAdjustRow]:
+        """Bulk-read raw MASTER B/F/I values once for Manual Adjust.
+
+        Unlike the frozen AUTO reader, this preserves blank TX_ID and performs
+        no amount conversion or business filtering.
+        """
+        if not self._master:
+            raise RuntimeError("Not connected")
+        values = self._master.get_all_values()
+        rows: List[RawManualAdjustRow] = []
+        for idx, row in enumerate(values[1:], start=2):
+            def cell(col_index: int) -> str:
+                i = col_index - 1
+                return row[i] if 0 <= i < len(row) else ""
+            rows.append(RawManualAdjustRow(
+                source_row=idx,
+                username_raw=cell(self.cols["user_id"]),
+                amount_raw=cell(self.cols["true_amount"]),
+                source_tx_id=cell(self.cols["tx_id"]),
+            ))
+        return rows
 
     # ---------------------------------------------------------------- helpers
     @staticmethod

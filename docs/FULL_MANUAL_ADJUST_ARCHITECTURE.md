@@ -223,8 +223,8 @@ Proposed new modules:
    newly allocated cycle in a single SQLite transaction. The immutable source
    provenance includes spreadsheet ID, tab, load timestamp and row number.
 3. Loader computes `username = raw.strip()` and
-   `username_key = username.casefold()` (which is at least as strong as required
-   `lower()`), and parses F after removing comma and ordinary whitespace. Only
+   `username_key = username.lower()`, and parses F after removing comma and
+   ordinary whitespace. Only
    a syntactically integral value >0 is valid. It does not accept truncating
    decimals and applies no AUTO rule.
 4. Every source row is persisted. The first occurrence of each non-empty
@@ -248,9 +248,12 @@ Proposed new modules:
    becomes `UNKNOWN` and is never automatically retried. Other users continue
    unless the browser/session is unavailable, in which case the controller
    safely stops the cycle without converting untouched PENDING rows.
-9. When no PENDING/claimed operation remains, a cycle with no UNKNOWN becomes
-   `COMPLETED` (failures may still exist); any UNKNOWN makes it
-   `REVIEW_REQUIRED`. Worker becomes STOP/IDLE. No sheet reread and no refill.
+9. When no PENDING/claimed operation remains, any UNKNOWN makes the cycle
+   `REVIEW_REQUIRED`; otherwise, any `FAILED_NOT_SUBMITTED` makes it
+   `FAILURE_REVIEW`. Only a cycle with neither condition becomes `COMPLETED`.
+   In `FAILURE_REVIEW`, the operator either selects definitely-not-submitted
+   rows for an explicit retry or explicitly finalizes the cycle with those
+   failures. Worker becomes STOP/IDLE. No sheet reread and no refill.
 
 TRUE AMOUNT is passed 1:1. Manual never invokes tier conversion, thresholds,
 daily cap, current bonus queries, MANUAL BONUS exclusion, or `Validator`.
@@ -279,7 +282,7 @@ rows conflicts with having exactly one executable row per username:
 CREATE TABLE manual_adjust_cycles (
     cycle_id            TEXT PRIMARY KEY,
     status              TEXT NOT NULL CHECK (status IN
-      ('LOADING','PREVIEW','RUNNING','STOPPED','REVIEW_REQUIRED','COMPLETED','CANCELLED')),
+      ('LOADING','PREVIEW','RUNNING','STOPPED','FAILURE_REVIEW','REVIEW_REQUIRED','COMPLETED','CANCELLED')),
     spreadsheet_id      TEXT NOT NULL,
     sheet_name          TEXT NOT NULL,
     snapshot_fingerprint TEXT NOT NULL,
@@ -371,13 +374,23 @@ IF NOT EXISTS` must not modify or backfill `processed_transactions`.
 - `PREVIEW -> CANCELLED`: operator cancels.
 - `RUNNING -> STOPPED`: operator requests stop after current safe boundary, or
   panel becomes unavailable before the next click.
-- `RUNNING -> COMPLETED`: no PENDING/SUBMITTING/UNKNOWN remains; failures are
-  terminal and do not prevent completion.
+- `RUNNING -> COMPLETED`: no PENDING, SUBMITTING, UNKNOWN or
+  FAILED_NOT_SUBMITTED remains.
+- `RUNNING|STOPPED -> FAILURE_REVIEW`: the finite queue has no remaining
+  PENDING/SUBMITTING/UNKNOWN row, but one or more definitely-not-submitted
+  failures remain. The worker is idle and no retry starts automatically.
+- `FAILURE_REVIEW -> RUNNING`: the operator explicitly selects one or more
+  FAILED_NOT_SUBMITTED rows, confirms retry, and those selected rows are
+  atomically returned to PENDING before normal durable claiming resumes.
+- `FAILURE_REVIEW -> COMPLETED`: the operator explicitly finalizes the cycle
+  with the displayed failures unresolved; the failure records remain immutable
+  audit history and cannot be retried within that terminal cycle.
 - `RUNNING|STOPPED -> REVIEW_REQUIRED`: stale SUBMITTING or any UNKNOWN exists.
-- `STOPPED -> RUNNING`: resume after ownership checks, but only PENDING and
-  explicitly operator-approved `FAILED_NOT_SUBMITTED` rows can execute.
-- `REVIEW_REQUIRED -> STOPPED|COMPLETED`: every UNKNOWN is manually reconciled
-  with durable evidence; never an automatic transition to retry.
+- `STOPPED -> RUNNING`: resume after ownership checks, but only PENDING rows
+  can execute. Failed rows are handled only at the FAILURE_REVIEW decision.
+- `REVIEW_REQUIRED -> STOPPED|FAILURE_REVIEW|COMPLETED`: every UNKNOWN is
+  manually reconciled with durable evidence; the destination is determined by
+  remaining PENDING and FAILED_NOT_SUBMITTED rows, never by automatic retry.
 - `COMPLETED` and `CANCELLED` are terminal. A later run creates another cycle.
 
 ### 6.2 Transaction states
@@ -389,8 +402,10 @@ IF NOT EXISTS` must not modify or backfill `processed_transactions`.
   before submit click (browser unavailable, field validation/navigation failure).
 - `SUBMITTING -> UNKNOWN`: submit click occurred but success/non-acceptance
   cannot be proved, or the process/lease disappears while SUBMITTING.
-- `FAILED_NOT_SUBMITTED -> SUBMITTING`: only explicit operator retry; never a
-  blanket automatic retry policy.
+- `FAILED_NOT_SUBMITTED -> PENDING`: only for rows explicitly selected and
+  confirmed by the operator at the `FAILURE_REVIEW` decision point; it never
+  occurs automatically. The normal `PENDING -> SUBMITTING` durable claim then
+  applies.
 - `UNKNOWN -> SUCCESS`: operator reconciliation proves panel accepted it.
 - `UNKNOWN -> FAILED_NOT_SUBMITTED`: only authoritative panel audit proves no
   submission; requires operator identity, timestamp, evidence and note before a
@@ -406,7 +421,7 @@ exception where phase cannot be durably established resolves to UNKNOWN.
 ## 7. Duplicate Protection
 
 1. **Load:** iterate fixed source order, normalize using
-   `strip().casefold()`, and put the first non-empty normalized user in a local
+   `strip().lower()`, and put the first non-empty normalized user in a local
    seen map before amount validation. Later matching rows are persisted
    DUPLICATE pointing to the first occurrence; amounts are neither merged nor
    replaced. Thus an invalid first amount cannot be bypassed by a later row for
@@ -480,8 +495,10 @@ Incomplete cycles are **selectively resumable**, never blindly resumable:
 2. Require operator selection of the same cycle and panel attachment.
 3. Block resume while any UNKNOWN is unresolved (conservative cycle-wide
    barrier). This prevents an operator overlooking ambiguous money movement.
-4. After reconciliation, resume only persisted PENDING rows. A
-   FAILED_NOT_SUBMITTED retry requires a separate explicit confirmation.
+4. After UNKNOWN reconciliation, resume only persisted PENDING rows. When the
+   finite queue reaches FAILURE_REVIEW, a FAILED_NOT_SUBMITTED retry requires
+   row selection and a separate explicit confirmation; alternatively the
+   operator may explicitly finalize the cycle with those failures.
 5. Acquire executor ownership/heartbeat to prevent two app instances working
    one cycle. A database transaction/unique active-owner guard must reject a
    second executor.
@@ -557,7 +574,8 @@ staging panel and the complete frozen AUTO suite passes.
 ### 11.1 Loader and validation
 
 - Valid user/exact positive integer; comma-formatted and whitespace-formatted
-  integer; leading/trailing username whitespace; Unicode/case normalization.
+  integer; leading/trailing username whitespace; locked `strip().lower()` case
+  normalization without Unicode normalization or case-folding.
 - Blank user, blank amount, malformed text, decimal/fraction, zero, negative,
   overflow and excessively large amount.
 - Explicit proof that 1, 49,999, 50,000, 100,000 and values above daily cap are
@@ -587,8 +605,9 @@ staging panel and the complete frozen AUTO suite passes.
   invalids; total sums READY exact amounts only; integer formatting correct.
 - Confirmation displays exact executable count/total; cancel performs no
   submission; snapshot immutable after confirmation.
-- End of list marks COMPLETED/IDLE and performs no read/refill; new sheet rows
-  wait for a new intentional cycle.
+- End of list marks COMPLETED/IDLE only when no failures need a decision;
+  otherwise it enters FAILURE_REVIEW/IDLE for explicit retry-or-finalize. It
+  performs no read/refill, and new sheet rows wait for a new intentional cycle.
 - Stop before first row, between rows and during an operation respects safe
   boundaries. Separate cycles and state/timers cannot bleed across mode switch.
 
@@ -597,7 +616,7 @@ staging panel and the complete frozen AUTO suite passes.
 - Exact amount and dedicated remark reach form; no tier/cap/Validator call.
 - Success; definite pre-click timeout; panel closed before click; failed field
   fill; post-click timeout; unexpected alert; site rejection proven/not proven;
-  continuation after a terminal failure; halt on lost durability.
+  continuation after a definitely-not-submitted failure; halt on lost durability.
 - Immediate pre-submit claim blocks duplicate/concurrent executor; two app
   instances cannot operate one cycle.
 - Browser/profile/selectors work in source and portable build.
@@ -646,9 +665,10 @@ stop, browser recovery, maintenance and portable restart.
 
 - SQLite disk-full/lock/corruption during execution; stop submissions on lost
   durability, preserve UNKNOWN, provide backup/integrity/runbook.
-- Username normalization expectations (Unicode/casefold) may differ from panel
-  account identity. Confirm with real account rules while retaining at least
-  trim/lower equivalence.
+- Username normalization is deliberately limited to `strip().lower()` so
+  financial duplicate protection does not merge accounts more aggressively
+  than known username semantics. Introduce Unicode normalization or case-folding
+  only if real panel account-identity rules are later verified to require it.
 - `_safe_int` is lossy (`float`, malformed -> zero); Manual requires a new
   strict parser and raw values.
 - Existing connect requires MANUAL BONUS RELOAD tab although Manual does not
@@ -729,14 +749,17 @@ stop, browser recovery, maintenance and portable restart.
     require authoritative operator reconciliation, never blindly retry.
 13. **Half-cycle restart:** load persisted cycle; stale SUBMITTING -> UNKNOWN;
     keep SUCCESS and PENDING; show review rather than auto-start.
-14. **Resumable?** Selectively: only after UNKNOWN resolution, and only PENDING
-    plus separately confirmed definitely-not-submitted failures.
+14. **Resumable?** Selectively: UNKNOWN must first be reconciled; ordinary
+    resume processes only PENDING rows. Definitely-not-submitted failures are
+    retried only when selected and confirmed at FAILURE_REVIEW, or the operator
+    explicitly finalizes the cycle with those failures.
 15. **Certainty classification:** committed/reconciled evidence = SUCCESS;
     proven pre-click/authoritative negative = definitely not submitted; any
     crossed-or-uncertain click boundary = UNKNOWN.
 16. **Protective model:** cycle/source/executable tables, unique cycle/key,
     immutable SUCCESS, durable PENDING -> SUBMITTING claim, distinct
-    FAILED_NOT_SUBMITTED and UNKNOWN, ownership/attempt/evidence fields.
+    FAILED_NOT_SUBMITTED and UNKNOWN, FAILURE_REVIEW retry-or-finalize decision,
+    and ownership/attempt/evidence fields.
 17. **UI switch:** mutually exclusive coordinator; switching only at idle safe
     boundary; separate controllers/timers/models; no automatic resume/refill.
 18. **Tests before money:** all loader, duplicate, cycle, execution,

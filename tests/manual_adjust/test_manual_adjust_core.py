@@ -60,6 +60,13 @@ def snapshot(repo, rows=None):
     return repo.create_snapshot("sid","MASTER",snapshot_fingerprint("sid","MASTER",raw),classify_rows(raw))
 
 
+def activate(repo, cycle_id, executor="executor"):
+    repo._conn.execute(
+        "UPDATE manual_adjust_cycles SET status='RUNNING',executor_id=? WHERE cycle_id=?",
+        (executor, cycle_id),
+    )
+
+
 def test_snapshot_persists_all_rows_summary_and_finite_ordered_queue(repo):
     cid = snapshot(repo)
     summary = repo.get_cycle_summary(cid)
@@ -92,6 +99,7 @@ def test_database_unique_barrier_foreign_keys_and_atomic_rollback(repo):
 
 def test_attempt_history_completion_immutability_and_reconciliation(repo):
     cid = snapshot(repo,[rr(2,"u",1)])
+    activate(repo, cid)
     tx = repo.get_pending_transactions(cid)[0]
     attempt = repo.claim_pending(tx.transaction_id,"executor")
     with pytest.raises(ValueError): repo.claim_pending(tx.transaction_id,"executor")
@@ -111,12 +119,82 @@ def test_attempt_history_completion_immutability_and_reconciliation(repo):
 
 def test_non_unknown_and_wrong_attempt_cannot_be_reconciled(repo):
     cid = snapshot(repo,[rr(2,"u",1)])
+    activate(repo, cid, "e")
     tx = repo.get_pending_transactions(cid)[0]
     attempt = repo.claim_pending(tx.transaction_id,"e")
     repo.finish_attempt(attempt["attempt_id"],AttemptResult.FAILED_NOT_SUBMITTED,
         click_crossed=False,submission_phase="FILL")
     with pytest.raises(ValueError):
         repo.reconcile_unknown(tx.transaction_id,attempt["attempt_id"],"SUCCESS",reconciled_by="o",note="n",evidence="e")
+
+
+def test_claim_requires_running_owned_cycle(repo):
+    cid = snapshot(repo,[rr(2,"u",1)])
+    tx = repo.get_pending_transactions(cid)[0]
+    with pytest.raises(ValueError, match="RUNNING"):
+        repo.claim_pending(tx.transaction_id,"executor")
+    activate(repo,cid,"owner")
+    with pytest.raises(ValueError, match="does not own"):
+        repo.claim_pending(tx.transaction_id,"intruder")
+    assert repo.get_transaction(tx.transaction_id).status.value == "PENDING"
+    assert repo.get_attempt_history(tx.transaction_id) == []
+
+
+def test_claim_rejects_inconsistent_attempt_history(repo):
+    cid = snapshot(repo,[rr(2,"u",1)])
+    activate(repo,cid)
+    tx = repo.get_pending_transactions(cid)[0]
+    repo._conn.execute("UPDATE manual_adjust_transactions SET attempt_count=1 WHERE transaction_id=?",(tx.transaction_id,))
+    with pytest.raises(ValueError, match="attempt_count"):
+        repo.claim_pending(tx.transaction_id,"executor")
+    repo._conn.execute("UPDATE manual_adjust_transactions SET attempt_count=0 WHERE transaction_id=?",(tx.transaction_id,))
+    repo._conn.execute("""INSERT INTO manual_adjust_attempts
+      (attempt_id,transaction_id,attempt_no,executor_id,claimed_at,result,submission_phase,created_at)
+      VALUES('hostile',?,2,'x','n','IN_PROGRESS','X','n')""",(tx.transaction_id,))
+    repo._conn.execute("UPDATE manual_adjust_transactions SET attempt_count=1,current_attempt_id='hostile' WHERE transaction_id=?",(tx.transaction_id,))
+    with pytest.raises(ValueError, match="contiguous"):
+        repo.claim_pending(tx.transaction_id,"executor")
+
+
+def test_finish_attempt_rolls_back_attempt_on_transaction_mismatch(repo):
+    cid = snapshot(repo,[rr(2,"u",1)])
+    activate(repo,cid)
+    tx = repo.get_pending_transactions(cid)[0]
+    attempt = repo.claim_pending(tx.transaction_id,"executor")
+    repo._conn.execute("UPDATE manual_adjust_transactions SET status='PENDING' WHERE transaction_id=?",(tx.transaction_id,))
+    with pytest.raises(ValueError, match="transition failed"):
+        repo.finish_attempt(attempt["attempt_id"],AttemptResult.SUCCESS,
+                            click_crossed=True,submission_phase="DONE")
+    unchanged = repo.get_attempt_history(tx.transaction_id)[0]
+    assert unchanged["result"] == "IN_PROGRESS"
+    assert unchanged["finished_at"] is None
+
+
+def test_validate_cycle_integrity_reports_locked_invariants(repo):
+    cid = snapshot(repo,[rr(2,"u",1)])
+    activate(repo,cid)
+    tx = repo.get_pending_transactions(cid)[0]
+    attempt = repo.claim_pending(tx.transaction_id,"executor")
+    assert repo.validate_cycle_integrity(cid) == []
+
+    # A non-SUBMITTING transaction with an active attempt is impossible.
+    repo._conn.execute("UPDATE manual_adjust_transactions SET status='PENDING',attempt_count=2 WHERE transaction_id=?",(tx.transaction_id,))
+    errors = repo.validate_cycle_integrity(cid)
+    assert any("attempt count mismatch" in e for e in errors)
+    assert any("PENDING transaction has IN_PROGRESS" in e for e in errors)
+
+    repo._conn.execute("UPDATE manual_adjust_transactions SET status='UNKNOWN',attempt_count=1 WHERE transaction_id=?",(tx.transaction_id,))
+    errors = repo.validate_cycle_integrity(cid)
+    assert any("UNKNOWN requires current UNKNOWN" in e for e in errors)
+
+    # Finish correctly after restoring SUBMITTING, then force an outcome/state
+    # contradiction that the integrity audit must report.
+    repo._conn.execute("UPDATE manual_adjust_transactions SET status='SUBMITTING' WHERE transaction_id=?",(tx.transaction_id,))
+    repo.finish_attempt(attempt["attempt_id"],AttemptResult.UNKNOWN,
+                        click_crossed=True,submission_phase="CLICKED")
+    repo._conn.execute("UPDATE manual_adjust_transactions SET status='SUCCESS' WHERE transaction_id=?",(tx.transaction_id,))
+    errors = repo.validate_cycle_integrity(cid)
+    assert any("SUCCESS does not match current attempt outcome" in e for e in errors)
 
 
 class FakeSheet:

@@ -165,12 +165,43 @@ class ManualAdjustRepository:
         return [dict(r) for r in self._conn.execute("SELECT * FROM manual_adjust_attempts WHERE transaction_id=? ORDER BY attempt_no", (transaction_id,))]
 
     def claim_pending(self, transaction_id: int, executor_id: str) -> dict:
+        """Atomically claim one internally consistent PENDING transaction.
+
+        Lease acquisition/heartbeat scheduling belongs to the future
+        controller, but once ownership is represented on a cycle this boundary
+        requires an exact RUNNING-cycle owner match.  It never manufactures or
+        repairs ownership.
+        """
+        if not executor_id:
+            raise ValueError("executor_id is required")
         now, attempt_id = _now(), str(uuid.uuid4())
         try:
             self._conn.execute("BEGIN IMMEDIATE")
-            row = self._conn.execute("SELECT status,attempt_count FROM manual_adjust_transactions WHERE transaction_id=?", (transaction_id,)).fetchone()
+            row = self._conn.execute("""SELECT t.status,t.attempt_count,t.current_attempt_id,
+              c.status cycle_status,c.executor_id
+              FROM manual_adjust_transactions t JOIN manual_adjust_cycles c USING(cycle_id)
+              WHERE t.transaction_id=?""", (transaction_id,)).fetchone()
             if not row or row["status"] != TransactionStatus.PENDING.value:
                 raise ValueError("transaction is not PENDING")
+            if row["cycle_status"] != CycleStatus.RUNNING.value:
+                raise ValueError("cycle is not RUNNING")
+            if row["executor_id"] != executor_id:
+                raise ValueError("executor does not own cycle")
+            history = self._conn.execute("""SELECT attempt_id,attempt_no,result
+              FROM manual_adjust_attempts WHERE transaction_id=? ORDER BY attempt_no""",
+              (transaction_id,)).fetchall()
+            expected = list(range(1, len(history) + 1))
+            if [int(a["attempt_no"]) for a in history] != expected:
+                raise ValueError("attempt numbers are not contiguous")
+            if int(row["attempt_count"]) != len(history):
+                raise ValueError("attempt_count does not match history")
+            if any(a["result"] == AttemptResult.IN_PROGRESS.value for a in history):
+                raise ValueError("conflicting IN_PROGRESS attempt exists")
+            if history:
+                if row["current_attempt_id"] != history[-1]["attempt_id"]:
+                    raise ValueError("current_attempt_id does not identify latest attempt")
+            elif row["current_attempt_id"] is not None:
+                raise ValueError("current_attempt_id exists without attempt history")
             attempt_no = int(row["attempt_count"]) + 1
             self._conn.execute("""INSERT INTO manual_adjust_attempts
               (attempt_id,transaction_id,attempt_no,executor_id,claimed_at,result,submission_phase,created_at)
@@ -195,8 +226,10 @@ class ManualAdjustRepository:
                 raise ValueError("attempt is not IN_PROGRESS")
             self._conn.execute("UPDATE manual_adjust_attempts SET finished_at=?,result=?,click_crossed=?,submission_phase=?,error_detail=?,evidence_detail=? WHERE attempt_id=?",
                 (now,result.value,int(click_crossed),submission_phase,error_detail,evidence_detail,attempt_id))
-            self._conn.execute("UPDATE manual_adjust_transactions SET status=?,processed_at=? WHERE transaction_id=? AND current_attempt_id=? AND status='SUBMITTING'",
+            changed = self._conn.execute("UPDATE manual_adjust_transactions SET status=?,processed_at=? WHERE transaction_id=? AND current_attempt_id=? AND status='SUBMITTING'",
                 (result.value,now,row["transaction_id"],attempt_id))
+            if changed.rowcount != 1:
+                raise ValueError("matching SUBMITTING transaction transition failed")
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -224,11 +257,82 @@ class ManualAdjustRepository:
             raise
 
     def validate_cycle_integrity(self, cycle_id: str) -> list[str]:
+        """Report persistence contradictions without attempting recovery."""
         errors: list[str] = []
-        for row in self._conn.execute("""SELECT t.transaction_id,t.attempt_count,COUNT(a.attempt_id) n,
-          SUM(CASE WHEN a.result='IN_PROGRESS' THEN 1 ELSE 0 END) active
-          FROM manual_adjust_transactions t LEFT JOIN manual_adjust_attempts a USING(transaction_id)
-          WHERE t.cycle_id=? GROUP BY t.transaction_id""", (cycle_id,)):
-            if row["attempt_count"] != row["n"]: errors.append(f"transaction {row['transaction_id']}: attempt count mismatch")
-            if (row["active"] or 0) > 1: errors.append(f"transaction {row['transaction_id']}: multiple active attempts")
+        transactions = self._conn.execute(
+            "SELECT * FROM manual_adjust_transactions WHERE cycle_id=?",
+            (cycle_id,),
+        ).fetchall()
+        for tx in transactions:
+            txid = int(tx["transaction_id"])
+            prefix = f"transaction {txid}: "
+            history = self._conn.execute(
+                "SELECT * FROM manual_adjust_attempts WHERE transaction_id=? ORDER BY attempt_no",
+                (txid,),
+            ).fetchall()
+            numbers = [int(a["attempt_no"]) for a in history]
+            if numbers != list(range(1, len(history) + 1)):
+                errors.append(prefix + "attempt numbers are not contiguous from 1")
+            if int(tx["attempt_count"]) != len(history):
+                errors.append(prefix + "attempt count mismatch")
+
+            active = [a for a in history if a["result"] == AttemptResult.IN_PROGRESS.value]
+            if len(active) > 1:
+                errors.append(prefix + "multiple IN_PROGRESS attempts")
+
+            current = None
+            if tx["current_attempt_id"] is not None:
+                current = next((a for a in history if a["attempt_id"] == tx["current_attempt_id"]), None)
+                if current is None:
+                    errors.append(prefix + "current_attempt_id does not belong to transaction")
+                elif history and current["attempt_id"] != history[-1]["attempt_id"]:
+                    errors.append(prefix + "current_attempt_id is not latest attempt")
+            elif history:
+                errors.append(prefix + "attempt history exists without current_attempt_id")
+
+            status = tx["status"]
+            if status == TransactionStatus.SUBMITTING.value:
+                if current is None or current["result"] != AttemptResult.IN_PROGRESS.value:
+                    errors.append(prefix + "SUBMITTING requires current IN_PROGRESS attempt")
+                if len(active) != 1:
+                    errors.append(prefix + "SUBMITTING requires exactly one IN_PROGRESS attempt")
+            elif active:
+                errors.append(prefix + f"{status} transaction has IN_PROGRESS attempt")
+
+            if status == TransactionStatus.UNKNOWN.value:
+                if current is None or current["result"] != AttemptResult.UNKNOWN.value:
+                    errors.append(prefix + "UNKNOWN requires current UNKNOWN attempt")
+                elif current["reconciled_outcome"] is not None:
+                    errors.append(prefix + "UNKNOWN transaction has already reconciled current attempt")
+
+            if status == TransactionStatus.PENDING.value and current is not None:
+                retryable = (current["result"] == AttemptResult.FAILED_NOT_SUBMITTED.value or
+                    (current["result"] == AttemptResult.UNKNOWN.value and
+                     current["reconciled_outcome"] == "NOT_SUBMITTED"))
+                if not retryable:
+                    errors.append(prefix + "PENDING does not follow a retryable current attempt")
+            if status == TransactionStatus.CANCELLED.value and history:
+                errors.append(prefix + "CANCELLED transaction has attempt history")
+
+            for attempt in history:
+                fields = (attempt["reconciled_outcome"], attempt["reconciled_at"],
+                          attempt["reconciled_by"], attempt["reconciliation_note"],
+                          attempt["reconciliation_evidence"])
+                populated = sum(value is not None for value in fields)
+                if populated not in (0, 5):
+                    errors.append(prefix + f"attempt {attempt['attempt_no']} has partial reconciliation")
+                if populated and attempt["result"] != AttemptResult.UNKNOWN.value:
+                    errors.append(prefix + f"attempt {attempt['attempt_no']} reconciliation is not on UNKNOWN")
+
+            if current is not None and status in (TransactionStatus.SUCCESS.value,
+                                                  TransactionStatus.FAILED_NOT_SUBMITTED.value):
+                direct = current["result"] == status
+                reconciled = (current["result"] == AttemptResult.UNKNOWN.value and
+                    ((status == TransactionStatus.SUCCESS.value and current["reconciled_outcome"] == "SUCCESS") or
+                     (status == TransactionStatus.FAILED_NOT_SUBMITTED.value and current["reconciled_outcome"] == "NOT_SUBMITTED")))
+                if not (direct or reconciled):
+                    errors.append(prefix + f"{status} does not match current attempt outcome")
+            elif current is None and status in (TransactionStatus.SUCCESS.value,
+                                                TransactionStatus.FAILED_NOT_SUBMITTED.value):
+                errors.append(prefix + f"{status} requires a current attempt")
         return errors

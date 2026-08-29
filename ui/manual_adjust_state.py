@@ -32,6 +32,8 @@ class ManualPreviewState:
             except Exception as exc:
                 return False, f"Full Manual Adjust is unavailable: {exc}"
             self.manual_backend_ready = True
+        if requested is OperatingMode.MANUAL and not self.manual_backend_ready:
+            return False, "Full Manual Adjust backend is not ready."
         self.mode = requested
         return True, ""
 

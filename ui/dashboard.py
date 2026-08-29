@@ -65,6 +65,7 @@ from core.maintenance import MaintenanceService
 from core.crash_state import CrashState, CrashStateStore
 from core.manual_adjust_loader import ManualAdjustLoader
 from core.manual_adjust_repository import ManualAdjustRepository
+from core.manual_adjust_controller import ManualAdjustController
 from ui.manual_adjust_state import ManualPreviewState, OperatingMode
 from ui.manual_adjust_view import ManualAdjustView
 
@@ -512,6 +513,7 @@ class Dashboard(QMainWindow):
         # never prevent the frozen AUTO application from starting.
         self.manual_repository: Optional[ManualAdjustRepository] = None
         self.manual_loader: Optional[ManualAdjustLoader] = None
+        self.manual_controller: Optional[ManualAdjustController] = None
         self.manual_state = ManualPreviewState()
 
         # Timers
@@ -521,6 +523,10 @@ class Dashboard(QMainWindow):
         self.worker_timer = QTimer(self)
         self.worker_timer.setSingleShot(False)
         self.worker_timer.timeout.connect(self._worker_step)
+        self.manual_worker_timer = QTimer(self)
+        self.manual_worker_timer.timeout.connect(self._manual_worker_step)
+        self.manual_heartbeat_timer = QTimer(self)
+        self.manual_heartbeat_timer.timeout.connect(self._manual_heartbeat)
 
         # Periodic panel-alive poll: detects operator closing the browser
         # window (X) so Panel Status can auto-return to "Closed".
@@ -848,6 +854,11 @@ class Dashboard(QMainWindow):
         self.auto_view = splitter
         self.manual_view = ManualAdjustView(self)
         self.manual_view.load_requested.connect(self._on_manual_load)
+        self.manual_view.open_panel_requested.connect(self._on_open_panel)
+        self.manual_view.attach_panel_requested.connect(self._on_ready)
+        self.manual_view.start_requested.connect(self._on_manual_start)
+        self.manual_view.stop_requested.connect(self._on_manual_stop)
+        self.manual_view.resume_requested.connect(self._on_manual_resume)
         self.mode_stack = QStackedWidget()
         self.mode_stack.addWidget(self.auto_view)
         self.mode_stack.addWidget(self.manual_view)
@@ -855,6 +866,13 @@ class Dashboard(QMainWindow):
 
     def _on_mode_selected(self, text: str) -> None:
         requested = OperatingMode(text)
+        if (requested is OperatingMode.AUTO and self.manual_repository is not None
+                and self.manual_state.active_cycle_id):
+            cycle = self.manual_repository.get_cycle(self.manual_state.active_cycle_id)
+            if cycle and cycle["status"] == "RUNNING":
+                self.mode_selector.blockSignals(True); self.mode_selector.setCurrentText(OperatingMode.MANUAL.value); self.mode_selector.blockSignals(False)
+                QMessageBox.warning(self, "Mode switch blocked", "STOP Manual Adjust before switching to AUTO.")
+                return
         allowed, message = self.manual_state.select_mode(
             requested,
             self.state,
@@ -893,6 +911,8 @@ class Dashboard(QMainWindow):
             repository = ManualAdjustRepository(self.db.path)
             repository.initialize_schema()
             loader = ManualAdjustLoader(self.sheet, repository)
+            controller = ManualAdjustController(repository, self.panel, self.config,
+                                                evidence_dir=self.app_dir / "screenshots")
         except Exception:
             if repository is not None:
                 try:
@@ -902,6 +922,7 @@ class Dashboard(QMainWindow):
             raise
         self.manual_repository = repository
         self.manual_loader = loader
+        self.manual_controller = controller
 
     def _on_manual_load(self) -> None:
         if self.manual_state.mode is not OperatingMode.MANUAL:
@@ -921,11 +942,61 @@ class Dashboard(QMainWindow):
             self.manual_view.show_error(str(exc))
             return
         self.manual_view.display_preview(cycle, summary, rows)
+        execution = self.manual_repository.get_cycle_execution_summary(cycle["cycle_id"])
+        self.manual_view.set_execution_state(cycle["status"], execution,
+            execution_enabled=bool(self.config.get("manual_adjust", {}).get("execution_enabled", False)),
+            panel_attached=self.panel.is_attached)
         self.logger.info(f"[MANUAL] Snapshot frozen — cycle {cycle['cycle_id']}")
         self.logger.info(
             f"[MANUAL] {summary.ready} READY / {summary.duplicates} DUPLICATE / "
             f"{summary.invalid} INVALID"
         )
+
+    def _on_manual_start(self) -> None:
+        if not self.manual_controller or not self.manual_repository or not self.manual_state.active_cycle_id:
+            return
+        cid = self.manual_state.active_cycle_id
+        summary = self.manual_repository.get_cycle_execution_summary(cid)
+        cycle = self.manual_repository.get_cycle(cid)
+        total = int(cycle["total_amount"]) if cycle else 0
+        answer = QMessageBox.question(self, "Confirm Manual Adjust",
+            f"Executable Users: {summary['pending']:,}\nTotal Adjustment: {total:,}\n\nThese adjustments will be submitted to the panel using TRUE AMOUNT exactly 1:1.")
+        if answer != QMessageBox.Yes: return
+        try:
+            self.manual_controller.start(cid, confirmed=True)
+            self.manual_worker_timer.start(100)
+            self.manual_heartbeat_timer.start(int(self.config.get("manual_adjust", {}).get("heartbeat_interval_sec", 10)) * 1000)
+            self._refresh_manual_execution()
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
+    def _on_manual_stop(self) -> None:
+        if self.manual_controller: self.manual_controller.request_stop()
+
+    def _on_manual_resume(self) -> None:
+        if not self.manual_controller or not self.manual_state.active_cycle_id: return
+        try:
+            self.manual_controller.resume(self.manual_state.active_cycle_id)
+            self.manual_worker_timer.start(100); self.manual_heartbeat_timer.start()
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
+    def _manual_worker_step(self) -> None:
+        if not self.manual_controller: self.manual_worker_timer.stop(); return
+        result = self.manual_controller.step(); self._refresh_manual_execution()
+        if result.state in ("STOPPED", "FAILURE_REVIEW", "REVIEW_REQUIRED", "COMPLETED", "HARD_STOPPED"):
+            self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop()
+
+    def _manual_heartbeat(self) -> None:
+        try:
+            if self.manual_controller: self.manual_controller.heartbeat()
+        except Exception as exc:
+            self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop(); self.logger.error(f"[MANUAL] Lease lost: {exc}")
+
+    def _refresh_manual_execution(self) -> None:
+        if not self.manual_repository or not self.manual_state.active_cycle_id: return
+        cycle = self.manual_repository.get_cycle(self.manual_state.active_cycle_id)
+        summary = self.manual_repository.get_cycle_execution_summary(self.manual_state.active_cycle_id)
+        if cycle: self.manual_view.set_execution_state(cycle["status"], summary,
+            execution_enabled=bool(self.config.get("manual_adjust", {}).get("execution_enabled", False)), panel_attached=self.panel.is_attached)
 
     def _wrap_scroll(self, widget: QWidget) -> QScrollArea:
         sc = QScrollArea()

@@ -11,6 +11,14 @@ from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QHeaderView,
 
 class ManualAdjustView(QWidget):
     load_requested = Signal()
+    open_panel_requested = Signal()
+    attach_panel_requested = Signal()
+    start_requested = Signal()
+    stop_requested = Signal()
+    resume_requested = Signal()
+    retry_requested = Signal()
+    finalize_requested = Signal()
+    reconcile_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -27,7 +35,7 @@ class ManualAdjustView(QWidget):
         self.load_button.clicked.connect(self.load_requested)
         title_row.addWidget(title); title_row.addStretch(1); title_row.addWidget(self.load_button)
         layout.addLayout(title_row)
-        note = QLabel("TRUE AMOUNT is adjusted exactly 1:1. Preview only — no submission is available in Phase 3.")
+        note = QLabel("TRUE AMOUNT is submitted exactly 1:1. Execution requires explicit confirmation and the Manual safety gate.")
         note.setStyleSheet("color:#C7C6BE;font-size:12px")
         layout.addWidget(note)
 
@@ -36,6 +44,24 @@ class ManualAdjustView(QWidget):
         self.provenance = QLabel("Load is operator-initiated and reads MASTER exactly once.")
         self.provenance.setStyleSheet("color:#8A8C99")
         layout.addWidget(self.frozen); layout.addWidget(self.provenance)
+
+        controls = QHBoxLayout()
+        specs = (("OPEN PANEL", "open_panel", self.open_panel_requested),
+                 ("ATTACH PANEL", "attach_panel", self.attach_panel_requested),
+                 ("START MANUAL ADJUST", "start", self.start_requested),
+                 ("STOP", "stop", self.stop_requested), ("RESUME", "resume", self.resume_requested),
+                 ("RETRY SELECTED", "retry", self.retry_requested),
+                 ("FINALIZE WITH FAILURES", "finalize", self.finalize_requested),
+                 ("RECONCILE UNKNOWN", "reconcile", self.reconcile_requested))
+        self.actions = {}
+        for text, key, signal in specs:
+            button = QPushButton(text); button.clicked.connect(signal); button.setEnabled(False)
+            controls.addWidget(button); self.actions[key] = button
+        layout.addLayout(controls)
+        self.execution_status = QLabel("PREVIEW")
+        self.execution_status.setObjectName("StatusBadge")
+        self.progress = QLabel("SUCCESS 0  •  FAILED 0  •  UNKNOWN 0  •  PENDING 0  •  TOTAL ADJUSTED SUCCESSFULLY 0")
+        layout.addWidget(self.execution_status); layout.addWidget(self.progress)
 
         cards = QGridLayout()
         self.values = {}
@@ -60,6 +86,23 @@ class ManualAdjustView(QWidget):
     def set_sheet_connected(self, connected: bool) -> None:
         self.load_button.setEnabled(connected)
         self.load_button.setToolTip("" if connected else "Connect the Google Sheet before loading Manual data.")
+
+    def set_execution_state(self, status: str, summary: dict | None = None, *,
+                            execution_enabled: bool = False, panel_attached: bool = False) -> None:
+        summary = summary or {}
+        self.execution_status.setText(status)
+        self.progress.setText("SUCCESS {success}  •  FAILED {failed}  •  UNKNOWN {unknown}  •  PENDING {pending}  •  TOTAL ADJUSTED SUCCESSFULLY {total_adjusted_successfully:,}".format(
+            success=summary.get("success", 0), failed=summary.get("failed", 0),
+            unknown=summary.get("unknown", 0), pending=summary.get("pending", 0),
+            total_adjusted_successfully=summary.get("total_adjusted_successfully", 0)))
+        for button in self.actions.values(): button.setEnabled(False)
+        self.actions["open_panel"].setEnabled(True); self.actions["attach_panel"].setEnabled(True)
+        self.actions["start"].setEnabled(status == "PREVIEW" and execution_enabled and panel_attached and summary.get("pending", 0) > 0)
+        self.actions["stop"].setEnabled(status == "RUNNING")
+        self.actions["resume"].setEnabled(status == "STOPPED" and execution_enabled and panel_attached)
+        self.actions["retry"].setEnabled(status == "FAILURE_REVIEW")
+        self.actions["finalize"].setEnabled(status == "FAILURE_REVIEW")
+        self.actions["reconcile"].setEnabled(status == "REVIEW_REQUIRED")
 
     def show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Manual snapshot failed", message)
@@ -94,3 +137,4 @@ class ManualAdjustView(QWidget):
                 if column == 3:
                     item.setForeground(QColor(colors.get(row["classification"], "#ECEBE4")))
                 self.table.setItem(index, column, item)
+        self.set_execution_state(cycle["status"], {"pending": summary.ready})

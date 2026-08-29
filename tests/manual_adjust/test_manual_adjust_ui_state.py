@@ -27,7 +27,9 @@ class Loader:
 def test_default_mode_and_auto_idle_switch_boundary():
     state = ManualPreviewState()
     assert state.mode is OperatingMode.AUTO
-    assert state.select_mode(OperatingMode.MANUAL, "idle") == (True, "")
+    allowed, message = state.select_mode(OperatingMode.MANUAL, "idle")
+    assert not allowed and "backend is not ready" in message
+    assert state.select_mode(OperatingMode.MANUAL, "idle", lambda: None) == (True, "")
     assert state.mode is OperatingMode.MANUAL
 
 

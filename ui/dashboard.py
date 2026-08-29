@@ -42,6 +42,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QComboBox,
+    QStackedWidget,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -61,6 +63,10 @@ from core.recovery import RetryExhausted, retry_with_ladder, safe_run
 from core.health import HealthMonitor, LeakThresholds
 from core.maintenance import MaintenanceService
 from core.crash_state import CrashState, CrashStateStore
+from core.manual_adjust_loader import ManualAdjustLoader
+from core.manual_adjust_repository import ManualAdjustRepository
+from ui.manual_adjust_state import ManualPreviewState, OperatingMode
+from ui.manual_adjust_view import ManualAdjustView
 
 
 # -------------------------------------------------------------------- theme
@@ -502,6 +508,12 @@ class Dashboard(QMainWindow):
         self.validator = Validator(config["bonus_rules"])
         self.queue: Optional[QueueManager] = None
         self.panel = PanelService(config, selectors)
+        # Manual uses additive tables in the exact database file already owned
+        # by DatabaseService.  It has no AUTO QueueManager/Validator dependency.
+        self.manual_repository = ManualAdjustRepository(self.db.path)
+        self.manual_repository.initialize_schema()
+        self.manual_loader = ManualAdjustLoader(self.sheet, self.manual_repository)
+        self.manual_state = ManualPreviewState()
 
         # Timers
         self.manual_timer = QTimer(self)
@@ -736,6 +748,11 @@ class Dashboard(QMainWindow):
 
         top.addWidget(title)
         top.addWidget(subtitle)
+        self.mode_selector = QComboBox()
+        self.mode_selector.setObjectName("operating-mode-selector")
+        self.mode_selector.addItems([mode.value for mode in OperatingMode])
+        self.mode_selector.currentTextChanged.connect(self._on_mode_selected)
+        top.addWidget(self.mode_selector)
         top.addStretch(1)
         top.addWidget(self.top_sync)
         top.addWidget(self.top_version)
@@ -829,7 +846,60 @@ class Dashboard(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
-        root.addWidget(splitter, 1)
+        self.auto_view = splitter
+        self.manual_view = ManualAdjustView(self)
+        self.manual_view.load_requested.connect(self._on_manual_load)
+        self.mode_stack = QStackedWidget()
+        self.mode_stack.addWidget(self.auto_view)
+        self.mode_stack.addWidget(self.manual_view)
+        root.addWidget(self.mode_stack, 1)
+
+    def _on_mode_selected(self, text: str) -> None:
+        requested = OperatingMode(text)
+        allowed, message = self.manual_state.select_mode(requested, self.state)
+        if not allowed:
+            self.mode_selector.blockSignals(True)
+            self.mode_selector.setCurrentText(OperatingMode.AUTO.value)
+            self.mode_selector.blockSignals(False)
+            QMessageBox.warning(self, "Mode switch blocked", message)
+            return
+        manual = requested is OperatingMode.MANUAL
+        self.mode_stack.setCurrentWidget(self.manual_view if manual else self.auto_view)
+        if manual:
+            # AUTO business timers must be dormant in the isolated Manual view.
+            self.manual_timer.stop()
+            self.worker_timer.stop()
+            self.metrics_timer.stop()
+            self.manual_view.set_sheet_connected(self.sheet.is_connected)
+            current = self.manual_state.current_preview(self.manual_repository)
+            if current:
+                self.manual_view.display_preview(*current)
+            self.logger.info("[MANUAL] Mode selected")
+        elif self.sheet.is_connected:
+            interval = int(self.config.get("manual_reload_interval_sec", 90)) * 1000
+            self.manual_timer.start(interval)
+
+    def _on_manual_load(self) -> None:
+        if self.manual_state.mode is not OperatingMode.MANUAL:
+            return
+        if not self.sheet.is_connected:
+            self.manual_view.show_error("Connect the Google Sheet before loading Manual data.")
+            return
+        self.logger.info("[MANUAL] Loading snapshot")
+        try:
+            cycle, summary, rows = self.manual_state.load_snapshot(
+                self.manual_loader, self.manual_repository
+            )
+        except Exception as exc:
+            self.logger.error(f"[MANUAL] Snapshot load failed: {exc}")
+            self.manual_view.show_error(str(exc))
+            return
+        self.manual_view.display_preview(cycle, summary, rows)
+        self.logger.info(f"[MANUAL] Snapshot frozen — cycle {cycle['cycle_id']}")
+        self.logger.info(
+            f"[MANUAL] {summary.ready} READY / {summary.duplicates} DUPLICATE / "
+            f"{summary.invalid} INVALID"
+        )
 
     def _wrap_scroll(self, widget: QWidget) -> QScrollArea:
         sc = QScrollArea()
@@ -1255,8 +1325,13 @@ class Dashboard(QMainWindow):
         self.btn_ready.setEnabled(self.panel.is_open)
         self.btn_start.setEnabled(self.panel.is_attached)
         self._refresh_stats()
+        self.manual_view.set_sheet_connected(True)
+        if self.manual_state.mode is OperatingMode.MANUAL:
+            self.manual_timer.stop()
 
     def _reload_manual_list(self) -> None:
+        if self.manual_state.mode is OperatingMode.MANUAL:
+            return
         if not self.sheet.is_connected:
             return
         # Defer while worker is actively processing to avoid extra Google API
@@ -1349,7 +1424,7 @@ class Dashboard(QMainWindow):
         """Re-read pending rows from Google Sheets and rebuild the preview
         queue (no dialog). Disabled while the worker is running to keep API
         traffic minimal."""
-        if self.queue is None:
+        if self.manual_state.mode is OperatingMode.MANUAL or self.queue is None:
             return
         if self.state == "running":
             QMessageBox.information(
@@ -1371,7 +1446,7 @@ class Dashboard(QMainWindow):
     def _on_preview(self) -> None:
         """Show the currently-loaded queue. If nothing has been loaded yet,
         do one refill so the operator isn't looking at an empty dialog."""
-        if self.queue is None:
+        if self.manual_state.mode is OperatingMode.MANUAL or self.queue is None:
             return
         if not self.queue.items():
             try:
@@ -1387,6 +1462,8 @@ class Dashboard(QMainWindow):
         self._refresh_stats()
 
     def _on_start(self) -> None:
+        if self.manual_state.mode is OperatingMode.MANUAL:
+            return
         if self.state in ("running", "monitoring"):
             return
         if self.queue is None or not self.panel.is_attached:
@@ -1443,6 +1520,9 @@ class Dashboard(QMainWindow):
     # WORKER STEP
     # =============================================================
     def _worker_step(self) -> None:
+        if self.manual_state.mode is OperatingMode.MANUAL:
+            self.worker_timer.stop()
+            return
         if self.queue is None:
             self.worker_timer.stop()
             return
@@ -1849,6 +1929,13 @@ class Dashboard(QMainWindow):
         # Persist current URL / window geometry as a clean-exit snapshot.
         try:
             self._persist_crash_state(clean_exit=True)
+        except Exception:
+            pass
+
+        # Additive Manual repository cleanup must never obstruct the frozen
+        # AUTO shutdown/checkpoint/browser/crash-state sequence above.
+        try:
+            self.manual_repository.close()
         except Exception:
             pass
 

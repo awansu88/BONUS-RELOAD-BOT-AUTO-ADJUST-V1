@@ -337,9 +337,6 @@ CREATE TABLE manual_adjust_transactions (
     attempt_count       INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
     current_attempt_id  TEXT REFERENCES manual_adjust_attempts(attempt_id),
     processed_at        TEXT,
-    reconciled_at       TEXT,
-    reconciled_by       TEXT,
-    resolution_note     TEXT NOT NULL DEFAULT '',
     UNIQUE(cycle_id, username_key)
 );
 
@@ -359,8 +356,24 @@ CREATE TABLE manual_adjust_attempts (
     submission_phase    TEXT NOT NULL,
     error_detail        TEXT,
     evidence_detail     TEXT,
+    reconciled_outcome  TEXT CHECK(reconciled_outcome IN
+      ('SUCCESS','NOT_SUBMITTED')),
+    reconciled_at       TEXT,
+    reconciled_by       TEXT,
+    reconciliation_note TEXT,
+    reconciliation_evidence TEXT,
     created_at          TEXT NOT NULL,
-    UNIQUE(transaction_id, attempt_no)
+    UNIQUE(transaction_id, attempt_no),
+    CHECK (
+      (reconciled_outcome IS NULL AND reconciled_at IS NULL
+       AND reconciled_by IS NULL AND reconciliation_note IS NULL
+       AND reconciliation_evidence IS NULL)
+      OR
+      (result = 'UNKNOWN' AND reconciled_outcome IS NOT NULL
+       AND reconciled_at IS NOT NULL AND reconciled_by IS NOT NULL
+       AND reconciliation_note IS NOT NULL
+       AND reconciliation_evidence IS NOT NULL)
+    )
 );
 
 CREATE INDEX idx_manual_cycle_status
@@ -379,11 +392,15 @@ rows are permanent: they are never deleted or reused, and after an attempt is
 finished its result, phase, timestamps, error and evidence are immutable. The
 only permitted update is monotonic completion of that attempt's own
 `IN_PROGRESS` record. Repository APIs must reject changes to any finished or
-older attempt. Counts should normally be derived in queries; cached cycle
-aggregates are updated in the same transaction and verified before
-confirmation/completion. Store money as SQLite INTEGER and reject values above
-the application's explicitly tested safe maximum (at most signed 64-bit); never
-use float.
+older execution fields. Reconciliation columns start NULL and form a separate
+write-once extension: they may be populated together exactly once, only on the
+specific UNKNOWN `attempt_id` being reconciled. Once populated they are
+immutable. A later retry creates another attempt and cannot overwrite any prior
+attempt's execution or reconciliation evidence. Counts should normally be
+derived in queries; cached cycle aggregates are updated in the same transaction
+and verified before confirmation/completion. Store money as SQLite INTEGER and
+reject values above the application's explicitly tested safe maximum (at most
+signed 64-bit); never use float.
 
 Schema installation must be additive and versioned in a dedicated migration
 record (for example `_meta.manual_adjust_schema_version`). `CREATE TABLE/INDEX
@@ -434,10 +451,15 @@ IF NOT EXISTS` must not modify or backfill `processed_transactions`.
   confirmed by the operator at the `FAILURE_REVIEW` decision point; it never
   occurs automatically. The normal `PENDING -> SUBMITTING` durable claim then
   applies.
-- `UNKNOWN -> SUCCESS`: operator reconciliation proves panel accepted it.
+- `UNKNOWN -> SUCCESS`: operator reconciliation proves panel accepted it. In
+  the same database transaction, the exact `current_attempt_id` UNKNOWN attempt
+  receives its one-time `SUCCESS` reconciliation metadata before transaction
+  status becomes SUCCESS.
 - `UNKNOWN -> FAILED_NOT_SUBMITTED`: only authoritative panel audit proves no
-  submission; requires operator identity, timestamp, evidence and note before a
-  separately confirmed retry.
+  submission. In the same database transaction, the exact `current_attempt_id`
+  UNKNOWN attempt receives its one-time `NOT_SUBMITTED` outcome, operator,
+  timestamp, note and evidence before transaction status changes. A separately
+  confirmed FAILURE_REVIEW decision is still required before retry.
 - `PENDING -> CANCELLED`: operator intentionally excludes an untouched row
   before execution; optional, audited, and never permitted after claim.
 - `SUCCESS` is immutable. No state transitions back to PENDING.
@@ -492,6 +514,12 @@ the micro-window between click and DB write. Thus *every stale SUBMITTING*, with
 or without `submit_clicked_at`, becomes UNKNOWN at recovery, and its current
 attempt is monotonically finished as UNKNOWN. It never becomes PENDING/FAILED.
 All prior finished attempts remain unchanged and available for reconciliation.
+UNKNOWN is not considered reconciled merely because transaction-level state was
+edited: the repository must locate the transaction's exact current UNKNOWN
+attempt, require all its reconciliation fields to be NULL, populate them once,
+and transition the transaction atomically. Missing, mismatched, already
+reconciled or non-UNKNOWN attempt IDs reject the transition and keep the cycle
+in REVIEW_REQUIRED.
 
 If the site provides an authoritative transaction history, search it using the
 username, exact amount, dedicated manual remark, attempt/cycle correlation text
@@ -520,9 +548,11 @@ cycles. A cycle whose lease is stale changes to REVIEW_REQUIRED if any row is
 SUBMITTING; those rows and their current IN_PROGRESS attempts become UNKNOWN in
 one transaction. Recovery validates that attempt numbers are contiguous,
 `attempt_count` matches history, and no transaction has multiple IN_PROGRESS
-attempts. It never edits a finished earlier attempt. Untouched PENDING rows
-remain safe, SUCCESS remains immutable, and definite failures remain available
-for the FAILURE_REVIEW decision.
+attempts. It also verifies that any transaction moved out of UNKNOWN through
+reconciliation has complete write-once metadata on the matching attempt. It
+never edits a finished earlier attempt or any prior reconciliation. Untouched
+PENDING rows remain safe, SUCCESS remains immutable, and definite failures
+remain available for the FAILURE_REVIEW decision.
 
 Incomplete cycles are **selectively resumable**, never blindly resumable:
 
@@ -636,6 +666,12 @@ staging panel and the complete frozen AUTO suite passes.
 - Finished attempt rows cannot be updated or deleted through repository APIs;
   attempt-count/history mismatches and multiple IN_PROGRESS attempts are
   detected and stop execution for review.
+- Reconciliation targets the exact current UNKNOWN attempt ID; all five
+  reconciliation fields are written atomically exactly once, reject partial or
+  repeat writes, and cannot be changed by a later retry/reconciliation.
+- Multi-retry history preserves independent UNKNOWN/reconciliation records, for
+  example attempts 1 and 2 reconciled NOT_SUBMITTED followed by attempt 3
+  SUCCESS, without overwriting either earlier audit trail.
 - Migration on fresh and existing v1.2 DB; repeat migration idempotence; AUTO
   table schema/data/query plans/results unchanged.
 
@@ -673,6 +709,9 @@ every stale SUBMITTING becomes UNKNOWN; no UNKNOWN automatically retries;
 review evidence is mandatory; resume uses persisted snapshot; DB failure after
 remote success stops new submissions; every retry has a new attempt ID/number;
 and completed evidence from prior attempts remains byte-for-byte unchanged.
+Fault injection during reconciliation must leave either all attempt-specific
+reconciliation fields plus the matching transaction transition committed, or
+none of them; transaction-only resolution is forbidden.
 
 ### 11.6 Scale and endurance
 
@@ -702,6 +741,9 @@ stop, browser recovery, maintenance and portable restart.
 - **Attempt-evidence loss:** reusing transaction-level attempt fields could
   overwrite the reason and click phase of an earlier try. Dedicated permanent
   attempt rows, monotonic completion and immutability tests are mandatory.
+- **Reconciliation misattribution:** transaction-level resolution could attach
+  an operator decision to the wrong UNKNOWN try. Exact current-attempt matching,
+  atomic write-once reconciliation fields and multi-retry tests are mandatory.
 - **Mode leakage:** reusing Dashboard worker/monitoring state could reread the
   sheet or apply Validator. Separate controller/queue/timer is mandatory.
 
@@ -742,8 +784,9 @@ stop, browser recovery, maintenance and portable restart.
 6. Define and test PanelService additive manual submission result with explicit
    click phase. Verify selectors, remark, exact amount, panel history and any
    idempotency support in staging before choosing reconciliation automation.
-7. Add controller state machine, executor ownership, durable claims, UNKNOWN
-   recovery and fault-injection tests. Default to operator review.
+7. Add controller state machine, executor ownership, durable claims,
+   attempt-specific write-once UNKNOWN reconciliation/recovery and
+   fault-injection tests. Default to operator review.
 8. Add isolated Manual UI preview/confirmation/progress/reconciliation and
    mutually exclusive Dashboard mode coordinator.
 9. Run crash matrix, two-instance/concurrency, 1,000-row and portable-build
@@ -792,7 +835,8 @@ stop, browser recovery, maintenance and portable restart.
 11. **Panel reuse:** yes, browser and selectors can be shared through a new
     additive method; existing AUTO `submit_deposit` remains unchanged.
 12. **Remote success/DB failure:** stop submissions, retain/infer UNKNOWN,
-    require authoritative operator reconciliation, never blindly retry.
+    require authoritative operator reconciliation recorded once against the
+    exact UNKNOWN attempt ID, never blindly retry.
 13. **Half-cycle restart:** load persisted cycle; stale SUBMITTING -> UNKNOWN;
     keep SUCCESS and PENDING; show review rather than auto-start.
 14. **Resumable?** Selectively: UNKNOWN must first be reconciled; ordinary
@@ -802,12 +846,14 @@ stop, browser recovery, maintenance and portable restart.
 15. **Certainty classification:** committed/reconciled evidence = SUCCESS;
     proven pre-click/authoritative negative = definitely not submitted; any
     crossed-or-uncertain click boundary = UNKNOWN. The complete evidence and
-    phase for each try remains in its own permanent attempt row.
+    phase for each try remains in its own permanent attempt row, and every
+    UNKNOWN resolution is written once on that exact attempt.
 16. **Protective model:** cycle/source/executable/attempt tables, unique
     cycle/key and transaction/attempt-number constraints, immutable SUCCESS,
     durable PENDING -> SUBMITTING plus new-attempt claim, distinct
     FAILED_NOT_SUBMITTED and UNKNOWN, FAILURE_REVIEW retry-or-finalize decision,
-    and immutable finished attempt evidence.
+    immutable finished attempt evidence, and atomic write-once attempt-specific
+    reconciliation.
 17. **UI switch:** mutually exclusive coordinator; switching only at idle safe
     boundary; separate controllers/timers/models; no automatic resume/refill.
 18. **Tests before money:** all loader, duplicate, cycle, execution,

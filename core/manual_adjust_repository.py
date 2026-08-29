@@ -187,7 +187,7 @@ class ManualAdjustRepository:
                 raise ValueError("cycle is not RUNNING")
             if row["executor_id"] != executor_id:
                 raise ValueError("executor does not own cycle")
-            history = self._conn.execute("""SELECT attempt_id,attempt_no,result
+            history = self._conn.execute("""SELECT attempt_id,attempt_no,result,reconciled_outcome
               FROM manual_adjust_attempts WHERE transaction_id=? ORDER BY attempt_no""",
               (transaction_id,)).fetchall()
             expected = list(range(1, len(history) + 1))
@@ -200,6 +200,16 @@ class ManualAdjustRepository:
             if history:
                 if row["current_attempt_id"] != history[-1]["attempt_id"]:
                     raise ValueError("current_attempt_id does not identify latest attempt")
+                latest = history[-1]
+                retryable = (
+                    latest["result"] == AttemptResult.FAILED_NOT_SUBMITTED.value
+                    or (
+                        latest["result"] == AttemptResult.UNKNOWN.value
+                        and latest["reconciled_outcome"] == "NOT_SUBMITTED"
+                    )
+                )
+                if not retryable:
+                    raise ValueError("latest attempt does not prove retry eligibility")
             elif row["current_attempt_id"] is not None:
                 raise ValueError("current_attempt_id exists without attempt history")
             attempt_no = int(row["attempt_count"]) + 1
@@ -213,11 +223,20 @@ class ManualAdjustRepository:
             raise
         return self.get_attempt_history(transaction_id)[-1]
 
-    def finish_attempt(self, attempt_id: str, result: AttemptResult, *, click_crossed: bool,
+    def finish_attempt(self, attempt_id: str, result: AttemptResult, *, click_crossed: Optional[bool],
                        submission_phase: str, error_detail: Optional[str] = None,
                        evidence_detail: Optional[str] = None) -> None:
         if result is AttemptResult.IN_PROGRESS:
             raise ValueError("finish result must be terminal")
+        if not submission_phase or not submission_phase.strip():
+            raise ValueError("submission_phase is required")
+        if result is AttemptResult.SUCCESS and click_crossed is not True:
+            raise ValueError("SUCCESS requires click_crossed=True")
+        if result is AttemptResult.FAILED_NOT_SUBMITTED and click_crossed is not False:
+            raise ValueError("FAILED_NOT_SUBMITTED requires click_crossed=False")
+        if result is AttemptResult.UNKNOWN and click_crossed not in (True, None):
+            raise ValueError("UNKNOWN requires click_crossed=True or unknown boundary")
+        stored_click = None if click_crossed is None else int(click_crossed)
         now = _now()
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -225,7 +244,7 @@ class ManualAdjustRepository:
             if not row or row["result"] != AttemptResult.IN_PROGRESS.value:
                 raise ValueError("attempt is not IN_PROGRESS")
             self._conn.execute("UPDATE manual_adjust_attempts SET finished_at=?,result=?,click_crossed=?,submission_phase=?,error_detail=?,evidence_detail=? WHERE attempt_id=?",
-                (now,result.value,int(click_crossed),submission_phase,error_detail,evidence_detail,attempt_id))
+                (now,result.value,stored_click,submission_phase,error_detail,evidence_detail,attempt_id))
             changed = self._conn.execute("UPDATE manual_adjust_transactions SET status=?,processed_at=? WHERE transaction_id=? AND current_attempt_id=? AND status='SUBMITTING'",
                 (result.value,now,row["transaction_id"],attempt_id))
             if changed.rowcount != 1:
@@ -323,6 +342,18 @@ class ManualAdjustRepository:
                     errors.append(prefix + f"attempt {attempt['attempt_no']} has partial reconciliation")
                 if populated and attempt["result"] != AttemptResult.UNKNOWN.value:
                     errors.append(prefix + f"attempt {attempt['attempt_no']} reconciliation is not on UNKNOWN")
+                result = attempt["result"]
+                click = attempt["click_crossed"]
+                if result == AttemptResult.SUCCESS.value and click != 1:
+                    errors.append(prefix + f"attempt {attempt['attempt_no']} SUCCESS lacks crossed click boundary")
+                elif result == AttemptResult.FAILED_NOT_SUBMITTED.value and click != 0:
+                    errors.append(prefix + f"attempt {attempt['attempt_no']} FAILED_NOT_SUBMITTED has invalid click boundary")
+                elif result == AttemptResult.UNKNOWN.value and click not in (1, None):
+                    errors.append(prefix + f"attempt {attempt['attempt_no']} UNKNOWN has definitely-not-clicked boundary")
+                elif result == AttemptResult.IN_PROGRESS.value and click is not None:
+                    errors.append(prefix + f"attempt {attempt['attempt_no']} IN_PROGRESS has finalized click boundary")
+                if not attempt["submission_phase"] or not attempt["submission_phase"].strip():
+                    errors.append(prefix + f"attempt {attempt['attempt_no']} has blank submission phase")
 
             if current is not None and status in (TransactionStatus.SUCCESS.value,
                                                   TransactionStatus.FAILED_NOT_SUBMITTED.value):

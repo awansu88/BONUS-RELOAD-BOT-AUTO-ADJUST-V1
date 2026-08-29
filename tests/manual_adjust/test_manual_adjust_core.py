@@ -156,6 +156,69 @@ def test_claim_rejects_inconsistent_attempt_history(repo):
         repo.claim_pending(tx.transaction_id,"executor")
 
 
+@pytest.mark.parametrize("previous,reconciliation,allowed", [
+    (AttemptResult.SUCCESS,None,False),
+    (AttemptResult.UNKNOWN,None,False),
+    (AttemptResult.UNKNOWN,"SUCCESS",False),
+    (AttemptResult.FAILED_NOT_SUBMITTED,None,True),
+    (AttemptResult.UNKNOWN,"NOT_SUBMITTED",True),
+])
+def test_claim_enforces_latest_attempt_retry_eligibility(repo,previous,reconciliation,allowed):
+    cid = snapshot(repo,[rr(2,"u",1)])
+    activate(repo,cid)
+    tx = repo.get_pending_transactions(cid)[0]
+    attempt = repo.claim_pending(tx.transaction_id,"executor")
+    click = previous is not AttemptResult.FAILED_NOT_SUBMITTED
+    repo.finish_attempt(attempt["attempt_id"],previous,click_crossed=click,
+                        submission_phase="FINISHED")
+    if reconciliation:
+        repo.reconcile_unknown(tx.transaction_id,attempt["attempt_id"],reconciliation,
+            reconciled_by="operator",note="ledger checked",evidence="ledger row")
+    # Retry selection is a future lifecycle API; emulate its sole state change
+    # to prove claim_pending remains the final independent safety gate.
+    repo._conn.execute("UPDATE manual_adjust_transactions SET status='PENDING' WHERE transaction_id=?",
+                       (tx.transaction_id,))
+    if allowed:
+        claimed = repo.claim_pending(tx.transaction_id,"executor")
+        assert claimed["attempt_no"] == 2
+    else:
+        with pytest.raises(ValueError,match="retry eligibility"):
+            repo.claim_pending(tx.transaction_id,"executor")
+        assert len(repo.get_attempt_history(tx.transaction_id)) == 1
+
+
+@pytest.mark.parametrize("result,click,phase", [
+    (AttemptResult.SUCCESS,False,"DONE"),
+    (AttemptResult.SUCCESS,None,"DONE"),
+    (AttemptResult.FAILED_NOT_SUBMITTED,True,"FILL"),
+    (AttemptResult.FAILED_NOT_SUBMITTED,None,"FILL"),
+    (AttemptResult.UNKNOWN,False,"BEFORE_CLICK"),
+    (AttemptResult.UNKNOWN,True,"   "),
+])
+def test_finish_rejects_impossible_click_result_and_rolls_back(repo,result,click,phase):
+    cid = snapshot(repo,[rr(2,"u",1)])
+    activate(repo,cid)
+    tx = repo.get_pending_transactions(cid)[0]
+    attempt = repo.claim_pending(tx.transaction_id,"executor")
+    with pytest.raises(ValueError):
+        repo.finish_attempt(attempt["attempt_id"],result,click_crossed=click,
+                            submission_phase=phase)
+    unchanged = repo.get_attempt_history(tx.transaction_id)[0]
+    assert unchanged["result"] == "IN_PROGRESS"
+    assert unchanged["click_crossed"] is None
+    assert repo.get_transaction(tx.transaction_id).status.value == "SUBMITTING"
+
+
+def test_unknown_may_persist_genuinely_unknown_click_boundary(repo):
+    cid = snapshot(repo,[rr(2,"u",1)])
+    activate(repo,cid)
+    tx = repo.get_pending_transactions(cid)[0]
+    attempt = repo.claim_pending(tx.transaction_id,"executor")
+    repo.finish_attempt(attempt["attempt_id"],AttemptResult.UNKNOWN,
+                        click_crossed=None,submission_phase="BOUNDARY_UNKNOWN")
+    assert repo.get_attempt_history(tx.transaction_id)[0]["click_crossed"] is None
+
+
 def test_finish_attempt_rolls_back_attempt_on_transaction_mismatch(repo):
     cid = snapshot(repo,[rr(2,"u",1)])
     activate(repo,cid)
@@ -195,6 +258,20 @@ def test_validate_cycle_integrity_reports_locked_invariants(repo):
     repo._conn.execute("UPDATE manual_adjust_transactions SET status='SUCCESS' WHERE transaction_id=?",(tx.transaction_id,))
     errors = repo.validate_cycle_integrity(cid)
     assert any("SUCCESS does not match current attempt outcome" in e for e in errors)
+
+
+def test_integrity_reports_impossible_persisted_click_result(repo):
+    cid = snapshot(repo,[rr(2,"u",1)])
+    tx = repo.get_pending_transactions(cid)[0]
+    repo._conn.execute("""INSERT INTO manual_adjust_attempts
+      (attempt_id,transaction_id,attempt_no,executor_id,claimed_at,finished_at,result,
+       click_crossed,submission_phase,created_at)
+      VALUES('corrupt-click',?,1,'e','n','n','SUCCESS',0,'DONE','n')""",(tx.transaction_id,))
+    repo._conn.execute("""UPDATE manual_adjust_transactions
+      SET status='SUCCESS',attempt_count=1,current_attempt_id='corrupt-click'
+      WHERE transaction_id=?""",(tx.transaction_id,))
+    assert any("SUCCESS lacks crossed click boundary" in e
+               for e in repo.validate_cycle_integrity(cid))
 
 
 class FakeSheet:

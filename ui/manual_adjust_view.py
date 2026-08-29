@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QHeaderView,
-    QLabel, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
+    QComboBox, QLabel, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget)
 
 
@@ -19,6 +19,8 @@ class ManualAdjustView(QWidget):
     retry_requested = Signal()
     finalize_requested = Signal()
     reconcile_requested = Signal()
+    open_cycle_requested = Signal(str)
+    recover_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,6 +46,19 @@ class ManualAdjustView(QWidget):
         self.provenance = QLabel("Load is operator-initiated and reads MASTER exactly once.")
         self.provenance.setStyleSheet("color:#8A8C99")
         layout.addWidget(self.frozen); layout.addWidget(self.provenance)
+
+        discovery = QHBoxLayout()
+        self.cycle_selector = QComboBox()
+        self.cycle_selector.setPlaceholderText("SELECT A PERSISTED CYCLE")
+        self.open_cycle_button = QPushButton("OPEN SELECTED CYCLE")
+        self.recover_button = QPushButton("RECOVER STALE CYCLE")
+        self.open_cycle_button.clicked.connect(self._emit_open_cycle)
+        self.recover_button.clicked.connect(self.recover_requested)
+        self.recover_button.setEnabled(False)
+        discovery.addWidget(self.cycle_selector, 1)
+        discovery.addWidget(self.open_cycle_button)
+        discovery.addWidget(self.recover_button)
+        layout.addLayout(discovery)
 
         controls = QHBoxLayout()
         specs = (("OPEN PANEL", "open_panel", self.open_panel_requested),
@@ -103,11 +118,79 @@ class ManualAdjustView(QWidget):
         self.actions["retry"].setEnabled(status == "FAILURE_REVIEW")
         self.actions["finalize"].setEnabled(status == "FAILURE_REVIEW")
         self.actions["reconcile"].setEnabled(status == "REVIEW_REQUIRED")
+        self.recover_button.setEnabled(status == "RUNNING")
 
     def show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Manual snapshot failed", message)
 
+    def display_nonterminal_cycles(self, cycles: list[dict]) -> None:
+        """List restart candidates without implicitly activating one."""
+        self.cycle_selector.clear()
+        self.cycle_selector.addItem("SELECT A PERSISTED CYCLE", None)
+        for cycle in cycles:
+            self.cycle_selector.addItem(
+                f"{cycle['status']} • {cycle['created_at']} • {cycle['cycle_id']}",
+                cycle["cycle_id"],
+            )
+
+    def _emit_open_cycle(self) -> None:
+        cycle_id = self.cycle_selector.currentData()
+        if cycle_id:
+            self.open_cycle_requested.emit(str(cycle_id))
+
+    def selected_failure_ids(self) -> list[int]:
+        selected = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.checkState() == Qt.Checked:
+                selected.append(int(item.data(Qt.UserRole)))
+        return selected
+
+    def selected_unknown(self) -> dict | None:
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        return item.data(Qt.UserRole) if item else None
+
+    def display_failure_review(self, rows: list[dict]) -> None:
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(
+            ["SELECT", "USER ID", "TRUE AMOUNT", "ATTEMPT", "PHASE", "ERROR / EVIDENCE"])
+        self.table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            select = QTableWidgetItem("")
+            select.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            select.setCheckState(Qt.Unchecked)
+            select.setData(Qt.UserRole, int(row["transaction_id"]))
+            values = (row["username"], f"{row['adjust_amount']:,}", row.get("attempt_no") or "",
+                      row.get("submission_phase") or "",
+                      " • ".join(x for x in (row.get("error_detail"), row.get("evidence_detail")) if x))
+            self.table.setItem(index, 0, select)
+            for column, value in enumerate(values, 1):
+                self.table.setItem(index, column, QTableWidgetItem(str(value)))
+
+    def display_unknown_review(self, rows: list[dict]) -> None:
+        headers = ["USER ID", "TRUE AMOUNT", "ATTEMPT", "ATTEMPT ID", "CLAIMED", "SUBMIT STARTED",
+                   "CLICK BOUNDARY", "PHASE", "CLICK CROSSED", "ERROR", "EVIDENCE"]
+        self.table.setColumnCount(len(headers)); self.table.setHorizontalHeaderLabels(headers)
+        self.table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            identity = {"transaction_id": int(row["transaction_id"]),
+                        "attempt_id": row["current_attempt_id"]}
+            values = (row["username"], f"{row['adjust_amount']:,}", row.get("attempt_no") or "",
+                      row["current_attempt_id"], row.get("claimed_at") or "", row.get("submit_started_at") or "",
+                      row.get("submit_clicked_at") or "", row.get("submission_phase") or "",
+                      "UNKNOWN" if row.get("click_crossed") is None else bool(row["click_crossed"]),
+                      row.get("error_detail") or "", row.get("evidence_detail") or "")
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0: item.setData(Qt.UserRole, identity)
+                self.table.setItem(index, column, item)
+
     def display_preview(self, cycle: dict, summary, rows: list[dict]) -> None:
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["ROW", "USER ID", "TRUE AMOUNT", "STATUS", "SOURCE TX_ID", "REASON"])
         self.values["SOURCE ROWS"].setText(f"{summary.source_rows:,}")
         self.values["UNIQUE USERS"].setText(f"{summary.unique_users:,}")
         self.values["READY"].setText(f"{summary.ready:,}")

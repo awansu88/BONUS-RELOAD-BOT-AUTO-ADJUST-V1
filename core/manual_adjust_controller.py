@@ -101,8 +101,18 @@ class ManualAdjustController:
             except Exception:
                 durability_failed = True; self.hard_stopped = True; raise
 
-        result = self.panel.submit_adjustment(item.username, item.adjust_amount,
-                                              str(self.config.get("remark", "MANUAL ADJUST")), phase_hook)
+        try:
+            result = self.panel.submit_adjustment(item.username, item.adjust_amount,
+                                                  str(self.config.get("remark", "MANUAL ADJUST")), phase_hook)
+        except Exception as exc:
+            # The click boundary is unknowable when an adapter violates its
+            # result contract.  Preserve SUBMITTING for stale recovery rather
+            # than manufacturing a retryable terminal result.
+            self.current_transaction = None
+            self.hard_stopped = True
+            self._emergency(item, attempt_id, "PANEL_EXCEPTION", None, str(exc))
+            return ControllerStep("HARD_STOPPED", item.transaction_id,
+                                  "unexpected panel exception")
         self.current_transaction = None
         if durability_failed:
             self._emergency(item, attempt_id, result.phase, result.click_crossed, result.detail)
@@ -123,6 +133,7 @@ class ManualAdjustController:
 
     def retry_selected(self, cycle_id: str, transaction_ids: list[int], *, confirmed: bool) -> None:
         if not confirmed: raise RuntimeError("Retry confirmation is required.")
+        self._preflight(cycle_id)
         self.repository.prepare_failure_retries(cycle_id, transaction_ids)
         self.resume(cycle_id)
 

@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -859,6 +860,11 @@ class Dashboard(QMainWindow):
         self.manual_view.start_requested.connect(self._on_manual_start)
         self.manual_view.stop_requested.connect(self._on_manual_stop)
         self.manual_view.resume_requested.connect(self._on_manual_resume)
+        self.manual_view.retry_requested.connect(self._on_manual_retry)
+        self.manual_view.finalize_requested.connect(self._on_manual_finalize)
+        self.manual_view.reconcile_requested.connect(self._on_manual_reconcile)
+        self.manual_view.open_cycle_requested.connect(self._on_manual_open_cycle)
+        self.manual_view.recover_requested.connect(self._on_manual_recover)
         self.mode_stack = QStackedWidget()
         self.mode_stack.addWidget(self.auto_view)
         self.mode_stack.addWidget(self.manual_view)
@@ -894,9 +900,9 @@ class Dashboard(QMainWindow):
             self.worker_timer.stop()
             self.metrics_timer.stop()
             self.manual_view.set_sheet_connected(self.sheet.is_connected)
-            current = self.manual_state.current_preview(self.manual_repository)
-            if current:
-                self.manual_view.display_preview(*current)
+            self.manual_state.active_cycle_id = None
+            self.manual_view.display_nonterminal_cycles(
+                self.manual_repository.list_nonterminal_cycles())
             self.logger.info("[MANUAL] Mode selected")
         elif self.sheet.is_connected:
             interval = int(self.config.get("manual_reload_interval_sec", 90)) * 1000
@@ -969,6 +975,32 @@ class Dashboard(QMainWindow):
             self._refresh_manual_execution()
         except Exception as exc: self.manual_view.show_error(str(exc))
 
+    def _on_manual_open_cycle(self, cycle_id: str) -> None:
+        """Explicitly open a frozen SQLite cycle; never consult the Sheet."""
+        if not self.manual_repository: return
+        cycle = self.manual_repository.get_cycle(cycle_id)
+        if not cycle: self.manual_view.show_error("Persisted Manual cycle no longer exists."); return
+        self.manual_state.active_cycle_id = cycle_id
+        self.manual_view.display_preview(cycle, self.manual_repository.get_cycle_summary(cycle_id),
+                                         self.manual_repository.get_source_rows(cycle_id))
+        self._refresh_manual_execution()
+
+    def _on_manual_recover(self) -> None:
+        if not self.manual_controller or not self.manual_repository or not self.manual_state.active_cycle_id: return
+        cid = self.manual_state.active_cycle_id
+        cycle = self.manual_repository.get_cycle(cid)
+        if not cycle or cycle["status"] != "RUNNING":
+            self.manual_view.show_error("Only a selected persisted RUNNING cycle can be recovered."); return
+        timeout = int(self.config.get("manual_adjust", {}).get("lease_timeout_sec", 120))
+        if not self.manual_repository.is_lease_stale(cid, timeout):
+            self.manual_view.show_error("This Manual execution lease is still fresh and remains locked."); return
+        if QMessageBox.question(self, "Recover stale Manual cycle",
+                "Recover this stale cycle conservatively? Any SUBMITTING transaction becomes UNKNOWN. Execution will not start automatically.") != QMessageBox.Yes:
+            return
+        try:
+            self.manual_controller.recover_stale(cid); self._refresh_manual_execution()
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
     def _on_manual_stop(self) -> None:
         if self.manual_controller: self.manual_controller.request_stop()
 
@@ -976,12 +1008,70 @@ class Dashboard(QMainWindow):
         if not self.manual_controller or not self.manual_state.active_cycle_id: return
         try:
             self.manual_controller.resume(self.manual_state.active_cycle_id)
-            self.manual_worker_timer.start(100); self.manual_heartbeat_timer.start()
+            self.manual_worker_timer.start(100)
+            self.manual_heartbeat_timer.start(int(self.config.get("manual_adjust", {}).get("heartbeat_interval_sec", 10)) * 1000)
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
+    def _on_manual_retry(self) -> None:
+        if not self.manual_controller or not self.manual_state.active_cycle_id: return
+        selected = self.manual_view.selected_failure_ids()
+        if not selected:
+            self.manual_view.show_error("Select at least one definitely-not-submitted transaction."); return
+        if QMessageBox.question(self, "Confirm explicit retry",
+                f"Retry exactly {len(selected)} selected definitely-not-submitted transaction(s)? A new attempt will be created.") != QMessageBox.Yes:
+            return
+        try:
+            self.manual_controller.retry_selected(self.manual_state.active_cycle_id, selected, confirmed=True)
+            self.manual_worker_timer.start(100)
+            self.manual_heartbeat_timer.start(int(self.config.get("manual_adjust", {}).get("heartbeat_interval_sec", 10)) * 1000)
+            self._refresh_manual_execution()
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
+    def _on_manual_finalize(self) -> None:
+        if not self.manual_controller or not self.manual_repository or not self.manual_state.active_cycle_id: return
+        rows = self.manual_repository.get_transactions_by_status(self.manual_state.active_cycle_id, "FAILED_NOT_SUBMITTED")
+        amount = sum(int(row["adjust_amount"]) for row in rows)
+        if QMessageBox.question(self, "Finalize with failures",
+                f"Permanently complete this cycle with {len(rows)} failed record(s), total amount {amount:,}? These records cannot be retried in this cycle afterward.") != QMessageBox.Yes:
+            return
+        try:
+            self.manual_controller.finalize_with_failures(self.manual_state.active_cycle_id, confirmed=True)
+            self._refresh_manual_execution()
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
+    def _on_manual_reconcile(self) -> None:
+        if not self.manual_controller: return
+        identity = self.manual_view.selected_unknown()
+        if not identity:
+            self.manual_view.show_error("Select one UNKNOWN transaction to reconcile."); return
+        action, ok = QInputDialog.getItem(self, "Reconcile UNKNOWN", "Explicit outcome:",
+                                          ["MARK AS SUCCESS", "PROVE NOT SUBMITTED"], 0, False)
+        if not ok: return
+        if action == "PROVE NOT SUBMITTED" and QMessageBox.warning(self, "Authoritative evidence required",
+                "Use this only when authoritative panel evidence proves the adjustment was not submitted.",
+                QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel) != QMessageBox.Ok:
+            return
+        operator, ok = QInputDialog.getText(self, "Reconciliation", "Operator identity:")
+        if not ok or not operator.strip(): self.manual_view.show_error("Operator identity is required."); return
+        note, ok = QInputDialog.getText(self, "Reconciliation", "Reconciliation note:")
+        if not ok or not note.strip(): self.manual_view.show_error("A reconciliation note is required."); return
+        evidence, ok = QInputDialog.getText(self, "Reconciliation", "Authoritative evidence:")
+        if not ok or not evidence.strip(): self.manual_view.show_error("Reconciliation evidence is required."); return
+        outcome = "SUCCESS" if action == "MARK AS SUCCESS" else "NOT_SUBMITTED"
+        try:
+            self.manual_controller.reconcile_unknown(identity["transaction_id"], identity["attempt_id"], outcome,
+                reconciled_by=operator.strip(), note=note.strip(), evidence=evidence.strip())
+            self._refresh_manual_execution()
         except Exception as exc: self.manual_view.show_error(str(exc))
 
     def _manual_worker_step(self) -> None:
         if not self.manual_controller: self.manual_worker_timer.stop(); return
-        result = self.manual_controller.step(); self._refresh_manual_execution()
+        try:
+            result = self.manual_controller.step(); self._refresh_manual_execution()
+        except Exception as exc:
+            self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop()
+            self.logger.error(f"[MANUAL] Unexpected controller failure: {exc}")
+            return
         if result.state in ("STOPPED", "FAILURE_REVIEW", "REVIEW_REQUIRED", "COMPLETED", "HARD_STOPPED"):
             self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop()
 
@@ -997,6 +1087,12 @@ class Dashboard(QMainWindow):
         summary = self.manual_repository.get_cycle_execution_summary(self.manual_state.active_cycle_id)
         if cycle: self.manual_view.set_execution_state(cycle["status"], summary,
             execution_enabled=bool(self.config.get("manual_adjust", {}).get("execution_enabled", False)), panel_attached=self.panel.is_attached)
+        if cycle and cycle["status"] == "FAILURE_REVIEW":
+            self.manual_view.display_failure_review(self.manual_repository.get_transactions_by_status(
+                self.manual_state.active_cycle_id, "FAILED_NOT_SUBMITTED"))
+        elif cycle and cycle["status"] == "REVIEW_REQUIRED":
+            self.manual_view.display_unknown_review(self.manual_repository.get_transactions_by_status(
+                self.manual_state.active_cycle_id, "UNKNOWN"))
 
     def _wrap_scroll(self, widget: QWidget) -> QScrollArea:
         sc = QScrollArea()
@@ -1485,6 +1581,8 @@ class Dashboard(QMainWindow):
             self.btn_ready.setEnabled(True)
             self._panel_was_open = True
             self.logger.info(f"Panel opened: {url}")
+            if self.manual_state.mode is OperatingMode.MANUAL:
+                self._refresh_manual_execution()
         except Exception as exc:
             self._set_dot(self.dot_panel, "err")
             self.txt_panel.setText("Error")
@@ -1499,6 +1597,8 @@ class Dashboard(QMainWindow):
             self._panel_was_open = True
             self.logger.info("Panel attached")
             self.btn_start.setEnabled(self.queue is not None)
+            if self.manual_state.mode is OperatingMode.MANUAL:
+                self._refresh_manual_execution()
         except Exception as exc:
             self.logger.error(f"Attach failed: {exc}")
             QMessageBox.critical(self, "Attach error", str(exc))
@@ -1900,6 +2000,8 @@ class Dashboard(QMainWindow):
         self.txt_panel.setText("Closed")
         self.btn_ready.setEnabled(False)
         self.logger.warn("Panel window closed by operator")
+        if self.manual_state.mode is OperatingMode.MANUAL:
+            self._refresh_manual_execution()
 
     def _finalise_stop(self, note: str = "Worker stopped") -> None:
         self.worker_timer.stop()
@@ -2002,6 +2104,7 @@ class Dashboard(QMainWindow):
         for name in (
             "manual_timer", "worker_timer", "panel_timer",
             "metrics_timer", "watchdog_timer",
+            "manual_worker_timer", "manual_heartbeat_timer",
         ):
             t = getattr(self, name, None)
             if isinstance(t, QTimer):

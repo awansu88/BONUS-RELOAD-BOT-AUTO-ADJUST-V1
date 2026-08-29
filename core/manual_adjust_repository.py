@@ -540,17 +540,16 @@ class ManualAdjustRepository:
             row = self._conn.execute("""SELECT a.result,a.reconciled_outcome,t.status,t.current_attempt_id,t.cycle_id,c.status cycle_status
               FROM manual_adjust_attempts a JOIN manual_adjust_transactions t ON t.transaction_id=a.transaction_id
               JOIN manual_adjust_cycles c USING(cycle_id) WHERE a.attempt_id=? AND a.transaction_id=?""", (attempt_id, transaction_id)).fetchone()
-            if not row or row["cycle_status"] not in ("RUNNING", "REVIEW_REQUIRED") or row["result"] != "UNKNOWN" or row["status"] != "UNKNOWN" or row["current_attempt_id"] != attempt_id or row["reconciled_outcome"] is not None:
+            if not row or row["cycle_status"] != "REVIEW_REQUIRED" or row["result"] != "UNKNOWN" or row["status"] != "UNKNOWN" or row["current_attempt_id"] != attempt_id or row["reconciled_outcome"] is not None:
                 raise ValueError("exact current UNKNOWN attempt in review is required")
             self._conn.execute("UPDATE manual_adjust_attempts SET reconciled_outcome=?,reconciled_at=?,reconciled_by=?,reconciliation_note=?,reconciliation_evidence=? WHERE attempt_id=?", (outcome,now,reconciled_by,note,evidence,attempt_id))
             self._conn.execute("UPDATE manual_adjust_transactions SET status=?,processed_at=? WHERE transaction_id=?", (target,now,transaction_id))
             s = self._refresh_counts_locked(row["cycle_id"])
-            if row["cycle_status"] == "REVIEW_REQUIRED":
-                if s["unknown"]: dest = "REVIEW_REQUIRED"
-                elif s["pending"]: dest = "STOPPED"
-                elif s["failed"]: dest = "FAILURE_REVIEW"
-                else: dest = "COMPLETED"
-                self._conn.execute("UPDATE manual_adjust_cycles SET status=?,completed_at=? WHERE cycle_id=?", (dest, now if dest == "COMPLETED" else None, row["cycle_id"]))
+            if s["unknown"]: dest = "REVIEW_REQUIRED"
+            elif s["pending"]: dest = "STOPPED"
+            elif s["failed"]: dest = "FAILURE_REVIEW"
+            else: dest = "COMPLETED"
+            self._conn.execute("UPDATE manual_adjust_cycles SET status=?,completed_at=? WHERE cycle_id=?", (dest, now if dest == "COMPLETED" else None, row["cycle_id"]))
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK"); raise
@@ -563,10 +562,10 @@ class ManualAdjustRepository:
         now = _now()
         try:
             self._conn.execute("BEGIN IMMEDIATE")
-            rows = self._conn.execute("""SELECT t.transaction_id,t.current_attempt_id,a.submit_clicked_at FROM manual_adjust_transactions t
+            rows = self._conn.execute("""SELECT t.transaction_id,t.current_attempt_id,a.submit_clicked_at,a.submission_phase FROM manual_adjust_transactions t
               JOIN manual_adjust_attempts a ON a.attempt_id=t.current_attempt_id WHERE t.cycle_id=? AND t.status='SUBMITTING' AND a.result='IN_PROGRESS'""", (cycle_id,)).fetchall()
             for row in rows:
-                click = 1 if row["submit_clicked_at"] else None
+                click = 1 if row["submission_phase"] in {"CLICK_RETURNED", "WAITING_RESULT", "SUCCESS_OBSERVED"} else None
                 self._conn.execute("UPDATE manual_adjust_attempts SET result='UNKNOWN',finished_at=?,click_crossed=?,submission_phase='RECOVERED_STALE_SUBMITTING',error_detail='stale executor lease recovery' WHERE attempt_id=?", (now,click,row["current_attempt_id"]))
                 self._conn.execute("UPDATE manual_adjust_transactions SET status='UNKNOWN',processed_at=? WHERE transaction_id=?", (now,row["transaction_id"]))
             s = self._refresh_counts_locked(cycle_id)

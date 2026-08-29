@@ -4,6 +4,7 @@ from core.manual_adjust_loader import classify_rows, snapshot_fingerprint
 from core.manual_adjust_models import RawManualAdjustRow
 from core.manual_adjust_repository import ManualAdjustRepository
 from ui.manual_adjust_state import ManualPreviewState, OperatingMode
+from pathlib import Path
 
 
 class Loader:
@@ -31,6 +32,19 @@ def test_default_mode_and_auto_idle_switch_boundary():
     assert not allowed and "backend is not ready" in message
     assert state.select_mode(OperatingMode.MANUAL, "idle", lambda: None) == (True, "")
     assert state.mode is OperatingMode.MANUAL
+
+
+def test_phase4_dashboard_wires_review_and_recovery_actions():
+    source = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text(encoding="utf-8")
+    for connection in (
+        "retry_requested.connect(self._on_manual_retry)",
+        "finalize_requested.connect(self._on_manual_finalize)",
+        "reconcile_requested.connect(self._on_manual_reconcile)",
+        "open_cycle_requested.connect(self._on_manual_open_cycle)",
+        "recover_requested.connect(self._on_manual_recover)",
+    ):
+        assert connection in source
+    assert '"manual_worker_timer", "manual_heartbeat_timer"' in source
 
 
 def test_busy_auto_states_reject_manual_without_silent_switch():

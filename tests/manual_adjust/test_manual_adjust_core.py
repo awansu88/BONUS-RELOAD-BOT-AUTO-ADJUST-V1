@@ -111,6 +111,7 @@ def test_attempt_history_completion_immutability_and_reconciliation(repo):
         repo._conn.execute("UPDATE manual_adjust_attempts SET evidence_detail='changed' WHERE attempt_id=?",(attempt["attempt_id"],))
     with pytest.raises(ValueError):
         repo.reconcile_unknown(tx.transaction_id,attempt["attempt_id"],"SUCCESS",reconciled_by="",note="n",evidence="e")
+    assert repo.evaluate_cycle_destination(cid, "executor") == "REVIEW_REQUIRED"
     repo.reconcile_unknown(tx.transaction_id,attempt["attempt_id"],"SUCCESS",reconciled_by="op",note="checked",evidence="ledger")
     assert repo.get_transaction(tx.transaction_id).status.value == "SUCCESS"
     with pytest.raises(ValueError):
@@ -172,12 +173,15 @@ def test_claim_enforces_latest_attempt_retry_eligibility(repo,previous,reconcili
     repo.finish_attempt(attempt["attempt_id"],previous,click_crossed=click,
                         submission_phase="FINISHED")
     if reconciliation:
+        assert repo.evaluate_cycle_destination(cid, "executor") == "REVIEW_REQUIRED"
         repo.reconcile_unknown(tx.transaction_id,attempt["attempt_id"],reconciliation,
             reconciled_by="operator",note="ledger checked",evidence="ledger row")
     # Retry selection is a future lifecycle API; emulate its sole state change
     # to prove claim_pending remains the final independent safety gate.
     repo._conn.execute("UPDATE manual_adjust_transactions SET status='PENDING' WHERE transaction_id=?",
                        (tx.transaction_id,))
+    repo._conn.execute("UPDATE manual_adjust_cycles SET status='RUNNING',executor_id='executor',completed_at=NULL WHERE cycle_id=?",
+                       (cid,))
     if allowed:
         claimed = repo.claim_pending(tx.transaction_id,"executor")
         assert claimed["attempt_no"] == 2

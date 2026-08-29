@@ -19,10 +19,19 @@ class OperatingMode(str, Enum):
 class ManualPreviewState:
     mode: OperatingMode = OperatingMode.AUTO
     active_cycle_id: str | None = None
+    manual_backend_ready: bool = False
 
-    def select_mode(self, requested: OperatingMode, auto_state: str) -> tuple[bool, str]:
+    def select_mode(self, requested: OperatingMode, auto_state: str,
+                    prepare_manual=None) -> tuple[bool, str]:
         if requested is OperatingMode.MANUAL and auto_state != "idle":
             return False, "Stop AUTO Bonus Reload before switching mode."
+        if (requested is OperatingMode.MANUAL and not self.manual_backend_ready
+                and prepare_manual is not None):
+            try:
+                prepare_manual()
+            except Exception as exc:
+                return False, f"Full Manual Adjust is unavailable: {exc}"
+            self.manual_backend_ready = True
         self.mode = requested
         return True, ""
 

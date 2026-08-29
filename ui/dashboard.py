@@ -508,11 +508,10 @@ class Dashboard(QMainWindow):
         self.validator = Validator(config["bonus_rules"])
         self.queue: Optional[QueueManager] = None
         self.panel = PanelService(config, selectors)
-        # Manual uses additive tables in the exact database file already owned
-        # by DatabaseService.  It has no AUTO QueueManager/Validator dependency.
-        self.manual_repository = ManualAdjustRepository(self.db.path)
-        self.manual_repository.initialize_schema()
-        self.manual_loader = ManualAdjustLoader(self.sheet, self.manual_repository)
+        # Manual persistence is lazy so an unavailable additive schema can
+        # never prevent the frozen AUTO application from starting.
+        self.manual_repository: Optional[ManualAdjustRepository] = None
+        self.manual_loader: Optional[ManualAdjustLoader] = None
         self.manual_state = ManualPreviewState()
 
         # Timers
@@ -856,11 +855,17 @@ class Dashboard(QMainWindow):
 
     def _on_mode_selected(self, text: str) -> None:
         requested = OperatingMode(text)
-        allowed, message = self.manual_state.select_mode(requested, self.state)
+        allowed, message = self.manual_state.select_mode(
+            requested,
+            self.state,
+            self._ensure_manual_backend if requested is OperatingMode.MANUAL else None,
+        )
         if not allowed:
             self.mode_selector.blockSignals(True)
             self.mode_selector.setCurrentText(OperatingMode.AUTO.value)
             self.mode_selector.blockSignals(False)
+            if message.startswith("Full Manual Adjust is unavailable:"):
+                self.logger.error(f"[MANUAL] Backend initialization failed: {message}")
             QMessageBox.warning(self, "Mode switch blocked", message)
             return
         manual = requested is OperatingMode.MANUAL
@@ -879,6 +884,25 @@ class Dashboard(QMainWindow):
             interval = int(self.config.get("manual_reload_interval_sec", 90)) * 1000
             self.manual_timer.start(interval)
 
+    def _ensure_manual_backend(self) -> None:
+        """Initialize the additive Manual backend once, isolated from AUTO."""
+        if self.manual_repository is not None and self.manual_loader is not None:
+            return
+        repository = None
+        try:
+            repository = ManualAdjustRepository(self.db.path)
+            repository.initialize_schema()
+            loader = ManualAdjustLoader(self.sheet, repository)
+        except Exception:
+            if repository is not None:
+                try:
+                    repository.close()
+                except Exception:
+                    pass
+            raise
+        self.manual_repository = repository
+        self.manual_loader = loader
+
     def _on_manual_load(self) -> None:
         if self.manual_state.mode is not OperatingMode.MANUAL:
             return
@@ -887,6 +911,8 @@ class Dashboard(QMainWindow):
             return
         self.logger.info("[MANUAL] Loading snapshot")
         try:
+            if self.manual_repository is None or self.manual_loader is None:
+                raise RuntimeError("Manual backend is not initialized")
             cycle, summary, rows = self.manual_state.load_snapshot(
                 self.manual_loader, self.manual_repository
             )
@@ -1935,7 +1961,8 @@ class Dashboard(QMainWindow):
         # Additive Manual repository cleanup must never obstruct the frozen
         # AUTO shutdown/checkpoint/browser/crash-state sequence above.
         try:
-            self.manual_repository.close()
+            if self.manual_repository is not None:
+                self.manual_repository.close()
         except Exception:
             pass
 

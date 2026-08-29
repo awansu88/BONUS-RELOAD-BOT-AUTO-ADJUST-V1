@@ -40,6 +40,38 @@ def test_busy_auto_states_reject_manual_without_silent_switch():
         assert message == "Stop AUTO Bonus Reload before switching mode."
 
 
+def test_manual_backend_is_lazy_initialized_once_and_reused():
+    state = ManualPreviewState()
+    calls = 0
+
+    def initialize():
+        nonlocal calls
+        calls += 1
+
+    # Constructing the default state performs no backend work.
+    assert calls == 0 and state.mode is OperatingMode.AUTO
+    assert state.select_mode(OperatingMode.MANUAL, "idle", initialize) == (True, "")
+    assert calls == 1
+    state.select_mode(OperatingMode.AUTO, "idle")
+    assert state.select_mode(OperatingMode.MANUAL, "idle", initialize) == (True, "")
+    assert calls == 1
+
+
+def test_manual_backend_failure_keeps_auto_and_never_loads_snapshot():
+    state = ManualPreviewState()
+    loader_calls = 0
+
+    def fail():
+        raise OSError("schema unavailable")
+
+    allowed, message = state.select_mode(OperatingMode.MANUAL, "idle", fail)
+    assert not allowed
+    assert message == "Full Manual Adjust is unavailable: schema unavailable"
+    assert state.mode is OperatingMode.AUTO
+    assert state.active_cycle_id is None
+    assert loader_calls == 0
+
+
 def test_one_load_and_sqlite_only_refresh_preserve_auditable_preview(tmp_path):
     repository = ManualAdjustRepository(tmp_path / "processed.db")
     repository.initialize_schema()

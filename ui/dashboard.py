@@ -115,6 +115,28 @@ QLineEdit, QSpinBox, QPlainTextEdit, QTableWidget {
 QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus, QTableWidget:focus {
     border: 1px solid #F5B301;
 }
+QComboBox {
+    background-color: #17181F;
+    border: 1px solid #2F313C;
+    border-radius: 8px;
+    padding: 0 34px 0 14px;
+    color: #ECEBE4;
+    min-height: 34px;
+    font-size: 11px;
+    font-weight: 600;
+}
+QComboBox:hover, QComboBox:focus, QComboBox:on { border-color: #F5B301; }
+QComboBox::drop-down { border: 0; width: 32px; }
+QComboBox::down-arrow { width: 10px; height: 6px; }
+QComboBox QAbstractItemView {
+    background-color: #17181F;
+    color: #ECEBE4;
+    border: 1px solid #2F313C;
+    selection-background-color: #3B2E00;
+    selection-color: #F5B301;
+    outline: 0;
+    padding: 4px;
+}
 QPlainTextEdit {
     font-family: 'JetBrains Mono', 'Consolas', monospace;
     font-size: 12px;
@@ -757,7 +779,10 @@ class Dashboard(QMainWindow):
         top.addWidget(subtitle)
         self.mode_selector = QComboBox()
         self.mode_selector.setObjectName("operating-mode-selector")
+        self.mode_selector.setFixedSize(205, 36)
         self.mode_selector.addItems([mode.value for mode in OperatingMode])
+        self.mode_selector.view().setMinimumWidth(205)
+        self.mode_selector.view().setStyleSheet("QListView::item { min-height:32px; padding:0 12px; }")
         self.mode_selector.currentTextChanged.connect(self._on_mode_selected)
         top.addWidget(self.mode_selector)
         top.addStretch(1)

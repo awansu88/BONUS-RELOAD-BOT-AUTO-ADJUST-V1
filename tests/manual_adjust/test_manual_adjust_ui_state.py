@@ -53,9 +53,11 @@ def test_phase4_dashboard_wires_review_and_recovery_actions():
 def test_manual_running_panel_controls_and_handlers_are_locked():
     root = Path(__file__).parents[2]
     view_source = (root / "ui" / "manual_adjust_view.py").read_text(encoding="utf-8")
-    assert 'panel_mutation_enabled = status != "RUNNING"' in view_source
-    assert 'self.actions["open_panel"].setEnabled(panel_mutation_enabled)' in view_source
-    assert 'self.actions["attach_panel"].setEnabled(panel_mutation_enabled)' in view_source
+    running_actions = view_source[view_source.index('elif status == "RUNNING"'):
+                                  view_source.index('elif status == "STOPPED"')]
+    assert 'self.actions["stop"].show()' in running_actions
+    assert 'self.actions["open_panel"]' not in running_actions
+    assert 'self.actions["attach_panel"]' not in running_actions
 
     dashboard = (root / "ui" / "dashboard.py").read_text(encoding="utf-8")
     open_method = dashboard[dashboard.index("    def _on_open_panel"):dashboard.index("    def _on_ready")]

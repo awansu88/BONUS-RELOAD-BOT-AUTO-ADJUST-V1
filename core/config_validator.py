@@ -164,6 +164,50 @@ def validate_configuration(
 
     # ---- panel URL ----
     if cfg:
+        # Full Manual Adjust is additive.  In particular, never coerce strings
+        # such as "true" into permission to submit a financial transaction.
+        manual = cfg.get("manual_adjust")
+        manual_ok = True
+        manual_errors: list[str] = []
+        manual_absent = manual is None
+        if manual_absent:
+            # Backward-compatible v1.2 configurations have Manual execution
+            # disabled implicitly.
+            manual = {}
+        elif not isinstance(manual, dict):
+            manual_ok = False
+            manual_errors.append("manual_adjust must be an object")
+            manual = {}
+        enabled = manual.get("execution_enabled", False)
+        if type(enabled) is not bool:
+            manual_ok = False
+            manual_errors.append("execution_enabled must be literal true or false (invalid values never enable execution)")
+        lease = heartbeat = None
+        if not manual_absent:
+            remark = manual.get("remark")
+            if not isinstance(remark, str) or not remark.strip():
+                manual_ok = False
+                manual_errors.append("remark must be a non-empty string")
+            lease = manual.get("lease_timeout_sec")
+            heartbeat = manual.get("heartbeat_interval_sec")
+            if type(lease) is not int or lease <= 0:
+                manual_ok = False
+                manual_errors.append("lease_timeout_sec must be a positive integer")
+            if type(heartbeat) is not int or heartbeat <= 0:
+                manual_ok = False
+                manual_errors.append("heartbeat_interval_sec must be a positive integer")
+            if (type(lease) is int and lease > 0 and type(heartbeat) is int
+                    and heartbeat > 0 and heartbeat * 3 >= lease):
+                manual_ok = False
+                manual_errors.append("heartbeat_interval_sec * 3 must be less than lease_timeout_sec")
+        r.add(
+            "manual_adjust",
+            manual_ok,
+            "Manual section omitted; execution safely disabled" if manual_absent else
+            ("execution disabled when omitted" if manual_ok and "execution_enabled" not in manual else "; ".join(manual_errors)),
+            "restore the manual_adjust block from the seed config; keep execution_enabled false until an approved test",
+        )
+
         panel_url = str(cfg.get("panel_url") or "").strip()
         if not panel_url:
             r.add(

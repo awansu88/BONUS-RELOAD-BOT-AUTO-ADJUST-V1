@@ -259,6 +259,22 @@ class ManualAdjustRepository:
     def validate_cycle_integrity(self, cycle_id: str) -> list[str]:
         """Report persistence contradictions without attempting recovery."""
         errors: list[str] = []
+        cycle = self._conn.execute(
+            "SELECT status,executor_id,lease_heartbeat_at FROM manual_adjust_cycles WHERE cycle_id=?",
+            (cycle_id,),
+        ).fetchone()
+        if cycle is None:
+            return [f"cycle {cycle_id}: cycle does not exist"]
+        running_count = int(self._conn.execute(
+            "SELECT COUNT(*) FROM manual_adjust_cycles WHERE status='RUNNING'"
+        ).fetchone()[0])
+        if running_count > 1:
+            errors.append("multiple RUNNING Manual cycles")
+        if cycle["status"] == "RUNNING":
+            if not cycle["executor_id"]:
+                errors.append("RUNNING cycle requires executor_id")
+        elif cycle["executor_id"] is not None or cycle["lease_heartbeat_at"] is not None:
+            errors.append(f"{cycle['status']} cycle cannot retain executor ownership")
         transactions = self._conn.execute(
             "SELECT * FROM manual_adjust_transactions WHERE cycle_id=?",
             (cycle_id,),
@@ -570,11 +586,8 @@ class ManualAdjustRepository:
             self._conn.execute("ROLLBACK"); raise
 
     def recover_stale_cycle(self, cycle_id: str, lease_timeout_sec: int) -> str:
-        if lease_timeout_sec <= 0:
+        if type(lease_timeout_sec) is not int or lease_timeout_sec <= 0:
             raise ValueError("valid lease timeout is required")
-        if self.validate_cycle_integrity(cycle_id):
-            self._conn.execute("UPDATE manual_adjust_cycles SET status='REVIEW_REQUIRED' WHERE cycle_id=? AND status='RUNNING'", (cycle_id,))
-            raise ValueError("cycle integrity validation failed; review required")
         now = _now()
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=lease_timeout_sec)
         try:
@@ -585,6 +598,18 @@ class ManualAdjustRepository:
             if (cycle["lease_heartbeat_at"] and
                     datetime.fromisoformat(cycle["lease_heartbeat_at"]) >= cutoff):
                 raise ValueError("cycle lease is not stale")
+            # Missing ownership and multiple RUNNING cycles are precisely the
+            # cycle-level anomalies this explicit stale operation can resolve.
+            # Every transaction/attempt contradiction remains non-repairable.
+            allowed_cycle_errors = {
+                "multiple RUNNING Manual cycles",
+                "RUNNING cycle requires executor_id",
+            }
+            integrity_errors = self.validate_cycle_integrity(cycle_id)
+            blocking = [error for error in integrity_errors
+                        if error not in allowed_cycle_errors]
+            if blocking:
+                raise ValueError("cycle integrity validation failed: " + "; ".join(blocking))
             rows = self._conn.execute("""SELECT t.transaction_id,t.current_attempt_id,a.submit_clicked_at,a.submission_phase FROM manual_adjust_transactions t
               JOIN manual_adjust_attempts a ON a.attempt_id=t.current_attempt_id WHERE t.cycle_id=? AND t.status='SUBMITTING' AND a.result='IN_PROGRESS'""", (cycle_id,)).fetchall()
             for row in rows:

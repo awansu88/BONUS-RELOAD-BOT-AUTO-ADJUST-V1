@@ -34,6 +34,7 @@ class ManualAdjustView(QWidget):
         self._execution_status = "PREVIEW"
         self._pause_requested = False
         self._pending_count = 0
+        self._active_cycle_selected = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -85,7 +86,7 @@ class ManualAdjustView(QWidget):
         specs = (
             ("LOAD MANUAL DATA", "load", self.load_requested),
             ("OPEN PANEL", "open_panel", self.open_panel_requested),
-            ("ATTACH PANEL", "attach_panel", self.attach_panel_requested),
+            ("READY", "attach_panel", self.attach_panel_requested),
             ("START MANUAL ADJUST", "start", self.start_requested),
             ("PAUSE", "stop", self.stop_requested), ("CONTINUE", "resume", self.resume_requested),
             ("RETRY SELECTED", "retry", self.retry_requested),
@@ -159,10 +160,11 @@ class ManualAdjustView(QWidget):
         self.provenance.setWordWrap(True); self.provenance.setStyleSheet("color:#8A8C99;font-size:11px")
         box.addWidget(self.frozen); box.addWidget(self.provenance)
 
+        box.addWidget(self._title("Previous / Recovery Cycles"))
         cycle_row = QHBoxLayout(); cycle_row.setSpacing(8)
         self.cycle_selector = QComboBox(); self.cycle_selector.setObjectName("manual-cycle-selector")
-        self.cycle_selector.setPlaceholderText("SELECT A PERSISTED CYCLE")
-        self.open_cycle_button = QPushButton("OPEN SELECTED CYCLE")
+        self.cycle_selector.setPlaceholderText("SELECT PERSISTED CYCLE")
+        self.open_cycle_button = QPushButton("OPEN")
         self.recover_button = QPushButton("RECOVER STALE CYCLE")
         self.open_cycle_button.clicked.connect(self._emit_open_cycle); self.recover_button.clicked.connect(self.recover_requested)
         cycle_row.addWidget(self.cycle_selector, 1); cycle_row.addWidget(self.open_cycle_button); cycle_row.addWidget(self.recover_button)
@@ -215,8 +217,11 @@ class ManualAdjustView(QWidget):
 
     def set_execution_state(self, status: str, summary: dict | None = None, *,
                             execution_enabled: bool = False, panel_attached: bool = False,
-                            panel_open: bool = False) -> None:
+                            panel_open: bool = False,
+                            active_cycle_selected: bool | None = None) -> None:
         summary = summary or {}; self._execution_status = status
+        if active_cycle_selected is not None:
+            self._active_cycle_selected = active_cycle_selected
         if status != "RUNNING": self._pause_requested = False
         shown = self._operator_status(status)
         self.execution_status.setText(shown); self.status_values["MANUAL CYCLE"].setText(shown)
@@ -248,6 +253,7 @@ class ManualAdjustView(QWidget):
                                panel_open: bool = False) -> None:
         """Clear only the visible selection while preserving persisted cycles."""
         self._pause_requested = False
+        self._active_cycle_selected = False
         self.frozen.setText("NO SNAPSHOT LOADED")
         self.provenance.setText(
             "Connect Google Sheets and click LOAD MANUAL DATA to freeze the current MASTER rows for review.")
@@ -272,6 +278,7 @@ class ManualAdjustView(QWidget):
             self.actions["open_panel"].setEnabled(True); self.actions["attach_panel"].setEnabled(True)
             self.actions["start"].setEnabled(getattr(self, "_execution_enabled", False)
                                              and getattr(self, "_panel_attached", False)
+                                             and self._active_cycle_selected
                                              and self._pending_count > 0)
         elif status == "RUNNING":
             self.actions["stop"].show(); self.actions["stop"].setText("PAUSING..." if self._pause_requested else "PAUSE")
@@ -289,7 +296,7 @@ class ManualAdjustView(QWidget):
         QMessageBox.critical(self, "Manual snapshot failed", message)
 
     def display_nonterminal_cycles(self, cycles: list[dict]) -> None:
-        self.cycle_selector.clear(); self.cycle_selector.addItem("SELECT A PERSISTED CYCLE", None)
+        self.cycle_selector.clear(); self.cycle_selector.addItem("SELECT PERSISTED CYCLE", None)
         for cycle in cycles:
             self.cycle_selector.addItem(f"{self._operator_status(cycle['status'])} • {cycle['created_at']} • {cycle['cycle_id']}", cycle["cycle_id"])
 

@@ -31,9 +31,20 @@ def test_manual_signals_and_preview_actions_remain_available():
                  "retry_requested", "finalize_requested", "reconcile_requested",
                  "open_cycle_requested", "recover_requested"):
         assert hasattr(view, name)
-    view.set_execution_state("PREVIEW", {"pending": 2}, execution_enabled=True, panel_attached=True)
+    view.set_execution_state("PREVIEW", {"pending": 2}, execution_enabled=True,
+                             panel_attached=True, active_cycle_selected=True)
     assert all(_visible(view, key) for key in ("load", "open_panel", "attach_panel", "start"))
     assert view.actions["start"].isEnabled()
+    assert view.actions["attach_panel"].text() == "READY"
+
+
+def test_start_requires_an_explicitly_active_cycle_and_recovery_ui_remains_available():
+    view = _view()
+    view.set_execution_state("PREVIEW", {"pending": 2}, execution_enabled=True,
+                             panel_attached=True, active_cycle_selected=False)
+    assert not view.actions["start"].isEnabled()
+    assert view.cycle_selector.placeholderText() == "SELECT PERSISTED CYCLE"
+    assert view.open_cycle_button.text() == "OPEN"
 
 
 def test_lifecycle_actions_are_taller_than_standard_actions():

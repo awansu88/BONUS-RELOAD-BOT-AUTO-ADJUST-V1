@@ -130,6 +130,39 @@ def test_running_cycle_pins_load_and_persisted_selection():
     assert state.active_cycle_id == "cycle-a"
 
 
+def test_fresh_snapshot_is_the_active_cycle_through_panel_ready_and_start_flow(tmp_path):
+    repository = ManualAdjustRepository(tmp_path / "normal-flow.db")
+    repository.initialize_schema()
+    try:
+        state, loader = ManualPreviewState(), Loader(repository)
+        cycle = state.load_snapshot(loader, repository)[0]
+        assert loader.calls == 1
+        assert state.active_cycle_id == cycle["cycle_id"]
+
+        dashboard = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text(encoding="utf-8")
+        open_method = dashboard[dashboard.index("    def _on_open_panel"):
+                                dashboard.index("    def _on_ready")]
+        ready_method = dashboard[dashboard.index("    def _on_ready"):
+                                 dashboard.index("    def _poll_panel_alive")]
+        start_method = dashboard[dashboard.index("    def _on_manual_start"):
+                                 dashboard.index("    def _on_manual_open_cycle")]
+        assert "active_cycle_id =" not in open_method
+        assert "active_cycle_id =" not in ready_method
+        assert "self.panel.open_panel(url)" in open_method
+        assert "self.panel.attach()" in ready_method
+        assert "cid = self.manual_state.active_cycle_id" in start_method
+        assert "self.manual_controller.start(cid, confirmed=True)" in start_method
+        assert "manual_loader" not in open_method + ready_method + start_method
+        assert loader.calls == 1
+    finally:
+        repository.close()
+
+
+def test_fresh_startup_does_not_choose_an_old_cycle():
+    state = ManualPreviewState(manual_backend_ready=True)
+    assert state.active_cycle_id is None
+
+
 def test_authoritative_manual_execution_blocks_auto_without_ui_selection():
     assert manual_execution_blocks_auto(controller_cycle_status="RUNNING",
         current_transaction=False, worker_active=False, heartbeat_active=False)

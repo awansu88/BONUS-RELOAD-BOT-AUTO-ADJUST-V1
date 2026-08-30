@@ -33,6 +33,12 @@
     "polling_delay_sec": 2,
     "monitoring_interval_sec": 10,
     "remark": "BONUS RELOAD AUTO",
+    "manual_adjust": {
+        "execution_enabled": false,
+        "remark": "MANUAL ADJUST",
+        "lease_timeout_sec": 120,
+        "heartbeat_interval_sec": 10
+    },
     "browser": {
         "headless": false,
         "viewport": { "width": 1366, "height": 768 },

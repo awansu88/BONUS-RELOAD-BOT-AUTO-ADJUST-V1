@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -65,7 +66,9 @@ from core.maintenance import MaintenanceService
 from core.crash_state import CrashState, CrashStateStore
 from core.manual_adjust_loader import ManualAdjustLoader
 from core.manual_adjust_repository import ManualAdjustRepository
-from ui.manual_adjust_state import ManualPreviewState, OperatingMode
+from core.manual_adjust_controller import ManualAdjustController
+from ui.manual_adjust_state import (ManualPreviewState, OperatingMode,
+                                    manual_execution_blocks_auto)
 from ui.manual_adjust_view import ManualAdjustView
 
 
@@ -512,6 +515,7 @@ class Dashboard(QMainWindow):
         # never prevent the frozen AUTO application from starting.
         self.manual_repository: Optional[ManualAdjustRepository] = None
         self.manual_loader: Optional[ManualAdjustLoader] = None
+        self.manual_controller: Optional[ManualAdjustController] = None
         self.manual_state = ManualPreviewState()
 
         # Timers
@@ -521,6 +525,10 @@ class Dashboard(QMainWindow):
         self.worker_timer = QTimer(self)
         self.worker_timer.setSingleShot(False)
         self.worker_timer.timeout.connect(self._worker_step)
+        self.manual_worker_timer = QTimer(self)
+        self.manual_worker_timer.timeout.connect(self._manual_worker_step)
+        self.manual_heartbeat_timer = QTimer(self)
+        self.manual_heartbeat_timer.timeout.connect(self._manual_heartbeat)
 
         # Periodic panel-alive poll: detects operator closing the browser
         # window (X) so Panel Status can auto-return to "Closed".
@@ -848,6 +856,16 @@ class Dashboard(QMainWindow):
         self.auto_view = splitter
         self.manual_view = ManualAdjustView(self)
         self.manual_view.load_requested.connect(self._on_manual_load)
+        self.manual_view.open_panel_requested.connect(self._on_open_panel)
+        self.manual_view.attach_panel_requested.connect(self._on_ready)
+        self.manual_view.start_requested.connect(self._on_manual_start)
+        self.manual_view.stop_requested.connect(self._on_manual_stop)
+        self.manual_view.resume_requested.connect(self._on_manual_resume)
+        self.manual_view.retry_requested.connect(self._on_manual_retry)
+        self.manual_view.finalize_requested.connect(self._on_manual_finalize)
+        self.manual_view.reconcile_requested.connect(self._on_manual_reconcile)
+        self.manual_view.open_cycle_requested.connect(self._on_manual_open_cycle)
+        self.manual_view.recover_requested.connect(self._on_manual_recover)
         self.mode_stack = QStackedWidget()
         self.mode_stack.addWidget(self.auto_view)
         self.mode_stack.addWidget(self.manual_view)
@@ -855,6 +873,10 @@ class Dashboard(QMainWindow):
 
     def _on_mode_selected(self, text: str) -> None:
         requested = OperatingMode(text)
+        if requested is OperatingMode.AUTO and self._manual_execution_blocks_auto():
+            self.mode_selector.blockSignals(True); self.mode_selector.setCurrentText(OperatingMode.MANUAL.value); self.mode_selector.blockSignals(False)
+            QMessageBox.warning(self, "Mode switch blocked", "STOP or recover the live Manual execution cycle before switching to AUTO.")
+            return
         allowed, message = self.manual_state.select_mode(
             requested,
             self.state,
@@ -876,13 +898,43 @@ class Dashboard(QMainWindow):
             self.worker_timer.stop()
             self.metrics_timer.stop()
             self.manual_view.set_sheet_connected(self.sheet.is_connected)
-            current = self.manual_state.current_preview(self.manual_repository)
-            if current:
-                self.manual_view.display_preview(*current)
+            self.manual_state.active_cycle_id = None
+            self.manual_view.display_nonterminal_cycles(
+                self.manual_repository.list_nonterminal_cycles())
             self.logger.info("[MANUAL] Mode selected")
-        elif self.sheet.is_connected:
-            interval = int(self.config.get("manual_reload_interval_sec", 90)) * 1000
-            self.manual_timer.start(interval)
+        else:
+            # Defense in depth: Manual can perform no background work after
+            # AUTO becomes the selected execution mode.
+            self.manual_worker_timer.stop()
+            self.manual_heartbeat_timer.stop()
+            if self.sheet.is_connected:
+                interval = int(self.config.get("manual_reload_interval_sec", 90)) * 1000
+                self.manual_timer.start(interval)
+
+    def _manual_live_cycle_id(self) -> Optional[str]:
+        if not self.manual_controller or not self.manual_repository or not self.manual_controller.cycle_id:
+            return None
+        cycle = self.manual_repository.get_cycle(self.manual_controller.cycle_id)
+        return self.manual_controller.cycle_id if cycle and cycle["status"] == "RUNNING" else None
+
+    def _manual_execution_blocks_auto(self) -> bool:
+        status = None
+        if self.manual_controller and self.manual_repository and self.manual_controller.cycle_id:
+            cycle = self.manual_repository.get_cycle(self.manual_controller.cycle_id)
+            status = cycle["status"] if cycle else None
+        return manual_execution_blocks_auto(
+            controller_cycle_status=status,
+            current_transaction=bool(self.manual_controller and self.manual_controller.current_transaction is not None),
+            worker_active=self.manual_worker_timer.isActive(),
+            heartbeat_active=self.manual_heartbeat_timer.isActive(),
+        )
+
+    def _reject_other_manual_cycle(self, target_cycle_id: str) -> bool:
+        live = self._manual_live_cycle_id()
+        if live is not None and target_cycle_id != live:
+            self.manual_view.show_error("Stop the live Manual execution cycle before selecting or operating another cycle.")
+            return True
+        return False
 
     def _ensure_manual_backend(self) -> None:
         """Initialize the additive Manual backend once, isolated from AUTO."""
@@ -893,6 +945,8 @@ class Dashboard(QMainWindow):
             repository = ManualAdjustRepository(self.db.path)
             repository.initialize_schema()
             loader = ManualAdjustLoader(self.sheet, repository)
+            controller = ManualAdjustController(repository, self.panel, self.config,
+                                                evidence_dir=self.app_dir / "screenshots")
         except Exception:
             if repository is not None:
                 try:
@@ -902,6 +956,7 @@ class Dashboard(QMainWindow):
             raise
         self.manual_repository = repository
         self.manual_loader = loader
+        self.manual_controller = controller
 
     def _on_manual_load(self) -> None:
         if self.manual_state.mode is not OperatingMode.MANUAL:
@@ -909,23 +964,188 @@ class Dashboard(QMainWindow):
         if not self.sheet.is_connected:
             self.manual_view.show_error("Connect the Google Sheet before loading Manual data.")
             return
+        live = self._manual_live_cycle_id()
+        if live is not None:
+            self.manual_state.active_cycle_id = live
+            self.manual_view.show_error("Stop the running Manual cycle before loading new data.")
+            return
         self.logger.info("[MANUAL] Loading snapshot")
         try:
             if self.manual_repository is None or self.manual_loader is None:
                 raise RuntimeError("Manual backend is not initialized")
             cycle, summary, rows = self.manual_state.load_snapshot(
-                self.manual_loader, self.manual_repository
+                self.manual_loader, self.manual_repository, live_cycle_id=live
             )
         except Exception as exc:
             self.logger.error(f"[MANUAL] Snapshot load failed: {exc}")
             self.manual_view.show_error(str(exc))
             return
         self.manual_view.display_preview(cycle, summary, rows)
+        execution = self.manual_repository.get_cycle_execution_summary(cycle["cycle_id"])
+        self.manual_view.set_execution_state(cycle["status"], execution,
+            execution_enabled=bool(self.config.get("manual_adjust", {}).get("execution_enabled", False)),
+            panel_attached=self.panel.is_attached)
         self.logger.info(f"[MANUAL] Snapshot frozen — cycle {cycle['cycle_id']}")
         self.logger.info(
             f"[MANUAL] {summary.ready} READY / {summary.duplicates} DUPLICATE / "
             f"{summary.invalid} INVALID"
         )
+
+    def _on_manual_start(self) -> None:
+        if not self.manual_controller or not self.manual_repository or not self.manual_state.active_cycle_id:
+            return
+        cid = self.manual_state.active_cycle_id
+        if self._reject_other_manual_cycle(cid): return
+        summary = self.manual_repository.get_cycle_execution_summary(cid)
+        cycle = self.manual_repository.get_cycle(cid)
+        total = int(cycle["total_amount"]) if cycle else 0
+        answer = QMessageBox.question(self, "Confirm Manual Adjust",
+            f"Executable Users: {summary['pending']:,}\nTotal Adjustment: {total:,}\n\nThese adjustments will be submitted to the panel using TRUE AMOUNT exactly 1:1.")
+        if answer != QMessageBox.Yes: return
+        try:
+            self.manual_controller.start(cid, confirmed=True)
+            self.manual_worker_timer.start(100)
+            self.manual_heartbeat_timer.start(int(self.config.get("manual_adjust", {}).get("heartbeat_interval_sec", 10)) * 1000)
+            self._refresh_manual_execution()
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
+    def _on_manual_open_cycle(self, cycle_id: str) -> None:
+        """Explicitly open a frozen SQLite cycle; never consult the Sheet."""
+        if not self.manual_repository: return
+        if self._reject_other_manual_cycle(cycle_id): return
+        cycle = self.manual_repository.get_cycle(cycle_id)
+        if not cycle: self.manual_view.show_error("Persisted Manual cycle no longer exists."); return
+        try:
+            self.manual_state.select_persisted_cycle(cycle_id,
+                live_cycle_id=self._manual_live_cycle_id())
+        except RuntimeError as exc:
+            self.manual_view.show_error(str(exc)); return
+        self.manual_view.display_preview(cycle, self.manual_repository.get_cycle_summary(cycle_id),
+                                         self.manual_repository.get_source_rows(cycle_id))
+        self._refresh_manual_execution()
+
+    def _on_manual_recover(self) -> None:
+        if not self.manual_controller or not self.manual_repository or not self.manual_state.active_cycle_id: return
+        cid = self.manual_state.active_cycle_id
+        if self._reject_other_manual_cycle(cid): return
+        cycle = self.manual_repository.get_cycle(cid)
+        if not cycle or cycle["status"] != "RUNNING":
+            self.manual_view.show_error("Only a selected persisted RUNNING cycle can be recovered."); return
+        timeout = int(self.config.get("manual_adjust", {}).get("lease_timeout_sec", 120))
+        if not self.manual_repository.is_lease_stale(cid, timeout):
+            self.manual_view.show_error("This Manual execution lease is still fresh and remains locked."); return
+        if QMessageBox.question(self, "Recover stale Manual cycle",
+                "Recover this stale cycle conservatively? Any SUBMITTING transaction becomes UNKNOWN. Execution will not start automatically.") != QMessageBox.Yes:
+            return
+        try:
+            self.manual_controller.recover_stale(cid); self._refresh_manual_execution()
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
+    def _on_manual_stop(self) -> None:
+        if self.manual_controller: self.manual_controller.request_stop()
+
+    def _on_manual_resume(self) -> None:
+        if not self.manual_controller or not self.manual_state.active_cycle_id: return
+        if self._reject_other_manual_cycle(self.manual_state.active_cycle_id): return
+        try:
+            self.manual_controller.resume(self.manual_state.active_cycle_id)
+            self.manual_worker_timer.start(100)
+            self.manual_heartbeat_timer.start(int(self.config.get("manual_adjust", {}).get("heartbeat_interval_sec", 10)) * 1000)
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
+    def _on_manual_retry(self) -> None:
+        if not self.manual_controller or not self.manual_state.active_cycle_id: return
+        if self._reject_other_manual_cycle(self.manual_state.active_cycle_id): return
+        selected = self.manual_view.selected_failure_ids()
+        if not selected:
+            self.manual_view.show_error("Select at least one definitely-not-submitted transaction."); return
+        if QMessageBox.question(self, "Confirm explicit retry",
+                f"Retry exactly {len(selected)} selected definitely-not-submitted transaction(s)? A new attempt will be created.") != QMessageBox.Yes:
+            return
+        try:
+            self.manual_controller.retry_selected(self.manual_state.active_cycle_id, selected, confirmed=True)
+            self.manual_worker_timer.start(100)
+            self.manual_heartbeat_timer.start(int(self.config.get("manual_adjust", {}).get("heartbeat_interval_sec", 10)) * 1000)
+            self._refresh_manual_execution()
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
+    def _on_manual_finalize(self) -> None:
+        if not self.manual_controller or not self.manual_repository or not self.manual_state.active_cycle_id: return
+        if self._reject_other_manual_cycle(self.manual_state.active_cycle_id): return
+        rows = self.manual_repository.get_transactions_by_status(self.manual_state.active_cycle_id, "FAILED_NOT_SUBMITTED")
+        amount = sum(int(row["adjust_amount"]) for row in rows)
+        if QMessageBox.question(self, "Finalize with failures",
+                f"Permanently complete this cycle with {len(rows)} failed record(s), total amount {amount:,}? These records cannot be retried in this cycle afterward.") != QMessageBox.Yes:
+            return
+        try:
+            self.manual_controller.finalize_with_failures(self.manual_state.active_cycle_id, confirmed=True)
+            self._refresh_manual_execution()
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
+    def _on_manual_reconcile(self) -> None:
+        if not self.manual_controller: return
+        if (self.manual_state.active_cycle_id and
+                self._reject_other_manual_cycle(self.manual_state.active_cycle_id)): return
+        identity = self.manual_view.selected_unknown()
+        if not identity:
+            self.manual_view.show_error("Select one UNKNOWN transaction to reconcile."); return
+        action, ok = QInputDialog.getItem(self, "Reconcile UNKNOWN", "Explicit outcome:",
+                                          ["MARK AS SUCCESS", "PROVE NOT SUBMITTED"], 0, False)
+        if not ok: return
+        if action == "PROVE NOT SUBMITTED" and QMessageBox.warning(self, "Authoritative evidence required",
+                "Use this only when authoritative panel evidence proves the adjustment was not submitted.",
+                QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel) != QMessageBox.Ok:
+            return
+        operator, ok = QInputDialog.getText(self, "Reconciliation", "Operator identity:")
+        if not ok or not operator.strip(): self.manual_view.show_error("Operator identity is required."); return
+        note, ok = QInputDialog.getText(self, "Reconciliation", "Reconciliation note:")
+        if not ok or not note.strip(): self.manual_view.show_error("A reconciliation note is required."); return
+        evidence, ok = QInputDialog.getText(self, "Reconciliation", "Authoritative evidence:")
+        if not ok or not evidence.strip(): self.manual_view.show_error("Reconciliation evidence is required."); return
+        outcome = "SUCCESS" if action == "MARK AS SUCCESS" else "NOT_SUBMITTED"
+        try:
+            self.manual_controller.reconcile_unknown(identity["transaction_id"], identity["attempt_id"], outcome,
+                reconciled_by=operator.strip(), note=note.strip(), evidence=evidence.strip())
+            self._refresh_manual_execution()
+        except Exception as exc: self.manual_view.show_error(str(exc))
+
+    def _manual_worker_step(self) -> None:
+        if not self.manual_controller: self.manual_worker_timer.stop(); return
+        if self.manual_state.mode is not OperatingMode.MANUAL:
+            self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop(); return
+        try:
+            result = self.manual_controller.step(); self._refresh_manual_execution()
+        except Exception as exc:
+            self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop()
+            self.logger.error(f"[MANUAL] Unexpected controller failure: {exc}")
+            return
+        if result.state in ("STOPPED", "FAILURE_REVIEW", "REVIEW_REQUIRED", "COMPLETED", "HARD_STOPPED"):
+            self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop()
+
+    def _manual_heartbeat(self) -> None:
+        if self.manual_state.mode is not OperatingMode.MANUAL:
+            self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop(); return
+        try:
+            if self.manual_controller: self.manual_controller.heartbeat()
+        except Exception as exc:
+            self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop(); self.logger.error(f"[MANUAL] Lease lost: {exc}")
+
+    def _refresh_manual_execution(self) -> None:
+        if not self.manual_repository: return
+        live = self._manual_live_cycle_id()
+        if live is not None:
+            self.manual_state.active_cycle_id = live
+        if not self.manual_state.active_cycle_id: return
+        cycle = self.manual_repository.get_cycle(self.manual_state.active_cycle_id)
+        summary = self.manual_repository.get_cycle_execution_summary(self.manual_state.active_cycle_id)
+        if cycle: self.manual_view.set_execution_state(cycle["status"], summary,
+            execution_enabled=bool(self.config.get("manual_adjust", {}).get("execution_enabled", False)), panel_attached=self.panel.is_attached)
+        if cycle and cycle["status"] == "FAILURE_REVIEW":
+            self.manual_view.display_failure_review(self.manual_repository.get_transactions_by_status(
+                self.manual_state.active_cycle_id, "FAILED_NOT_SUBMITTED"))
+        elif cycle and cycle["status"] == "REVIEW_REQUIRED":
+            self.manual_view.display_unknown_review(self.manual_repository.get_transactions_by_status(
+                self.manual_state.active_cycle_id, "UNKNOWN"))
 
     def _wrap_scroll(self, widget: QWidget) -> QScrollArea:
         sc = QScrollArea()
@@ -1399,6 +1619,11 @@ class Dashboard(QMainWindow):
             self.logger.warn(f"Fresh manual-list fetch failed: {exc}")
 
     def _on_open_panel(self) -> None:
+        if (self.manual_state.mode is OperatingMode.MANUAL and
+                self._manual_live_cycle_id() is not None):
+            QMessageBox.warning(self, "Manual execution running",
+                "Stop Manual Adjust before opening or re-attaching the panel.")
+            return
         url = self.config.get("panel_url", "").strip()
         if not url:
             QMessageBox.warning(
@@ -1414,6 +1639,8 @@ class Dashboard(QMainWindow):
             self.btn_ready.setEnabled(True)
             self._panel_was_open = True
             self.logger.info(f"Panel opened: {url}")
+            if self.manual_state.mode is OperatingMode.MANUAL:
+                self._refresh_manual_execution()
         except Exception as exc:
             self._set_dot(self.dot_panel, "err")
             self.txt_panel.setText("Error")
@@ -1421,6 +1648,11 @@ class Dashboard(QMainWindow):
             QMessageBox.critical(self, "Panel error", str(exc))
 
     def _on_ready(self) -> None:
+        if (self.manual_state.mode is OperatingMode.MANUAL and
+                self._manual_live_cycle_id() is not None):
+            QMessageBox.warning(self, "Manual execution running",
+                "Stop Manual Adjust before opening or re-attaching the panel.")
+            return
         try:
             self.panel.attach()
             self._set_dot(self.dot_panel, "ok")
@@ -1428,6 +1660,8 @@ class Dashboard(QMainWindow):
             self._panel_was_open = True
             self.logger.info("Panel attached")
             self.btn_start.setEnabled(self.queue is not None)
+            if self.manual_state.mode is OperatingMode.MANUAL:
+                self._refresh_manual_execution()
         except Exception as exc:
             self.logger.error(f"Attach failed: {exc}")
             QMessageBox.critical(self, "Attach error", str(exc))
@@ -1829,6 +2063,8 @@ class Dashboard(QMainWindow):
         self.txt_panel.setText("Closed")
         self.btn_ready.setEnabled(False)
         self.logger.warn("Panel window closed by operator")
+        if self.manual_state.mode is OperatingMode.MANUAL:
+            self._refresh_manual_execution()
 
     def _finalise_stop(self, note: str = "Worker stopped") -> None:
         self.worker_timer.stop()
@@ -1931,6 +2167,7 @@ class Dashboard(QMainWindow):
         for name in (
             "manual_timer", "worker_timer", "panel_timer",
             "metrics_timer", "watchdog_timer",
+            "manual_worker_timer", "manual_heartbeat_timer",
         ):
             t = getattr(self, name, None)
             if isinstance(t, QTimer):

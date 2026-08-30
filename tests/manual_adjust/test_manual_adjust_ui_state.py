@@ -3,7 +3,11 @@ from __future__ import annotations
 from core.manual_adjust_loader import classify_rows, snapshot_fingerprint
 from core.manual_adjust_models import RawManualAdjustRow
 from core.manual_adjust_repository import ManualAdjustRepository
-from ui.manual_adjust_state import ManualPreviewState, OperatingMode
+from ui.manual_adjust_state import (ManualPreviewState, OperatingMode,
+                                    manual_execution_blocks_auto)
+from pathlib import Path
+
+import pytest
 
 
 class Loader:
@@ -27,8 +31,69 @@ class Loader:
 def test_default_mode_and_auto_idle_switch_boundary():
     state = ManualPreviewState()
     assert state.mode is OperatingMode.AUTO
-    assert state.select_mode(OperatingMode.MANUAL, "idle") == (True, "")
+    allowed, message = state.select_mode(OperatingMode.MANUAL, "idle")
+    assert not allowed and "backend is not ready" in message
+    assert state.select_mode(OperatingMode.MANUAL, "idle", lambda: None) == (True, "")
     assert state.mode is OperatingMode.MANUAL
+
+
+def test_phase4_dashboard_wires_review_and_recovery_actions():
+    source = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text(encoding="utf-8")
+    for connection in (
+        "retry_requested.connect(self._on_manual_retry)",
+        "finalize_requested.connect(self._on_manual_finalize)",
+        "reconcile_requested.connect(self._on_manual_reconcile)",
+        "open_cycle_requested.connect(self._on_manual_open_cycle)",
+        "recover_requested.connect(self._on_manual_recover)",
+    ):
+        assert connection in source
+    assert '"manual_worker_timer", "manual_heartbeat_timer"' in source
+
+
+def test_manual_running_panel_controls_and_handlers_are_locked():
+    root = Path(__file__).parents[2]
+    view_source = (root / "ui" / "manual_adjust_view.py").read_text(encoding="utf-8")
+    assert 'panel_mutation_enabled = status != "RUNNING"' in view_source
+    assert 'self.actions["open_panel"].setEnabled(panel_mutation_enabled)' in view_source
+    assert 'self.actions["attach_panel"].setEnabled(panel_mutation_enabled)' in view_source
+
+    dashboard = (root / "ui" / "dashboard.py").read_text(encoding="utf-8")
+    open_method = dashboard[dashboard.index("    def _on_open_panel"):dashboard.index("    def _on_ready")]
+    ready_method = dashboard[dashboard.index("    def _on_ready"):dashboard.index("    def _poll_panel_alive")]
+    for method, mutation in ((open_method, "self.panel.open_panel"),
+                             (ready_method, "self.panel.attach")):
+        guard = method.index("self.manual_state.mode is OperatingMode.MANUAL")
+        rejection = method.index("Stop Manual Adjust before opening or re-attaching the panel.")
+        call = method.index(mutation)
+        assert guard < rejection < call
+    # The condition is Manual-only, preserving the frozen AUTO path.
+    assert "self._manual_live_cycle_id() is not None" in open_method
+    assert "self._manual_live_cycle_id() is not None" in ready_method
+
+
+def test_running_cycle_pins_load_and_persisted_selection():
+    state = ManualPreviewState(manual_backend_ready=True, active_cycle_id="cycle-a")
+    class Loader:
+        calls = 0
+        def load(self): self.calls += 1; return "cycle-b"
+    loader = Loader()
+    with pytest.raises(RuntimeError, match="running Manual cycle"):
+        state.load_snapshot(loader, object(), live_cycle_id="cycle-a")
+    assert loader.calls == 0 and state.active_cycle_id == "cycle-a"
+    with pytest.raises(RuntimeError, match="opening another cycle"):
+        state.select_persisted_cycle("cycle-b", live_cycle_id="cycle-a")
+    assert state.active_cycle_id == "cycle-a"
+
+
+def test_authoritative_manual_execution_blocks_auto_without_ui_selection():
+    assert manual_execution_blocks_auto(controller_cycle_status="RUNNING",
+        current_transaction=False, worker_active=False, heartbeat_active=False)
+    assert manual_execution_blocks_auto(controller_cycle_status="STOPPED",
+        current_transaction=True, worker_active=False, heartbeat_active=False)
+    assert manual_execution_blocks_auto(controller_cycle_status="STOPPED",
+        current_transaction=False, worker_active=True, heartbeat_active=False)
+    assert not manual_execution_blocks_auto(controller_cycle_status="STOPPED",
+        current_transaction=False, worker_active=False, heartbeat_active=False)
 
 
 def test_busy_auto_states_reject_manual_without_silent_switch():

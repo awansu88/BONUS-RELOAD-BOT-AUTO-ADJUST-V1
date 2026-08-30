@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -240,8 +240,10 @@ class ManualAdjustRepository:
         now = _now()
         try:
             self._conn.execute("BEGIN IMMEDIATE")
-            row = self._conn.execute("SELECT transaction_id,result FROM manual_adjust_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
-            if not row or row["result"] != AttemptResult.IN_PROGRESS.value:
+            row = self._conn.execute("""SELECT a.transaction_id,a.result,a.executor_id,c.status cycle_status,c.executor_id cycle_executor
+              FROM manual_adjust_attempts a JOIN manual_adjust_transactions t USING(transaction_id)
+              JOIN manual_adjust_cycles c USING(cycle_id) WHERE a.attempt_id=?""", (attempt_id,)).fetchone()
+            if not row or row["result"] != AttemptResult.IN_PROGRESS.value or row["cycle_status"] != "RUNNING" or row["executor_id"] != row["cycle_executor"]:
                 raise ValueError("attempt is not IN_PROGRESS")
             self._conn.execute("UPDATE manual_adjust_attempts SET finished_at=?,result=?,click_crossed=?,submission_phase=?,error_detail=?,evidence_detail=? WHERE attempt_id=?",
                 (now,result.value,stored_click,submission_phase,error_detail,evidence_detail,attempt_id))
@@ -249,27 +251,6 @@ class ManualAdjustRepository:
                 (result.value,now,row["transaction_id"],attempt_id))
             if changed.rowcount != 1:
                 raise ValueError("matching SUBMITTING transaction transition failed")
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
-
-    def reconcile_unknown(self, transaction_id: int, attempt_id: str, outcome: str, *, reconciled_by: str,
-                          note: str, evidence: str) -> None:
-        if outcome not in {"SUCCESS", "NOT_SUBMITTED"} or not all((reconciled_by, note, evidence)):
-            raise ValueError("complete valid reconciliation fields are required")
-        target = "SUCCESS" if outcome == "SUCCESS" else "FAILED_NOT_SUBMITTED"
-        now = _now()
-        try:
-            self._conn.execute("BEGIN IMMEDIATE")
-            row = self._conn.execute("""SELECT a.result,a.reconciled_outcome,t.status,t.current_attempt_id
-              FROM manual_adjust_attempts a JOIN manual_adjust_transactions t ON t.transaction_id=a.transaction_id
-              WHERE a.attempt_id=? AND a.transaction_id=?""", (attempt_id,transaction_id)).fetchone()
-            if not row or row["result"] != "UNKNOWN" or row["status"] != "UNKNOWN" or row["current_attempt_id"] != attempt_id or row["reconciled_outcome"] is not None:
-                raise ValueError("exact current UNKNOWN attempt is required")
-            self._conn.execute("""UPDATE manual_adjust_attempts SET reconciled_outcome=?,reconciled_at=?,reconciled_by=?,reconciliation_note=?,reconciliation_evidence=? WHERE attempt_id=?""",
-                (outcome,now,reconciled_by,note,evidence,attempt_id))
-            self._conn.execute("UPDATE manual_adjust_transactions SET status=?,processed_at=? WHERE transaction_id=?", (target,now,transaction_id))
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -367,3 +348,258 @@ class ManualAdjustRepository:
                                                 TransactionStatus.FAILED_NOT_SUBMITTED.value):
                 errors.append(prefix + f"{status} requires a current attempt")
         return errors
+
+    # Phase 4 lifecycle -------------------------------------------------
+    def list_nonterminal_cycles(self) -> list[dict]:
+        states = ('PREVIEW','RUNNING','STOPPED','FAILURE_REVIEW','REVIEW_REQUIRED')
+        marks = ','.join('?' for _ in states)
+        return [dict(r) for r in self._conn.execute(
+            f"SELECT * FROM manual_adjust_cycles WHERE status IN ({marks}) ORDER BY created_at DESC",
+            states)]
+
+    def get_transactions_by_status(self, cycle_id: str, status: str) -> list[dict]:
+        return [dict(r) for r in self._conn.execute("""SELECT t.*,s.source_row,a.attempt_no,a.claimed_at,
+          a.submit_started_at,a.submit_clicked_at,a.submission_phase,a.click_crossed,a.error_detail,a.evidence_detail
+          FROM manual_adjust_transactions t JOIN manual_adjust_source_rows s USING(source_row_id)
+          LEFT JOIN manual_adjust_attempts a ON a.attempt_id=t.current_attempt_id
+          WHERE t.cycle_id=? AND t.status=? ORDER BY s.source_row""", (cycle_id, status))]
+
+    def get_cycle_execution_summary(self, cycle_id: str) -> dict:
+        counts = {s.value: 0 for s in TransactionStatus}
+        amount = 0
+        for row in self._conn.execute("SELECT status,COUNT(*) n,COALESCE(SUM(adjust_amount),0) amount FROM manual_adjust_transactions WHERE cycle_id=? GROUP BY status", (cycle_id,)):
+            counts[row["status"]] = int(row["n"])
+            if row["status"] == "SUCCESS":
+                amount = int(row["amount"])
+        return {"success": counts["SUCCESS"], "failed": counts["FAILED_NOT_SUBMITTED"],
+                "unknown": counts["UNKNOWN"], "pending": counts["PENDING"],
+                "submitting": counts["SUBMITTING"], "total_adjusted_successfully": amount}
+
+    def _refresh_counts_locked(self, cycle_id: str) -> dict:
+        summary = self.get_cycle_execution_summary(cycle_id)
+        self._conn.execute("UPDATE manual_adjust_cycles SET success_count=?,failed_count=?,unknown_count=? WHERE cycle_id=?",
+                           (summary["success"], summary["failed"], summary["unknown"], cycle_id))
+        return summary
+
+    def confirm_and_start(self, cycle_id: str, executor_id: str, lease_timeout_sec: int = 120) -> None:
+        self._start_transition(cycle_id, executor_id, "PREVIEW", lease_timeout_sec, confirmed=True)
+
+    def resume_cycle(self, cycle_id: str, executor_id: str, lease_timeout_sec: int = 120) -> None:
+        self._start_transition(cycle_id, executor_id, "STOPPED", lease_timeout_sec, confirmed=False)
+
+    def _start_transition(self, cycle_id: str, executor_id: str, source: str,
+                          lease_timeout_sec: int, confirmed: bool) -> None:
+        if not executor_id or lease_timeout_sec <= 0:
+            raise ValueError("valid executor and lease timeout are required")
+        if self.validate_cycle_integrity(cycle_id):
+            raise ValueError("cycle integrity validation failed")
+        now = _now()
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=lease_timeout_sec)
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cycle = self._conn.execute("SELECT status FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+            if not cycle or cycle["status"] != source:
+                raise ValueError(f"cycle is not {source}")
+            if self._conn.execute("SELECT 1 FROM manual_adjust_transactions WHERE cycle_id=? AND status='UNKNOWN'", (cycle_id,)).fetchone():
+                raise ValueError("unresolved UNKNOWN blocks execution")
+            if not self._conn.execute("SELECT 1 FROM manual_adjust_transactions WHERE cycle_id=? AND status='PENDING'", (cycle_id,)).fetchone():
+                raise ValueError("cycle has no PENDING transactions")
+            conflict = self._conn.execute("""SELECT cycle_id,lease_heartbeat_at
+              FROM manual_adjust_cycles WHERE status='RUNNING' AND cycle_id<>?
+              ORDER BY created_at LIMIT 1""", (cycle_id,)).fetchone()
+            if conflict:
+                heartbeat = conflict["lease_heartbeat_at"]
+                if heartbeat and datetime.fromisoformat(heartbeat) >= cutoff:
+                    raise ValueError("another Manual cycle has a fresh execution lease")
+                raise ValueError("recover stale Manual cycle first")
+            fields = "status='RUNNING',executor_id=?,lease_heartbeat_at=?,started_at=COALESCE(started_at,?)"
+            params: list[object] = [executor_id, now, now]
+            if confirmed:
+                fields += ",confirmed_at=COALESCE(confirmed_at,?)"; params.append(now)
+            params.append(cycle_id)
+            self._conn.execute(f"UPDATE manual_adjust_cycles SET {fields} WHERE cycle_id=?", params)
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK"); raise
+
+    def acquire_cycle(self, cycle_id: str, executor_id: str, lease_timeout_sec: int = 120) -> None:
+        """Re-acquire only an already RUNNING cycle owned by this executor."""
+        now = _now()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute("SELECT status,executor_id,lease_heartbeat_at FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+            if not row or row["status"] != "RUNNING" or row["executor_id"] != executor_id:
+                raise ValueError("RUNNING cycle is not owned by executor")
+            self._conn.execute("UPDATE manual_adjust_cycles SET lease_heartbeat_at=? WHERE cycle_id=?", (now, cycle_id))
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK"); raise
+
+    def heartbeat_cycle(self, cycle_id: str, executor_id: str) -> None:
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute("SELECT status,executor_id FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+            if not row or row["status"] != "RUNNING" or row["executor_id"] != executor_id:
+                raise ValueError("executor does not own active cycle")
+            if self._conn.execute("SELECT 1 FROM manual_adjust_cycles WHERE status='RUNNING' AND cycle_id<>? LIMIT 1", (cycle_id,)).fetchone():
+                raise ValueError("multiple RUNNING Manual cycles require recovery")
+            self._conn.execute("UPDATE manual_adjust_cycles SET lease_heartbeat_at=? WHERE cycle_id=?", (_now(), cycle_id))
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK"); raise
+
+    def release_cycle(self, cycle_id: str, executor_id: str) -> None:
+        changed = self._conn.execute("UPDATE manual_adjust_cycles SET executor_id=NULL,lease_heartbeat_at=NULL WHERE cycle_id=? AND status<>'RUNNING' AND executor_id=?", (cycle_id, executor_id))
+        if changed.rowcount != 1:
+            raise ValueError("cycle cannot be released")
+
+    def is_lease_stale(self, cycle_id: str, lease_timeout_sec: int) -> bool:
+        row = self._conn.execute("SELECT status,lease_heartbeat_at FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+        if not row or row["status"] != "RUNNING":
+            return False
+        if not row["lease_heartbeat_at"]:
+            return True
+        heartbeat = datetime.fromisoformat(row["lease_heartbeat_at"])
+        return datetime.now(timezone.utc) - heartbeat > timedelta(seconds=lease_timeout_sec)
+
+    def record_attempt_phase(self, attempt_id: str, executor_id: str, phase: str) -> None:
+        order = ("CLAIMED","FORM_STARTED","USERNAME_FILLED","AMOUNT_FILLED","REMARK_FILLED",
+                 "READY_TO_CLICK","SUBMIT_CLICK_BOUNDARY","CLICK_RETURNED","WAITING_RESULT","SUCCESS_OBSERVED")
+        if phase not in order:
+            raise ValueError("invalid submission phase")
+        now = _now()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute("""SELECT a.submission_phase,a.result,t.status,t.current_attempt_id,c.status cycle_status,c.executor_id
+              FROM manual_adjust_attempts a JOIN manual_adjust_transactions t USING(transaction_id)
+              JOIN manual_adjust_cycles c USING(cycle_id) WHERE a.attempt_id=?""", (attempt_id,)).fetchone()
+            if not row or row["result"] != "IN_PROGRESS" or row["status"] != "SUBMITTING" or row["current_attempt_id"] != attempt_id or row["cycle_status"] != "RUNNING" or row["executor_id"] != executor_id:
+                raise ValueError("attempt phase ownership check failed")
+            if order.index(phase) < order.index(row["submission_phase"]):
+                raise ValueError("attempt phase cannot move backwards")
+            started = now if phase == "FORM_STARTED" else None
+            clicked = now if phase == "SUBMIT_CLICK_BOUNDARY" else None
+            self._conn.execute("""UPDATE manual_adjust_attempts SET submission_phase=?,
+              submit_started_at=COALESCE(submit_started_at,?),submit_clicked_at=COALESCE(submit_clicked_at,?) WHERE attempt_id=?""",
+              (phase, started, clicked, attempt_id))
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK"); raise
+
+    def record_submit_started(self, attempt_id: str, executor_id: str) -> None:
+        self.record_attempt_phase(attempt_id, executor_id, "FORM_STARTED")
+
+    def record_submit_click_boundary(self, attempt_id: str, executor_id: str) -> None:
+        self.record_attempt_phase(attempt_id, executor_id, "SUBMIT_CLICK_BOUNDARY")
+
+    def evaluate_cycle_destination(self, cycle_id: str, executor_id: Optional[str] = None,
+                                   stopped: bool = False) -> str:
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cycle = self._conn.execute("SELECT status,executor_id FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+            if not cycle or cycle["status"] != "RUNNING" or (executor_id and cycle["executor_id"] != executor_id):
+                raise ValueError("active cycle ownership required")
+            s = self._refresh_counts_locked(cycle_id)
+            if s["submitting"]:
+                raise ValueError("cannot finalize with SUBMITTING work")
+            if s["unknown"]: dest = "REVIEW_REQUIRED"
+            elif stopped and s["pending"]: dest = "STOPPED"
+            elif s["pending"]: dest = "RUNNING"
+            elif s["failed"]: dest = "FAILURE_REVIEW"
+            else: dest = "COMPLETED"
+            if dest != "RUNNING":
+                completed = _now() if dest == "COMPLETED" else None
+                self._conn.execute("UPDATE manual_adjust_cycles SET status=?,stopped_at=?,completed_at=?,executor_id=NULL,lease_heartbeat_at=NULL WHERE cycle_id=?",
+                                   (dest, _now() if dest == "STOPPED" else None, completed, cycle_id))
+            self._conn.execute("COMMIT"); return dest
+        except Exception:
+            self._conn.execute("ROLLBACK"); raise
+
+    def prepare_failure_retries(self, cycle_id: str, transaction_ids: Iterable[int]) -> None:
+        ids = list(transaction_ids)
+        if not ids or len(ids) != len(set(ids)):
+            raise ValueError("unique selected transactions are required")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cycle = self._conn.execute("SELECT status FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+            if not cycle or cycle["status"] != "FAILURE_REVIEW": raise ValueError("cycle is not FAILURE_REVIEW")
+            for txid in ids:
+                row = self._conn.execute("""SELECT t.status,a.result,a.click_crossed,a.reconciled_outcome FROM manual_adjust_transactions t
+                  JOIN manual_adjust_attempts a ON a.attempt_id=t.current_attempt_id WHERE t.transaction_id=? AND t.cycle_id=?""", (txid, cycle_id)).fetchone()
+                proven = row and ((row["result"] == "FAILED_NOT_SUBMITTED" and row["click_crossed"] == 0)
+                    or (row["result"] == "UNKNOWN" and row["reconciled_outcome"] == "NOT_SUBMITTED"))
+                if not row or row["status"] != "FAILED_NOT_SUBMITTED" or not proven:
+                    raise ValueError("selected transaction is not definitely retryable")
+            marks = ','.join('?' for _ in ids)
+            self._conn.execute(f"UPDATE manual_adjust_transactions SET status='PENDING',processed_at=NULL WHERE cycle_id=? AND transaction_id IN ({marks})", [cycle_id, *ids])
+            self._refresh_counts_locked(cycle_id); self._conn.execute("UPDATE manual_adjust_cycles SET status='STOPPED' WHERE cycle_id=?", (cycle_id,))
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK"); raise
+
+    def finalize_with_failures(self, cycle_id: str) -> None:
+        now = _now()
+        changed = self._conn.execute("""UPDATE manual_adjust_cycles SET status='COMPLETED',completed_at=?,executor_id=NULL,lease_heartbeat_at=NULL
+          WHERE cycle_id=? AND status='FAILURE_REVIEW' AND NOT EXISTS
+          (SELECT 1 FROM manual_adjust_transactions WHERE cycle_id=? AND status IN ('PENDING','SUBMITTING','UNKNOWN'))""", (now, cycle_id, cycle_id))
+        if changed.rowcount != 1: raise ValueError("cycle cannot be finalized with failures")
+
+    def reconcile_unknown(self, transaction_id: int, attempt_id: str, outcome: str, *, reconciled_by: str,
+                          note: str, evidence: str) -> None:
+        # Reconciliation and lifecycle destination are one atomic operation.
+        if outcome not in {"SUCCESS", "NOT_SUBMITTED"} or not all(x and x.strip() for x in (reconciled_by, note, evidence)):
+            raise ValueError("complete valid reconciliation fields are required")
+        target = "SUCCESS" if outcome == "SUCCESS" else "FAILED_NOT_SUBMITTED"; now = _now()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute("""SELECT a.result,a.reconciled_outcome,t.status,t.current_attempt_id,t.cycle_id,c.status cycle_status
+              FROM manual_adjust_attempts a JOIN manual_adjust_transactions t ON t.transaction_id=a.transaction_id
+              JOIN manual_adjust_cycles c USING(cycle_id) WHERE a.attempt_id=? AND a.transaction_id=?""", (attempt_id, transaction_id)).fetchone()
+            if not row or row["cycle_status"] != "REVIEW_REQUIRED" or row["result"] != "UNKNOWN" or row["status"] != "UNKNOWN" or row["current_attempt_id"] != attempt_id or row["reconciled_outcome"] is not None:
+                raise ValueError("exact current UNKNOWN attempt in review is required")
+            self._conn.execute("UPDATE manual_adjust_attempts SET reconciled_outcome=?,reconciled_at=?,reconciled_by=?,reconciliation_note=?,reconciliation_evidence=? WHERE attempt_id=?", (outcome,now,reconciled_by,note,evidence,attempt_id))
+            self._conn.execute("UPDATE manual_adjust_transactions SET status=?,processed_at=? WHERE transaction_id=?", (target,now,transaction_id))
+            s = self._refresh_counts_locked(row["cycle_id"])
+            if s["unknown"]: dest = "REVIEW_REQUIRED"
+            elif s["pending"]: dest = "STOPPED"
+            elif s["failed"]: dest = "FAILURE_REVIEW"
+            else: dest = "COMPLETED"
+            self._conn.execute("UPDATE manual_adjust_cycles SET status=?,completed_at=? WHERE cycle_id=?", (dest, now if dest == "COMPLETED" else None, row["cycle_id"]))
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK"); raise
+
+    def recover_stale_cycle(self, cycle_id: str, lease_timeout_sec: int) -> str:
+        if lease_timeout_sec <= 0:
+            raise ValueError("valid lease timeout is required")
+        if self.validate_cycle_integrity(cycle_id):
+            self._conn.execute("UPDATE manual_adjust_cycles SET status='REVIEW_REQUIRED' WHERE cycle_id=? AND status='RUNNING'", (cycle_id,))
+            raise ValueError("cycle integrity validation failed; review required")
+        now = _now()
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=lease_timeout_sec)
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cycle = self._conn.execute("SELECT status,lease_heartbeat_at FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+            if not cycle or cycle["status"] != "RUNNING":
+                raise ValueError("cycle is not RUNNING")
+            if (cycle["lease_heartbeat_at"] and
+                    datetime.fromisoformat(cycle["lease_heartbeat_at"]) >= cutoff):
+                raise ValueError("cycle lease is not stale")
+            rows = self._conn.execute("""SELECT t.transaction_id,t.current_attempt_id,a.submit_clicked_at,a.submission_phase FROM manual_adjust_transactions t
+              JOIN manual_adjust_attempts a ON a.attempt_id=t.current_attempt_id WHERE t.cycle_id=? AND t.status='SUBMITTING' AND a.result='IN_PROGRESS'""", (cycle_id,)).fetchall()
+            for row in rows:
+                click = 1 if row["submission_phase"] in {"CLICK_RETURNED", "WAITING_RESULT", "SUCCESS_OBSERVED"} else None
+                self._conn.execute("UPDATE manual_adjust_attempts SET result='UNKNOWN',finished_at=?,click_crossed=?,submission_phase='RECOVERED_STALE_SUBMITTING',error_detail='stale executor lease recovery' WHERE attempt_id=?", (now,click,row["current_attempt_id"]))
+                self._conn.execute("UPDATE manual_adjust_transactions SET status='UNKNOWN',processed_at=? WHERE transaction_id=?", (now,row["transaction_id"]))
+            s = self._refresh_counts_locked(cycle_id)
+            if s["unknown"]: dest = "REVIEW_REQUIRED"
+            elif s["pending"]: dest = "STOPPED"
+            elif s["failed"]: dest = "FAILURE_REVIEW"
+            else: dest = "COMPLETED"
+            self._conn.execute("""UPDATE manual_adjust_cycles SET status=?,stopped_at=?,completed_at=?,
+              executor_id=NULL,lease_heartbeat_at=NULL WHERE cycle_id=?""",
+              (dest, now if dest == "STOPPED" else None,
+               now if dest == "COMPLETED" else None, cycle_id))
+            self._conn.execute("COMMIT"); return dest
+        except Exception:
+            self._conn.execute("ROLLBACK"); raise

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -37,6 +38,21 @@ from playwright.sync_api import (
 class SubmitResult:
     ok: bool
     detail: str = ""
+
+
+class ManualSubmitOutcome(str, Enum):
+    SUCCESS = "SUCCESS"
+    FAILED_NOT_SUBMITTED = "FAILED_NOT_SUBMITTED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class ManualSubmitResult:
+    outcome: ManualSubmitOutcome
+    click_crossed: Optional[bool]
+    phase: str
+    detail: str = ""
+    evidence: str = ""
 
 
 class PanelService:
@@ -189,6 +205,72 @@ class PanelService:
             return SubmitResult(False, f"timeout: {exc}")
         except Exception as exc:  # pragma: no cover - defensive
             return SubmitResult(False, f"error: {exc}")
+
+    def submit_adjustment(self, user_id: str, amount: int, remark: str,
+                          phase_hook=None) -> ManualSubmitResult:
+        """Submit an exact Manual amount with conservative click classification.
+
+        ``phase_hook`` is called before each observable phase.  In particular,
+        SUBMIT_CLICK_BOUNDARY must return successfully before the remote click.
+        This method deliberately does not use Validator or AUTO bonus logic.
+        """
+        if not self.is_alive():
+            return ManualSubmitResult(ManualSubmitOutcome.FAILED_NOT_SUBMITTED,
+                                      False, "PANEL_UNAVAILABLE", "browser closed")
+        if not self.is_attached or not self._page:
+            return ManualSubmitResult(ManualSubmitOutcome.FAILED_NOT_SUBMITTED,
+                                      False, "PANEL_UNAVAILABLE", "panel not attached")
+        page = self._page
+        panel = self.selectors["panel"]
+        defaults = self.selectors.get("defaults", {})
+        success_text = self.selectors.get("success_text", "")
+        field_wait = int(self.timeouts.get("field_wait_ms", 8000))
+        success_wait = int(self.timeouts.get("success_wait_ms", 15000))
+
+        def phase(name: str) -> None:
+            if phase_hook is not None:
+                phase_hook(name)
+
+        current = "FORM_STARTED"
+        try:
+            phase(current)
+            page.wait_for_selector(panel["username"], timeout=field_wait)
+            self._fill(page, panel["username"], str(user_id))
+            current = "USERNAME_FILLED"; phase(current)
+            self._fill(page, panel["amount"], str(int(amount)))
+            current = "AMOUNT_FILLED"; phase(current)
+            self._fill(page, panel["remark"], str(remark))
+            current = "REMARK_FILLED"; phase(current)
+            self._maybe_select(page, panel.get("payment_dropdown"), defaults.get("payment"))
+            self._maybe_select(page, panel.get("currency_dropdown"), defaults.get("currency"))
+            current = "READY_TO_CLICK"; phase(current)
+            current = "SUBMIT_CLICK_BOUNDARY"; phase(current)
+        except Exception as exc:
+            return ManualSubmitResult(ManualSubmitOutcome.FAILED_NOT_SUBMITTED,
+                                      False, current, str(exc))
+
+        try:
+            page.click(panel["submit"])
+        except Exception as exc:
+            return ManualSubmitResult(ManualSubmitOutcome.UNKNOWN, None,
+                                      "CLICK_UNCERTAIN", str(exc))
+
+        try:
+            current = "CLICK_RETURNED"; phase(current)
+            current = "WAITING_RESULT"; phase(current)
+            selector = panel["success_alert"]
+            page.wait_for_selector(selector, timeout=success_wait, state="visible")
+            if success_text:
+                text = page.locator(selector).first.inner_text(timeout=1000)
+                if success_text.lower() not in (text or "").lower():
+                    return ManualSubmitResult(ManualSubmitOutcome.UNKNOWN, True,
+                                              "AMBIGUOUS_RESPONSE",
+                                              f"unexpected alert: {text!r}", str(text or ""))
+            current = "SUCCESS_OBSERVED"; phase(current)
+            return ManualSubmitResult(ManualSubmitOutcome.SUCCESS, True, current,
+                                      evidence="success alert observed")
+        except Exception as exc:
+            return ManualSubmitResult(ManualSubmitOutcome.UNKNOWN, True, current, str(exc))
 
     # ------------------------------------------------------------------
     def screenshot(self, path: str) -> None:

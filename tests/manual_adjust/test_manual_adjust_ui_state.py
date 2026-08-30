@@ -74,6 +74,8 @@ def test_mode_selector_keeps_options_dimensions_font_and_clear_chevron():
     assert "self.mode_selector.addItems([mode.value for mode in OperatingMode])" in source
     assert 'QColor("#F5B301")' in source
     assert "painter.drawLine(center_x - 4" in source
+    assert "QComboBox#operating-mode-selector::down-arrow { image: none; }" in source
+    assert "QComboBox::down-arrow { image: none; }" not in source
 
 
 def test_manual_running_panel_controls_and_handlers_are_locked():

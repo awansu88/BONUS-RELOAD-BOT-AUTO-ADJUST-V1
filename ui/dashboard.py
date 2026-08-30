@@ -127,7 +127,7 @@ QComboBox {
 }
 QComboBox:hover, QComboBox:focus, QComboBox:on { border-color: #F5B301; }
 QComboBox::drop-down { border: 0; width: 32px; }
-QComboBox::down-arrow { image: none; }
+QComboBox#operating-mode-selector::down-arrow { image: none; }
 QComboBox QAbstractItemView {
     background-color: #17181F;
     color: #ECEBE4;

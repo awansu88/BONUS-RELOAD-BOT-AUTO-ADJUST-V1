@@ -19,6 +19,13 @@ class ControllerStep:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class ManualExecutionSettings:
+    remark: str
+    lease_timeout_sec: int
+    heartbeat_interval_sec: int
+
+
 class ManualAdjustController:
     """Processes one persisted PENDING transaction per ``step`` call.
 
@@ -37,27 +44,52 @@ class ManualAdjustController:
         self.hard_stopped = False
         self.current_transaction = None
         self.evidence_dir = Path(evidence_dir)
+        self._validated_settings: ManualExecutionSettings | None = None
+
+    def _validate_execution_settings(self) -> ManualExecutionSettings:
+        """Return typed money-execution settings or fail closed."""
+        enabled = self.config.get("execution_enabled", False)
+        if type(enabled) is not bool or enabled is not True:
+            raise RuntimeError("Manual Adjust execution is disabled: execution_enabled must be literal boolean true.")
+        remark = self.config.get("remark")
+        if not isinstance(remark, str) or not remark.strip():
+            raise RuntimeError("Manual Adjust remark must be a non-empty string.")
+        lease = self.config.get("lease_timeout_sec")
+        if type(lease) is not int or lease <= 0:
+            raise RuntimeError("Manual Adjust lease_timeout_sec must be a positive integer (not boolean or text).")
+        heartbeat = self.config.get("heartbeat_interval_sec")
+        if type(heartbeat) is not int or heartbeat <= 0:
+            raise RuntimeError("Manual Adjust heartbeat_interval_sec must be a positive integer (not boolean or text).")
+        if heartbeat * 3 >= lease:
+            raise RuntimeError("Manual Adjust heartbeat_interval_sec * 3 must be less than lease_timeout_sec.")
+        return ManualExecutionSettings(remark.strip(), lease, heartbeat)
+
+    @property
+    def heartbeat_interval_sec(self) -> int:
+        if self._validated_settings is None:
+            raise RuntimeError("Manual execution settings have not passed preflight.")
+        return self._validated_settings.heartbeat_interval_sec
 
     def _preflight(self, cycle_id: str) -> None:
-        if self.config.get("execution_enabled", False) is not True:
-            raise RuntimeError("Manual Adjust execution is disabled by configuration.")
+        settings = self._validate_execution_settings()
         if not self.panel.is_alive() or not self.panel.is_attached:
             raise RuntimeError("Panel must be open and explicitly attached.")
         errors = self.repository.validate_cycle_integrity(cycle_id)
         if errors:
             raise RuntimeError("Manual cycle integrity failed: " + "; ".join(errors))
+        self._validated_settings = settings
 
     def start(self, cycle_id: str, *, confirmed: bool) -> None:
         if not confirmed: raise RuntimeError("Operator confirmation is required.")
         self._preflight(cycle_id)
         cycle = self.repository.get_cycle(cycle_id)
         if not cycle or cycle["status"] != "PREVIEW": raise RuntimeError("A frozen PREVIEW cycle is required.")
-        self.repository.confirm_and_start(cycle_id, self.executor_id, int(self.config.get("lease_timeout_sec", 120)))
+        self.repository.confirm_and_start(cycle_id, self.executor_id, self._validated_settings.lease_timeout_sec)
         self._activate(cycle_id)
 
     def resume(self, cycle_id: str) -> None:
         self._preflight(cycle_id)
-        self.repository.resume_cycle(cycle_id, self.executor_id, int(self.config.get("lease_timeout_sec", 120)))
+        self.repository.resume_cycle(cycle_id, self.executor_id, self._validated_settings.lease_timeout_sec)
         self._activate(cycle_id)
 
     def _activate(self, cycle_id: str) -> None:
@@ -148,7 +180,7 @@ class ManualAdjustController:
 
         try:
             result = self.panel.submit_adjustment(item.username, item.adjust_amount,
-                                                  str(self.config.get("remark", "MANUAL ADJUST")), phase_hook)
+                                                  self._validated_settings.remark, phase_hook)
         except Exception as exc:
             # The click boundary is unknowable when an adapter violates its
             # result contract.  Preserve SUBMITTING for stale recovery rather
@@ -178,6 +210,7 @@ class ManualAdjustController:
 
     def retry_selected(self, cycle_id: str, transaction_ids: list[int], *, confirmed: bool) -> None:
         if not confirmed: raise RuntimeError("Retry confirmation is required.")
+        # Validate before retry preparation mutates FAILURE_REVIEW -> STOPPED.
         self._preflight(cycle_id)
         self.repository.prepare_failure_retries(cycle_id, transaction_ids)
         self.resume(cycle_id)
@@ -192,7 +225,16 @@ class ManualAdjustController:
                                           reconciled_by=reconciled_by, note=note, evidence=evidence)
 
     def recover_stale(self, cycle_id: str) -> str:
-        return self.repository.recover_stale_cycle(cycle_id, int(self.config.get("lease_timeout_sec", 120)))
+        lease = self.recovery_lease_timeout_sec
+        return self.repository.recover_stale_cycle(cycle_id, lease)
+
+    @property
+    def recovery_lease_timeout_sec(self) -> int:
+        """Validate recovery timing without requiring money execution."""
+        lease = self.config.get("lease_timeout_sec")
+        if type(lease) is not int or lease <= 0:
+            raise RuntimeError("Stale recovery requires lease_timeout_sec to be a positive integer (not boolean or text).")
+        return lease
 
     def _emergency(self, item, attempt_id, phase, click, error) -> None:
         logging.getLogger(__name__).critical("MANUAL emergency cycle=%s transaction=%s attempt=%s user=%s amount=%s phase=%s click=%s error=%s",

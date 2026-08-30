@@ -1005,7 +1005,7 @@ class Dashboard(QMainWindow):
         try:
             self.manual_controller.start(cid, confirmed=True)
             self.manual_worker_timer.start(100)
-            self.manual_heartbeat_timer.start(int(self.config.get("manual_adjust", {}).get("heartbeat_interval_sec", 10)) * 1000)
+            self.manual_heartbeat_timer.start(self.manual_controller.heartbeat_interval_sec * 1000)
             self._refresh_manual_execution()
         except Exception as exc: self.manual_view.show_error(str(exc))
 
@@ -1031,7 +1031,10 @@ class Dashboard(QMainWindow):
         cycle = self.manual_repository.get_cycle(cid)
         if not cycle or cycle["status"] != "RUNNING":
             self.manual_view.show_error("Only a selected persisted RUNNING cycle can be recovered."); return
-        timeout = int(self.config.get("manual_adjust", {}).get("lease_timeout_sec", 120))
+        try:
+            timeout = self.manual_controller.recovery_lease_timeout_sec
+        except RuntimeError as exc:
+            self.manual_view.show_error(str(exc)); return
         if not self.manual_repository.is_lease_stale(cid, timeout):
             self.manual_view.show_error("This Manual execution lease is still fresh and remains locked."); return
         if QMessageBox.question(self, "Recover stale Manual cycle",
@@ -1050,7 +1053,7 @@ class Dashboard(QMainWindow):
         try:
             self.manual_controller.resume(self.manual_state.active_cycle_id)
             self.manual_worker_timer.start(100)
-            self.manual_heartbeat_timer.start(int(self.config.get("manual_adjust", {}).get("heartbeat_interval_sec", 10)) * 1000)
+            self.manual_heartbeat_timer.start(self.manual_controller.heartbeat_interval_sec * 1000)
         except Exception as exc: self.manual_view.show_error(str(exc))
 
     def _on_manual_retry(self) -> None:
@@ -1065,7 +1068,7 @@ class Dashboard(QMainWindow):
         try:
             self.manual_controller.retry_selected(self.manual_state.active_cycle_id, selected, confirmed=True)
             self.manual_worker_timer.start(100)
-            self.manual_heartbeat_timer.start(int(self.config.get("manual_adjust", {}).get("heartbeat_interval_sec", 10)) * 1000)
+            self.manual_heartbeat_timer.start(self.manual_controller.heartbeat_interval_sec * 1000)
             self._refresh_manual_execution()
         except Exception as exc: self.manual_view.show_error(str(exc))
 

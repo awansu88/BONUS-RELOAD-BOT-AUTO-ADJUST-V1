@@ -50,6 +50,27 @@ def test_phase4_dashboard_wires_review_and_recovery_actions():
     assert '"manual_worker_timer", "manual_heartbeat_timer"' in source
 
 
+def test_manual_running_panel_controls_and_handlers_are_locked():
+    root = Path(__file__).parents[2]
+    view_source = (root / "ui" / "manual_adjust_view.py").read_text(encoding="utf-8")
+    assert 'panel_mutation_enabled = status != "RUNNING"' in view_source
+    assert 'self.actions["open_panel"].setEnabled(panel_mutation_enabled)' in view_source
+    assert 'self.actions["attach_panel"].setEnabled(panel_mutation_enabled)' in view_source
+
+    dashboard = (root / "ui" / "dashboard.py").read_text(encoding="utf-8")
+    open_method = dashboard[dashboard.index("    def _on_open_panel"):dashboard.index("    def _on_ready")]
+    ready_method = dashboard[dashboard.index("    def _on_ready"):dashboard.index("    def _poll_panel_alive")]
+    for method, mutation in ((open_method, "self.panel.open_panel"),
+                             (ready_method, "self.panel.attach")):
+        guard = method.index("self.manual_state.mode is OperatingMode.MANUAL")
+        rejection = method.index("Stop Manual Adjust before opening or re-attaching the panel.")
+        call = method.index(mutation)
+        assert guard < rejection < call
+    # The condition is Manual-only, preserving the frozen AUTO path.
+    assert "self._manual_live_cycle_id() is not None" in open_method
+    assert "self._manual_live_cycle_id() is not None" in ready_method
+
+
 def test_running_cycle_pins_load_and_persisted_selection():
     state = ManualPreviewState(manual_backend_ready=True, active_cycle_id="cycle-a")
     class Loader:

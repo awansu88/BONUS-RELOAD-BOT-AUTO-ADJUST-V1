@@ -115,7 +115,9 @@ class ManualAdjustView(QWidget):
             unknown=summary.get("unknown", 0), pending=summary.get("pending", 0),
             total_adjusted_successfully=summary.get("total_adjusted_successfully", 0)))
         for button in self.actions.values(): button.setEnabled(False)
-        self.actions["open_panel"].setEnabled(True); self.actions["attach_panel"].setEnabled(True)
+        panel_mutation_enabled = status != "RUNNING"
+        self.actions["open_panel"].setEnabled(panel_mutation_enabled)
+        self.actions["attach_panel"].setEnabled(panel_mutation_enabled)
         self.actions["start"].setEnabled(status == "PREVIEW" and execution_enabled and panel_attached and summary.get("pending", 0) > 0)
         self.actions["stop"].setEnabled(status == "RUNNING")
         self.actions["resume"].setEnabled(status == "STOPPED" and execution_enabled and panel_attached)

@@ -1619,6 +1619,11 @@ class Dashboard(QMainWindow):
             self.logger.warn(f"Fresh manual-list fetch failed: {exc}")
 
     def _on_open_panel(self) -> None:
+        if (self.manual_state.mode is OperatingMode.MANUAL and
+                self._manual_live_cycle_id() is not None):
+            QMessageBox.warning(self, "Manual execution running",
+                "Stop Manual Adjust before opening or re-attaching the panel.")
+            return
         url = self.config.get("panel_url", "").strip()
         if not url:
             QMessageBox.warning(
@@ -1643,6 +1648,11 @@ class Dashboard(QMainWindow):
             QMessageBox.critical(self, "Panel error", str(exc))
 
     def _on_ready(self) -> None:
+        if (self.manual_state.mode is OperatingMode.MANUAL and
+                self._manual_live_cycle_id() is not None):
+            QMessageBox.warning(self, "Manual execution running",
+                "Stop Manual Adjust before opening or re-attaching the panel.")
+            return
         try:
             self.panel.attach()
             self._set_dot(self.dot_panel, "ok")

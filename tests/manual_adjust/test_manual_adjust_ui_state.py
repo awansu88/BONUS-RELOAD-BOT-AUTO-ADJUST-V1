@@ -64,6 +64,18 @@ def test_manual_entry_resets_view_with_shared_context_and_auto_controls_stay_fro
     assert 'self.btn_stop = QPushButton("STOP")' in source
 
 
+def test_mode_selector_keeps_options_dimensions_font_and_clear_chevron():
+    source = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text(encoding="utf-8")
+    assert "class HeaderModeSelector(QComboBox):" in source
+    assert "self.mode_selector = HeaderModeSelector()" in source
+    assert "self.mode_selector.setFixedSize(205, 36)" in source
+    assert 'self.mode_selector.setFont(QFont("Segoe UI", 9, QFont.DemiBold))' in source
+    assert "self.mode_selector.view().setFont(self.mode_selector.font())" in source
+    assert "self.mode_selector.addItems([mode.value for mode in OperatingMode])" in source
+    assert 'QColor("#F5B301")' in source
+    assert "painter.drawLine(center_x - 4" in source
+
+
 def test_manual_running_panel_controls_and_handlers_are_locked():
     root = Path(__file__).parents[2]
     view_source = (root / "ui" / "manual_adjust_view.py").read_text(encoding="utf-8")

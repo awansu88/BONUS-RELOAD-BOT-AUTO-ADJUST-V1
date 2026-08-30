@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPalette
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -127,7 +127,7 @@ QComboBox {
 }
 QComboBox:hover, QComboBox:focus, QComboBox:on { border-color: #F5B301; }
 QComboBox::drop-down { border: 0; width: 32px; }
-QComboBox::down-arrow { width: 10px; height: 6px; }
+QComboBox::down-arrow { image: none; }
 QComboBox QAbstractItemView {
     background-color: #17181F;
     color: #ECEBE4;
@@ -241,6 +241,25 @@ def status_color(status: str) -> str:
         "INVALID": "#EF4444",
         "FAILED": "#EF4444",
     }.get(s, "#ECEBE4")
+
+
+class HeaderModeSelector(QComboBox):
+    """Header combo with a platform-independent, clearly visible chevron."""
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        separator_x = self.width() - 32
+        painter.setPen(QPen(QColor("#2F313C"), 1))
+        painter.drawLine(separator_x, 8, separator_x, self.height() - 8)
+
+        center_x = self.width() - 16
+        center_y = self.height() // 2
+        painter.setPen(QPen(QColor("#F5B301"), 1.5))
+        painter.drawLine(center_x - 4, center_y - 2, center_x, center_y + 2)
+        painter.drawLine(center_x, center_y + 2, center_x + 4, center_y - 2)
 
 
 # =========================================================================
@@ -777,11 +796,13 @@ class Dashboard(QMainWindow):
 
         top.addWidget(title)
         top.addWidget(subtitle)
-        self.mode_selector = QComboBox()
+        self.mode_selector = HeaderModeSelector()
         self.mode_selector.setObjectName("operating-mode-selector")
         self.mode_selector.setFixedSize(205, 36)
+        self.mode_selector.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
         self.mode_selector.addItems([mode.value for mode in OperatingMode])
         self.mode_selector.view().setMinimumWidth(205)
+        self.mode_selector.view().setFont(self.mode_selector.font())
         self.mode_selector.view().setStyleSheet("QListView::item { min-height:32px; padding:0 12px; }")
         self.mode_selector.currentTextChanged.connect(self._on_mode_selected)
         top.addWidget(self.mode_selector)

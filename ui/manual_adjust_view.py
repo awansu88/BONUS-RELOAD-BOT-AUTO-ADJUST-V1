@@ -62,25 +62,26 @@ class ManualAdjustView(QWidget):
 
     def _build_left_scroll(self) -> QScrollArea:
         panel = QFrame(); panel.setObjectName("Card")
-        box = QVBoxLayout(panel); box.setContentsMargins(14, 12, 14, 12); box.setSpacing(10)
+        box = QVBoxLayout(panel); box.setContentsMargins(16, 14, 16, 14); box.setSpacing(12)
 
         box.addWidget(self._title("Status"))
-        status = QGridLayout(); status.setHorizontalSpacing(12); status.setVerticalSpacing(5)
+        status = QGridLayout(); status.setHorizontalSpacing(24); status.setVerticalSpacing(8)
         self.status_values = {}
         for row, (key, value) in enumerate((
             ("GOOGLE SHEETS", "Not connected"), ("PANEL", "Closed"),
             ("MANUAL CYCLE", "No snapshot"), ("EXECUTION GATE", "DISABLED"),
             ("LAST SNAPSHOT", "Never"),
         )):
-            caption = QLabel(key); caption.setObjectName("KpiCaption")
+            caption = QLabel(key.title()); caption.setObjectName("StatLabel")
             label = QLabel(value); label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            label.setObjectName("KpiSmall")
+            caption.setMinimumHeight(24); label.setMinimumHeight(24)
             status.addWidget(caption, row, 0); status.addWidget(label, row, 1)
             self.status_values[key] = label
         box.addLayout(status); box.addWidget(self._divider())
 
         box.addWidget(self._title("Actions"))
-        self.action_grid = QGridLayout(); self.action_grid.setSpacing(8)
+        self.action_grid = QGridLayout()
+        self.action_grid.setHorizontalSpacing(10); self.action_grid.setVerticalSpacing(10)
         specs = (
             ("LOAD MANUAL DATA", "load", self.load_requested),
             ("OPEN PANEL", "open_panel", self.open_panel_requested),
@@ -94,7 +95,7 @@ class ManualAdjustView(QWidget):
         self.actions = {}
         for index, (text, key, signal) in enumerate(specs):
             button = QPushButton(text); button.setObjectName(f"manual-{key}-btn")
-            button.setMinimumHeight(34)
+            button.setMinimumHeight(38)
             if key == "stop": button.clicked.connect(self._request_pause)
             else: button.clicked.connect(signal)
             self.action_grid.addWidget(button, index // 2, index % 2)
@@ -104,7 +105,9 @@ class ManualAdjustView(QWidget):
 
         box.addWidget(self._title("Current Execution"))
         current = QFrame(); current.setObjectName("SubCard")
-        current_grid = QGridLayout(current); current_grid.setContentsMargins(10, 8, 10, 8)
+        current.setMinimumHeight(72)
+        current_grid = QGridLayout(current); current_grid.setContentsMargins(12, 12, 12, 12)
+        current_grid.setVerticalSpacing(8)
         self.current_values = {}
         # The repository execution summary is aggregate-only.  Keep this card
         # deliberately limited to values the view can state authoritatively.
@@ -118,7 +121,9 @@ class ManualAdjustView(QWidget):
 
         box.addWidget(self._title("Progress"))
         progress_card = QFrame(); progress_card.setObjectName("SubCard")
-        progress_box = QVBoxLayout(progress_card); progress_box.setContentsMargins(10, 8, 10, 8)
+        progress_card.setMinimumHeight(70)
+        progress_box = QVBoxLayout(progress_card); progress_box.setContentsMargins(12, 12, 12, 12)
+        progress_box.setSpacing(8)
         self.progress_text = QLabel("Processed 0 / 0"); self.progress_percent = QLabel("0%")
         progress_row = QHBoxLayout(); progress_row.addWidget(self.progress_text); progress_row.addStretch(1); progress_row.addWidget(self.progress_percent)
         self.progress_bar = QProgressBar(); self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0); self.progress_bar.setTextVisible(False)
@@ -126,7 +131,9 @@ class ManualAdjustView(QWidget):
 
         box.addWidget(self._title("Execution Summary"))
         summary_card = QFrame(); summary_card.setObjectName("SubCard")
-        summary_grid = QGridLayout(summary_card); summary_grid.setContentsMargins(10, 8, 10, 8)
+        summary_card.setMinimumHeight(112)
+        summary_grid = QGridLayout(summary_card); summary_grid.setContentsMargins(12, 12, 12, 12)
+        summary_grid.setHorizontalSpacing(12); summary_grid.setVerticalSpacing(8)
         self.execution_values = {}
         colors = {"SUCCESS": "#4ADE80", "FAILED": "#EF4444", "UNKNOWN": "#F59E0B",
                   "PENDING": "#C7C6BE", "SUBMITTING": "#3B82F6",
@@ -134,7 +141,7 @@ class ManualAdjustView(QWidget):
         for index, key in enumerate(colors):
             caption = QLabel(key); caption.setObjectName("KpiCaption")
             value = QLabel("0"); value.setStyleSheet(f"color:{colors[key]};font-size:15px;font-weight:700")
-            cell = QVBoxLayout(); cell.setSpacing(1); cell.addWidget(value); cell.addWidget(caption)
+            cell = QVBoxLayout(); cell.setSpacing(3); cell.addWidget(value); cell.addWidget(caption)
             summary_grid.addLayout(cell, index // 2, index % 2)
             self.execution_values[key] = value
         box.addWidget(summary_card); box.addStretch(1)

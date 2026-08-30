@@ -78,6 +78,21 @@ def test_mode_selector_keeps_options_dimensions_font_and_clear_chevron():
     assert "QComboBox::down-arrow { image: none; }" not in source
 
 
+def test_manual_left_panel_uses_auto_status_typography_and_comfortable_spacing():
+    source = (Path(__file__).parents[2] / "ui" / "manual_adjust_view.py").read_text(encoding="utf-8")
+    assert 'caption = QLabel(key.title()); caption.setObjectName("StatLabel")' in source
+    status_block = source[source.index("status = QGridLayout()"):
+                          source.index("box.addLayout(status)")]
+    assert 'setObjectName("KpiCaption")' not in status_block
+    assert 'setObjectName("KpiSmall")' not in status_block
+    assert "status.setVerticalSpacing(8)" in status_block
+    assert "caption.setMinimumHeight(24); label.setMinimumHeight(24)" in status_block
+    assert "button.setMinimumHeight(38)" in source
+    assert "current.setMinimumHeight(72)" in source
+    assert "progress_card.setMinimumHeight(70)" in source
+    assert "summary_card.setMinimumHeight(112)" in source
+
+
 def test_manual_running_panel_controls_and_handlers_are_locked():
     root = Path(__file__).parents[2]
     view_source = (root / "ui" / "manual_adjust_view.py").read_text(encoding="utf-8")

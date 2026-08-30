@@ -36,6 +36,14 @@ def test_manual_signals_and_preview_actions_remain_available():
     assert view.actions["start"].isEnabled()
 
 
+def test_lifecycle_actions_are_taller_than_standard_actions():
+    view = _view()
+    for key in ("load", "open_panel", "attach_panel", "retry", "finalize", "reconcile"):
+        assert view.actions[key].minimumHeight() == 38
+    for key in ("start", "stop", "resume"):
+        assert view.actions[key].minimumHeight() == 44
+
+
 def test_running_pause_request_is_cooperative_and_locks_navigation():
     view = _view(); calls = []
     view.stop_requested.connect(lambda: calls.append("request_stop"))

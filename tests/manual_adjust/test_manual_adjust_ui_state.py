@@ -87,7 +87,7 @@ def test_manual_left_panel_uses_auto_status_typography_and_comfortable_spacing()
     assert 'setObjectName("KpiSmall")' not in status_block
     assert "status.setVerticalSpacing(8)" in status_block
     assert "caption.setMinimumHeight(24); label.setMinimumHeight(24)" in status_block
-    assert "button.setMinimumHeight(38)" in source
+    assert 'button.setMinimumHeight(44 if key in ("start", "stop", "resume") else 38)' in source
     assert "current.setMinimumHeight(72)" in source
     assert "progress_card.setMinimumHeight(70)" in source
     assert "summary_card.setMinimumHeight(112)" in source

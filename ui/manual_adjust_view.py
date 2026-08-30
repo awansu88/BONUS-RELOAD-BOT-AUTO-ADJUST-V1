@@ -95,7 +95,7 @@ class ManualAdjustView(QWidget):
         self.actions = {}
         for index, (text, key, signal) in enumerate(specs):
             button = QPushButton(text); button.setObjectName(f"manual-{key}-btn")
-            button.setMinimumHeight(38)
+            button.setMinimumHeight(44 if key in ("start", "stop", "resume") else 38)
             if key == "stop": button.clicked.connect(self._request_pause)
             else: button.clicked.connect(signal)
             self.action_grid.addWidget(button, index // 2, index % 2)

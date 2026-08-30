@@ -259,6 +259,22 @@ class ManualAdjustRepository:
     def validate_cycle_integrity(self, cycle_id: str) -> list[str]:
         """Report persistence contradictions without attempting recovery."""
         errors: list[str] = []
+        cycle = self._conn.execute(
+            "SELECT status,executor_id,lease_heartbeat_at FROM manual_adjust_cycles WHERE cycle_id=?",
+            (cycle_id,),
+        ).fetchone()
+        if cycle is None:
+            return [f"cycle {cycle_id}: cycle does not exist"]
+        running_count = int(self._conn.execute(
+            "SELECT COUNT(*) FROM manual_adjust_cycles WHERE status='RUNNING'"
+        ).fetchone()[0])
+        if running_count > 1:
+            errors.append("multiple RUNNING Manual cycles")
+        if cycle["status"] == "RUNNING":
+            if not cycle["executor_id"]:
+                errors.append("RUNNING cycle requires executor_id")
+        elif cycle["executor_id"] is not None or cycle["lease_heartbeat_at"] is not None:
+            errors.append(f"{cycle['status']} cycle cannot retain executor ownership")
         transactions = self._conn.execute(
             "SELECT * FROM manual_adjust_transactions WHERE cycle_id=?",
             (cycle_id,),

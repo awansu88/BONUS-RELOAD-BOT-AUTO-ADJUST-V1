@@ -28,7 +28,8 @@ class ManualAdjustController:
                  evidence_dir: str | Path = "screenshots"):
         self.repository = repository
         self.panel = panel
-        self.config = config.get("manual_adjust", config)
+        candidate = config.get("manual_adjust", config) if isinstance(config, dict) else {}
+        self.config = candidate if isinstance(candidate, dict) else {}
         self.executor_id = executor_id or str(uuid.uuid4())
         self.cycle_id: str | None = None
         self.queue = None
@@ -38,7 +39,7 @@ class ManualAdjustController:
         self.evidence_dir = Path(evidence_dir)
 
     def _preflight(self, cycle_id: str) -> None:
-        if not bool(self.config.get("execution_enabled", False)):
+        if self.config.get("execution_enabled", False) is not True:
             raise RuntimeError("Manual Adjust execution is disabled by configuration.")
         if not self.panel.is_alive() or not self.panel.is_attached:
             raise RuntimeError("Panel must be open and explicitly attached.")
@@ -72,20 +73,64 @@ class ManualAdjustController:
     def request_stop(self) -> None:
         self.stop_requested = True
 
+    def shutdown(self) -> str:
+        """Cooperatively persist a safe boundary without guessing a submit.
+
+        A live synchronous panel call cannot normally overlap Qt closeEvent.
+        If an adapter nevertheless reports a current transaction, its durable
+        SUBMITTING evidence is intentionally left for stale recovery.
+        """
+        self.stop_requested = True
+        if not self.cycle_id:
+            self._clear_terminal_state()
+            return "IDLE"
+        cycle = self.repository.get_cycle(self.cycle_id)
+        if not cycle or cycle["status"] != "RUNNING":
+            state = cycle["status"] if cycle else "IDLE"
+            self._clear_terminal_state()
+            return state
+        if self.current_transaction is not None:
+            logging.getLogger(__name__).critical(
+                "MANUAL shutdown preserves SUBMITTING cycle=%s transaction=%s; stale recovery required",
+                self.cycle_id, self.current_transaction.transaction_id)
+            self.hard_stopped = True
+            return "HARD_STOPPED"
+        try:
+            destination = self.repository.evaluate_cycle_destination(
+                self.cycle_id, self.executor_id, stopped=True)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "MANUAL shutdown durability failed cycle=%s; stale recovery required",
+                self.cycle_id)
+            self.hard_stopped = True
+            return "HARD_STOPPED"
+        self._clear_terminal_state()
+        return destination
+
+    def _clear_terminal_state(self) -> None:
+        self.current_transaction = None
+        self.queue = None
+        self.cycle_id = None
+        self.stop_requested = False
+        self.hard_stopped = False
+
     def step(self) -> ControllerStep:
         if not self.cycle_id or self.hard_stopped: return ControllerStep("HARD_STOPPED")
         if self.stop_requested:
             dest = self.repository.evaluate_cycle_destination(self.cycle_id, self.executor_id, stopped=True)
+            if dest != "RUNNING": self._clear_terminal_state()
             return ControllerStep(dest)
         try: self.repository.heartbeat_cycle(self.cycle_id, self.executor_id)
         except Exception as exc:
             self.hard_stopped = True; return ControllerStep("HARD_STOPPED", detail=str(exc))
         if not self.panel.is_alive() or not self.panel.is_attached:
             dest = self.repository.evaluate_cycle_destination(self.cycle_id, self.executor_id, stopped=True)
+            if dest != "RUNNING": self._clear_terminal_state()
             return ControllerStep(dest, detail="panel unavailable before claim")
         item = self.queue.next_pending() if self.queue else None
         if item is None:
             dest = self.repository.evaluate_cycle_destination(self.cycle_id, self.executor_id)
+            if dest != "RUNNING": self._clear_terminal_state()
             return ControllerStep(dest)
         try:
             attempt = self.repository.claim_pending(item.transaction_id, self.executor_id)

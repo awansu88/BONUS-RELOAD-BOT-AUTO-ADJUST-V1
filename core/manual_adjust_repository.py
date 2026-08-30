@@ -393,7 +393,8 @@ class ManualAdjustRepository:
             raise ValueError("valid executor and lease timeout are required")
         if self.validate_cycle_integrity(cycle_id):
             raise ValueError("cycle integrity validation failed")
-        now = _now(); cutoff = (datetime.now(timezone.utc) - timedelta(seconds=lease_timeout_sec)).isoformat(timespec="seconds")
+        now = _now()
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=lease_timeout_sec)
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             cycle = self._conn.execute("SELECT status FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
@@ -403,10 +404,14 @@ class ManualAdjustRepository:
                 raise ValueError("unresolved UNKNOWN blocks execution")
             if not self._conn.execute("SELECT 1 FROM manual_adjust_transactions WHERE cycle_id=? AND status='PENDING'", (cycle_id,)).fetchone():
                 raise ValueError("cycle has no PENDING transactions")
-            conflict = self._conn.execute("""SELECT cycle_id FROM manual_adjust_cycles
-              WHERE status='RUNNING' AND cycle_id<>? AND lease_heartbeat_at>=? LIMIT 1""", (cycle_id, cutoff)).fetchone()
+            conflict = self._conn.execute("""SELECT cycle_id,lease_heartbeat_at
+              FROM manual_adjust_cycles WHERE status='RUNNING' AND cycle_id<>?
+              ORDER BY created_at LIMIT 1""", (cycle_id,)).fetchone()
             if conflict:
-                raise ValueError("another Manual cycle has a fresh execution lease")
+                heartbeat = conflict["lease_heartbeat_at"]
+                if heartbeat and datetime.fromisoformat(heartbeat) >= cutoff:
+                    raise ValueError("another Manual cycle has a fresh execution lease")
+                raise ValueError("recover stale Manual cycle first")
             fields = "status='RUNNING',executor_id=?,lease_heartbeat_at=?,started_at=COALESCE(started_at,?)"
             params: list[object] = [executor_id, now, now]
             if confirmed:
@@ -431,9 +436,17 @@ class ManualAdjustRepository:
             self._conn.execute("ROLLBACK"); raise
 
     def heartbeat_cycle(self, cycle_id: str, executor_id: str) -> None:
-        changed = self._conn.execute("UPDATE manual_adjust_cycles SET lease_heartbeat_at=? WHERE cycle_id=? AND status='RUNNING' AND executor_id=?", (_now(), cycle_id, executor_id))
-        if changed.rowcount != 1:
-            raise ValueError("executor does not own active cycle")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute("SELECT status,executor_id FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+            if not row or row["status"] != "RUNNING" or row["executor_id"] != executor_id:
+                raise ValueError("executor does not own active cycle")
+            if self._conn.execute("SELECT 1 FROM manual_adjust_cycles WHERE status='RUNNING' AND cycle_id<>? LIMIT 1", (cycle_id,)).fetchone():
+                raise ValueError("multiple RUNNING Manual cycles require recovery")
+            self._conn.execute("UPDATE manual_adjust_cycles SET lease_heartbeat_at=? WHERE cycle_id=?", (_now(), cycle_id))
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK"); raise
 
     def release_cycle(self, cycle_id: str, executor_id: str) -> None:
         changed = self._conn.execute("UPDATE manual_adjust_cycles SET executor_id=NULL,lease_heartbeat_at=NULL WHERE cycle_id=? AND status<>'RUNNING' AND executor_id=?", (cycle_id, executor_id))
@@ -555,13 +568,22 @@ class ManualAdjustRepository:
             self._conn.execute("ROLLBACK"); raise
 
     def recover_stale_cycle(self, cycle_id: str, lease_timeout_sec: int) -> str:
+        if lease_timeout_sec <= 0:
+            raise ValueError("valid lease timeout is required")
         if self.validate_cycle_integrity(cycle_id):
             self._conn.execute("UPDATE manual_adjust_cycles SET status='REVIEW_REQUIRED' WHERE cycle_id=? AND status='RUNNING'", (cycle_id,))
             raise ValueError("cycle integrity validation failed; review required")
-        if not self.is_lease_stale(cycle_id, lease_timeout_sec): raise ValueError("cycle lease is not stale")
         now = _now()
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=lease_timeout_sec)
         try:
             self._conn.execute("BEGIN IMMEDIATE")
+            cycle = self._conn.execute("SELECT status,lease_heartbeat_at FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+            if not cycle or cycle["status"] != "RUNNING":
+                raise ValueError("cycle is not RUNNING")
+            if not cycle["lease_heartbeat_at"]:
+                raise ValueError("RUNNING cycle has no lease heartbeat; integrity review required")
+            if datetime.fromisoformat(cycle["lease_heartbeat_at"]) >= cutoff:
+                raise ValueError("cycle lease is not stale")
             rows = self._conn.execute("""SELECT t.transaction_id,t.current_attempt_id,a.submit_clicked_at,a.submission_phase FROM manual_adjust_transactions t
               JOIN manual_adjust_attempts a ON a.attempt_id=t.current_attempt_id WHERE t.cycle_id=? AND t.status='SUBMITTING' AND a.result='IN_PROGRESS'""", (cycle_id,)).fetchall()
             for row in rows:
@@ -569,8 +591,14 @@ class ManualAdjustRepository:
                 self._conn.execute("UPDATE manual_adjust_attempts SET result='UNKNOWN',finished_at=?,click_crossed=?,submission_phase='RECOVERED_STALE_SUBMITTING',error_detail='stale executor lease recovery' WHERE attempt_id=?", (now,click,row["current_attempt_id"]))
                 self._conn.execute("UPDATE manual_adjust_transactions SET status='UNKNOWN',processed_at=? WHERE transaction_id=?", (now,row["transaction_id"]))
             s = self._refresh_counts_locked(cycle_id)
-            dest = "REVIEW_REQUIRED" if s["unknown"] else "STOPPED"
-            self._conn.execute("UPDATE manual_adjust_cycles SET status=?,stopped_at=?,executor_id=NULL,lease_heartbeat_at=NULL WHERE cycle_id=?", (dest,now,cycle_id))
+            if s["unknown"]: dest = "REVIEW_REQUIRED"
+            elif s["pending"]: dest = "STOPPED"
+            elif s["failed"]: dest = "FAILURE_REVIEW"
+            else: dest = "COMPLETED"
+            self._conn.execute("""UPDATE manual_adjust_cycles SET status=?,stopped_at=?,completed_at=?,
+              executor_id=NULL,lease_heartbeat_at=NULL WHERE cycle_id=?""",
+              (dest, now if dest == "STOPPED" else None,
+               now if dest == "COMPLETED" else None, cycle_id))
             self._conn.execute("COMMIT"); return dest
         except Exception:
             self._conn.execute("ROLLBACK"); raise

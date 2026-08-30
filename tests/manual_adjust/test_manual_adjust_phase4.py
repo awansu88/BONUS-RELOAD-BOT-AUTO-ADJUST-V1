@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from core.manual_adjust_controller import ManualAdjustController
-from core.manual_adjust_models import ClassifiedSourceRow, SourceClassification
+from core.manual_adjust_models import AttemptResult, ClassifiedSourceRow, SourceClassification
 from core.manual_adjust_repository import ManualAdjustRepository
 from core.panel_service import ManualSubmitOutcome, ManualSubmitResult
 from core.panel_service import PanelService
@@ -65,6 +65,45 @@ def test_lease_exclusion_and_wrong_heartbeat(repo):
     with pytest.raises(ValueError): repo.confirm_and_start(cid, "two", 120)
 
 
+@pytest.mark.parametrize("lease_kind,error", [
+    ("fresh", "fresh execution lease"),
+    ("stale", "recover stale Manual cycle first"),
+    ("missing", "recover stale Manual cycle first"),
+])
+def test_any_other_running_cycle_blocks_start(repo, lease_kind, error):
+    cycle_a = snapshot(repo, 1); cycle_b = snapshot(repo, 1)
+    repo.confirm_and_start(cycle_a, "executor-a", 120)
+    if lease_kind == "stale":
+        heartbeat = (datetime.now(timezone.utc) - timedelta(seconds=500)).isoformat(timespec="seconds")
+        repo._conn.execute("UPDATE manual_adjust_cycles SET lease_heartbeat_at=? WHERE cycle_id=?", (heartbeat, cycle_a))
+    elif lease_kind == "missing":
+        repo._conn.execute("UPDATE manual_adjust_cycles SET lease_heartbeat_at=NULL WHERE cycle_id=?", (cycle_a,))
+    with pytest.raises(ValueError, match=error):
+        repo.confirm_and_start(cycle_b, "executor-b", 120)
+    assert repo.get_cycle(cycle_b)["status"] == "PREVIEW"
+
+
+def test_stale_cycle_must_be_recovered_before_other_start(repo):
+    cycle_a = snapshot(repo, 1); cycle_b = snapshot(repo, 1)
+    repo.confirm_and_start(cycle_a, "executor-a", 120)
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=500)).isoformat(timespec="seconds")
+    repo._conn.execute("UPDATE manual_adjust_cycles SET lease_heartbeat_at=? WHERE cycle_id=?", (stale, cycle_a))
+    with pytest.raises(ValueError, match="recover stale"):
+        repo.confirm_and_start(cycle_b, "executor-b", 120)
+    assert repo.recover_stale_cycle(cycle_a, 120) == "STOPPED"
+    repo.confirm_and_start(cycle_b, "executor-b", 120)
+    assert repo.get_cycle(cycle_b)["status"] == "RUNNING"
+
+
+def test_recovery_rechecks_fresh_heartbeat_inside_transaction(repo, monkeypatch):
+    cid = snapshot(repo, 1); repo.confirm_and_start(cid, "one", 120)
+    monkeypatch.setattr(repo, "is_lease_stale", lambda *args: True)
+    with pytest.raises(ValueError, match="not stale"):
+        repo.recover_stale_cycle(cid, 120)
+    assert repo.get_cycle(cid)["status"] == "RUNNING"
+    assert repo.get_pending_transactions(cid)
+
+
 def test_stale_submitting_is_unknown(repo):
     cid = snapshot(repo, 1); repo.confirm_and_start(cid, "one", 120)
     tx = repo.get_pending_transactions(cid)[0]; repo.claim_pending(tx.transaction_id, "one")
@@ -120,6 +159,51 @@ def test_stale_pending_only_recovers_stopped(repo):
     repo._conn.execute("UPDATE manual_adjust_cycles SET lease_heartbeat_at=? WHERE cycle_id=?", (stale, cid))
     assert repo.recover_stale_cycle(cid, 120) == "STOPPED"
     assert len(repo.get_pending_transactions(cid)) == 1
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ("failed", "FAILURE_REVIEW"),
+    ("success", "COMPLETED"),
+    ("unknown", "REVIEW_REQUIRED"),
+    ("pending_failed", "STOPPED"),
+])
+def test_stale_recovery_derives_destination_from_persisted_counts(repo, scenario, expected):
+    cid = snapshot(repo, 2 if scenario == "pending_failed" else 1)
+    repo.confirm_and_start(cid, "one", 120)
+    tx = repo.get_pending_transactions(cid)[0]
+    attempt = repo.claim_pending(tx.transaction_id, "one")
+    if scenario in {"failed", "pending_failed"}:
+        repo.finish_attempt(attempt["attempt_id"], AttemptResult.FAILED_NOT_SUBMITTED,
+                            click_crossed=False, submission_phase="FORM_STARTED")
+    elif scenario == "success":
+        repo.finish_attempt(attempt["attempt_id"], AttemptResult.SUCCESS,
+                            click_crossed=True, submission_phase="SUCCESS_OBSERVED")
+    else:
+        repo.finish_attempt(attempt["attempt_id"], AttemptResult.UNKNOWN,
+                            click_crossed=None, submission_phase="CLICK_UNCERTAIN")
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=500)).isoformat(timespec="seconds")
+    repo._conn.execute("UPDATE manual_adjust_cycles SET lease_heartbeat_at=? WHERE cycle_id=?", (stale, cid))
+    assert repo.recover_stale_cycle(cid, 120) == expected
+    cycle = repo.get_cycle(cid)
+    assert (cycle["completed_at"] is not None) is (expected == "COMPLETED")
+
+
+def test_heartbeat_rejects_corrupt_multiple_running_cycles(repo):
+    cycle_a = snapshot(repo, 1); cycle_b = snapshot(repo, 1)
+    repo.confirm_and_start(cycle_a, "executor-a", 120)
+    # Hostile corruption setup: lifecycle APIs never permit this state.
+    repo._conn.execute("""UPDATE manual_adjust_cycles SET status='RUNNING',executor_id='executor-b',
+      lease_heartbeat_at=? WHERE cycle_id=?""",
+      (datetime.now(timezone.utc).isoformat(timespec="seconds"), cycle_b))
+    second_connection = ManualAdjustRepository(repo.path)
+    second_connection.initialize_schema()
+    try:
+        with pytest.raises(ValueError, match="multiple RUNNING"):
+            repo.heartbeat_cycle(cycle_a, "executor-a")
+        with pytest.raises(ValueError, match="multiple RUNNING"):
+            second_connection.heartbeat_cycle(cycle_b, "executor-b")
+    finally:
+        second_connection.close()
 
 
 def _unknown_in_review(repo):

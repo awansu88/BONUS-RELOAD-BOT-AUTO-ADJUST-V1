@@ -3,8 +3,11 @@ from __future__ import annotations
 from core.manual_adjust_loader import classify_rows, snapshot_fingerprint
 from core.manual_adjust_models import RawManualAdjustRow
 from core.manual_adjust_repository import ManualAdjustRepository
-from ui.manual_adjust_state import ManualPreviewState, OperatingMode
+from ui.manual_adjust_state import (ManualPreviewState, OperatingMode,
+                                    manual_execution_blocks_auto)
 from pathlib import Path
+
+import pytest
 
 
 class Loader:
@@ -45,6 +48,31 @@ def test_phase4_dashboard_wires_review_and_recovery_actions():
     ):
         assert connection in source
     assert '"manual_worker_timer", "manual_heartbeat_timer"' in source
+
+
+def test_running_cycle_pins_load_and_persisted_selection():
+    state = ManualPreviewState(manual_backend_ready=True, active_cycle_id="cycle-a")
+    class Loader:
+        calls = 0
+        def load(self): self.calls += 1; return "cycle-b"
+    loader = Loader()
+    with pytest.raises(RuntimeError, match="running Manual cycle"):
+        state.load_snapshot(loader, object(), live_cycle_id="cycle-a")
+    assert loader.calls == 0 and state.active_cycle_id == "cycle-a"
+    with pytest.raises(RuntimeError, match="opening another cycle"):
+        state.select_persisted_cycle("cycle-b", live_cycle_id="cycle-a")
+    assert state.active_cycle_id == "cycle-a"
+
+
+def test_authoritative_manual_execution_blocks_auto_without_ui_selection():
+    assert manual_execution_blocks_auto(controller_cycle_status="RUNNING",
+        current_transaction=False, worker_active=False, heartbeat_active=False)
+    assert manual_execution_blocks_auto(controller_cycle_status="STOPPED",
+        current_transaction=True, worker_active=False, heartbeat_active=False)
+    assert manual_execution_blocks_auto(controller_cycle_status="STOPPED",
+        current_transaction=False, worker_active=True, heartbeat_active=False)
+    assert not manual_execution_blocks_auto(controller_cycle_status="STOPPED",
+        current_transaction=False, worker_active=False, heartbeat_active=False)
 
 
 def test_busy_auto_states_reject_manual_without_silent_switch():

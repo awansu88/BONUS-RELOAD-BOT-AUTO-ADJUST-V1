@@ -67,7 +67,8 @@ from core.crash_state import CrashState, CrashStateStore
 from core.manual_adjust_loader import ManualAdjustLoader
 from core.manual_adjust_repository import ManualAdjustRepository
 from core.manual_adjust_controller import ManualAdjustController
-from ui.manual_adjust_state import ManualPreviewState, OperatingMode
+from ui.manual_adjust_state import (ManualPreviewState, OperatingMode,
+                                    manual_execution_blocks_auto)
 from ui.manual_adjust_view import ManualAdjustView
 
 
@@ -872,13 +873,10 @@ class Dashboard(QMainWindow):
 
     def _on_mode_selected(self, text: str) -> None:
         requested = OperatingMode(text)
-        if (requested is OperatingMode.AUTO and self.manual_repository is not None
-                and self.manual_state.active_cycle_id):
-            cycle = self.manual_repository.get_cycle(self.manual_state.active_cycle_id)
-            if cycle and cycle["status"] == "RUNNING":
-                self.mode_selector.blockSignals(True); self.mode_selector.setCurrentText(OperatingMode.MANUAL.value); self.mode_selector.blockSignals(False)
-                QMessageBox.warning(self, "Mode switch blocked", "STOP Manual Adjust before switching to AUTO.")
-                return
+        if requested is OperatingMode.AUTO and self._manual_execution_blocks_auto():
+            self.mode_selector.blockSignals(True); self.mode_selector.setCurrentText(OperatingMode.MANUAL.value); self.mode_selector.blockSignals(False)
+            QMessageBox.warning(self, "Mode switch blocked", "STOP or recover the live Manual execution cycle before switching to AUTO.")
+            return
         allowed, message = self.manual_state.select_mode(
             requested,
             self.state,
@@ -904,9 +902,39 @@ class Dashboard(QMainWindow):
             self.manual_view.display_nonterminal_cycles(
                 self.manual_repository.list_nonterminal_cycles())
             self.logger.info("[MANUAL] Mode selected")
-        elif self.sheet.is_connected:
-            interval = int(self.config.get("manual_reload_interval_sec", 90)) * 1000
-            self.manual_timer.start(interval)
+        else:
+            # Defense in depth: Manual can perform no background work after
+            # AUTO becomes the selected execution mode.
+            self.manual_worker_timer.stop()
+            self.manual_heartbeat_timer.stop()
+            if self.sheet.is_connected:
+                interval = int(self.config.get("manual_reload_interval_sec", 90)) * 1000
+                self.manual_timer.start(interval)
+
+    def _manual_live_cycle_id(self) -> Optional[str]:
+        if not self.manual_controller or not self.manual_repository or not self.manual_controller.cycle_id:
+            return None
+        cycle = self.manual_repository.get_cycle(self.manual_controller.cycle_id)
+        return self.manual_controller.cycle_id if cycle and cycle["status"] == "RUNNING" else None
+
+    def _manual_execution_blocks_auto(self) -> bool:
+        status = None
+        if self.manual_controller and self.manual_repository and self.manual_controller.cycle_id:
+            cycle = self.manual_repository.get_cycle(self.manual_controller.cycle_id)
+            status = cycle["status"] if cycle else None
+        return manual_execution_blocks_auto(
+            controller_cycle_status=status,
+            current_transaction=bool(self.manual_controller and self.manual_controller.current_transaction is not None),
+            worker_active=self.manual_worker_timer.isActive(),
+            heartbeat_active=self.manual_heartbeat_timer.isActive(),
+        )
+
+    def _reject_other_manual_cycle(self, target_cycle_id: str) -> bool:
+        live = self._manual_live_cycle_id()
+        if live is not None and target_cycle_id != live:
+            self.manual_view.show_error("Stop the live Manual execution cycle before selecting or operating another cycle.")
+            return True
+        return False
 
     def _ensure_manual_backend(self) -> None:
         """Initialize the additive Manual backend once, isolated from AUTO."""
@@ -936,12 +964,17 @@ class Dashboard(QMainWindow):
         if not self.sheet.is_connected:
             self.manual_view.show_error("Connect the Google Sheet before loading Manual data.")
             return
+        live = self._manual_live_cycle_id()
+        if live is not None:
+            self.manual_state.active_cycle_id = live
+            self.manual_view.show_error("Stop the running Manual cycle before loading new data.")
+            return
         self.logger.info("[MANUAL] Loading snapshot")
         try:
             if self.manual_repository is None or self.manual_loader is None:
                 raise RuntimeError("Manual backend is not initialized")
             cycle, summary, rows = self.manual_state.load_snapshot(
-                self.manual_loader, self.manual_repository
+                self.manual_loader, self.manual_repository, live_cycle_id=live
             )
         except Exception as exc:
             self.logger.error(f"[MANUAL] Snapshot load failed: {exc}")
@@ -962,6 +995,7 @@ class Dashboard(QMainWindow):
         if not self.manual_controller or not self.manual_repository or not self.manual_state.active_cycle_id:
             return
         cid = self.manual_state.active_cycle_id
+        if self._reject_other_manual_cycle(cid): return
         summary = self.manual_repository.get_cycle_execution_summary(cid)
         cycle = self.manual_repository.get_cycle(cid)
         total = int(cycle["total_amount"]) if cycle else 0
@@ -978,9 +1012,14 @@ class Dashboard(QMainWindow):
     def _on_manual_open_cycle(self, cycle_id: str) -> None:
         """Explicitly open a frozen SQLite cycle; never consult the Sheet."""
         if not self.manual_repository: return
+        if self._reject_other_manual_cycle(cycle_id): return
         cycle = self.manual_repository.get_cycle(cycle_id)
         if not cycle: self.manual_view.show_error("Persisted Manual cycle no longer exists."); return
-        self.manual_state.active_cycle_id = cycle_id
+        try:
+            self.manual_state.select_persisted_cycle(cycle_id,
+                live_cycle_id=self._manual_live_cycle_id())
+        except RuntimeError as exc:
+            self.manual_view.show_error(str(exc)); return
         self.manual_view.display_preview(cycle, self.manual_repository.get_cycle_summary(cycle_id),
                                          self.manual_repository.get_source_rows(cycle_id))
         self._refresh_manual_execution()
@@ -988,6 +1027,7 @@ class Dashboard(QMainWindow):
     def _on_manual_recover(self) -> None:
         if not self.manual_controller or not self.manual_repository or not self.manual_state.active_cycle_id: return
         cid = self.manual_state.active_cycle_id
+        if self._reject_other_manual_cycle(cid): return
         cycle = self.manual_repository.get_cycle(cid)
         if not cycle or cycle["status"] != "RUNNING":
             self.manual_view.show_error("Only a selected persisted RUNNING cycle can be recovered."); return
@@ -1006,6 +1046,7 @@ class Dashboard(QMainWindow):
 
     def _on_manual_resume(self) -> None:
         if not self.manual_controller or not self.manual_state.active_cycle_id: return
+        if self._reject_other_manual_cycle(self.manual_state.active_cycle_id): return
         try:
             self.manual_controller.resume(self.manual_state.active_cycle_id)
             self.manual_worker_timer.start(100)
@@ -1014,6 +1055,7 @@ class Dashboard(QMainWindow):
 
     def _on_manual_retry(self) -> None:
         if not self.manual_controller or not self.manual_state.active_cycle_id: return
+        if self._reject_other_manual_cycle(self.manual_state.active_cycle_id): return
         selected = self.manual_view.selected_failure_ids()
         if not selected:
             self.manual_view.show_error("Select at least one definitely-not-submitted transaction."); return
@@ -1029,6 +1071,7 @@ class Dashboard(QMainWindow):
 
     def _on_manual_finalize(self) -> None:
         if not self.manual_controller or not self.manual_repository or not self.manual_state.active_cycle_id: return
+        if self._reject_other_manual_cycle(self.manual_state.active_cycle_id): return
         rows = self.manual_repository.get_transactions_by_status(self.manual_state.active_cycle_id, "FAILED_NOT_SUBMITTED")
         amount = sum(int(row["adjust_amount"]) for row in rows)
         if QMessageBox.question(self, "Finalize with failures",
@@ -1041,6 +1084,8 @@ class Dashboard(QMainWindow):
 
     def _on_manual_reconcile(self) -> None:
         if not self.manual_controller: return
+        if (self.manual_state.active_cycle_id and
+                self._reject_other_manual_cycle(self.manual_state.active_cycle_id)): return
         identity = self.manual_view.selected_unknown()
         if not identity:
             self.manual_view.show_error("Select one UNKNOWN transaction to reconcile."); return
@@ -1066,6 +1111,8 @@ class Dashboard(QMainWindow):
 
     def _manual_worker_step(self) -> None:
         if not self.manual_controller: self.manual_worker_timer.stop(); return
+        if self.manual_state.mode is not OperatingMode.MANUAL:
+            self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop(); return
         try:
             result = self.manual_controller.step(); self._refresh_manual_execution()
         except Exception as exc:
@@ -1076,13 +1123,19 @@ class Dashboard(QMainWindow):
             self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop()
 
     def _manual_heartbeat(self) -> None:
+        if self.manual_state.mode is not OperatingMode.MANUAL:
+            self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop(); return
         try:
             if self.manual_controller: self.manual_controller.heartbeat()
         except Exception as exc:
             self.manual_worker_timer.stop(); self.manual_heartbeat_timer.stop(); self.logger.error(f"[MANUAL] Lease lost: {exc}")
 
     def _refresh_manual_execution(self) -> None:
-        if not self.manual_repository or not self.manual_state.active_cycle_id: return
+        if not self.manual_repository: return
+        live = self._manual_live_cycle_id()
+        if live is not None:
+            self.manual_state.active_cycle_id = live
+        if not self.manual_state.active_cycle_id: return
         cycle = self.manual_repository.get_cycle(self.manual_state.active_cycle_id)
         summary = self.manual_repository.get_cycle_execution_summary(self.manual_state.active_cycle_id)
         if cycle: self.manual_view.set_execution_state(cycle["status"], summary,

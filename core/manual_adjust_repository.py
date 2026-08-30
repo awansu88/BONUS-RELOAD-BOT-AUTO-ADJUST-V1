@@ -455,8 +455,10 @@ class ManualAdjustRepository:
 
     def is_lease_stale(self, cycle_id: str, lease_timeout_sec: int) -> bool:
         row = self._conn.execute("SELECT status,lease_heartbeat_at FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
-        if not row or row["status"] != "RUNNING" or not row["lease_heartbeat_at"]:
+        if not row or row["status"] != "RUNNING":
             return False
+        if not row["lease_heartbeat_at"]:
+            return True
         heartbeat = datetime.fromisoformat(row["lease_heartbeat_at"])
         return datetime.now(timezone.utc) - heartbeat > timedelta(seconds=lease_timeout_sec)
 
@@ -580,9 +582,8 @@ class ManualAdjustRepository:
             cycle = self._conn.execute("SELECT status,lease_heartbeat_at FROM manual_adjust_cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
             if not cycle or cycle["status"] != "RUNNING":
                 raise ValueError("cycle is not RUNNING")
-            if not cycle["lease_heartbeat_at"]:
-                raise ValueError("RUNNING cycle has no lease heartbeat; integrity review required")
-            if datetime.fromisoformat(cycle["lease_heartbeat_at"]) >= cutoff:
+            if (cycle["lease_heartbeat_at"] and
+                    datetime.fromisoformat(cycle["lease_heartbeat_at"]) >= cutoff):
                 raise ValueError("cycle lease is not stale")
             rows = self._conn.execute("""SELECT t.transaction_id,t.current_attempt_id,a.submit_clicked_at,a.submission_phase FROM manual_adjust_transactions t
               JOIN manual_adjust_attempts a ON a.attempt_id=t.current_attempt_id WHERE t.cycle_id=? AND t.status='SUBMITTING' AND a.result='IN_PROGRESS'""", (cycle_id,)).fetchall()

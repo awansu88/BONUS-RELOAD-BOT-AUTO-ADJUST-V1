@@ -69,6 +69,8 @@ class ManualAdjustView(QWidget):
                  ("FINALIZE WITH FAILURES", "finalize", self.finalize_requested),
                  ("RECONCILE UNKNOWN", "reconcile", self.reconcile_requested))
         self.actions = {}
+        self._sheet_connected = False
+        self._execution_status = "PREVIEW"
         for text, key, signal in specs:
             button = QPushButton(text); button.clicked.connect(signal); button.setEnabled(False)
             controls.addWidget(button); self.actions[key] = button
@@ -99,12 +101,14 @@ class ManualAdjustView(QWidget):
         layout.addWidget(self.table, 1)
 
     def set_sheet_connected(self, connected: bool) -> None:
-        self.load_button.setEnabled(connected)
+        self._sheet_connected = connected
+        self.load_button.setEnabled(connected and self._execution_status != "RUNNING")
         self.load_button.setToolTip("" if connected else "Connect the Google Sheet before loading Manual data.")
 
     def set_execution_state(self, status: str, summary: dict | None = None, *,
                             execution_enabled: bool = False, panel_attached: bool = False) -> None:
         summary = summary or {}
+        self._execution_status = status
         self.execution_status.setText(status)
         self.progress.setText("SUCCESS {success}  •  FAILED {failed}  •  UNKNOWN {unknown}  •  PENDING {pending}  •  TOTAL ADJUSTED SUCCESSFULLY {total_adjusted_successfully:,}".format(
             success=summary.get("success", 0), failed=summary.get("failed", 0),
@@ -119,6 +123,10 @@ class ManualAdjustView(QWidget):
         self.actions["finalize"].setEnabled(status == "FAILURE_REVIEW")
         self.actions["reconcile"].setEnabled(status == "REVIEW_REQUIRED")
         self.recover_button.setEnabled(status == "RUNNING")
+        navigation_enabled = status != "RUNNING"
+        self.load_button.setEnabled(self._sheet_connected and navigation_enabled)
+        self.cycle_selector.setEnabled(navigation_enabled)
+        self.open_cycle_button.setEnabled(navigation_enabled)
 
     def show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Manual snapshot failed", message)

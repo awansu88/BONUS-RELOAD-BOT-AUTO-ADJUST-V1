@@ -104,6 +104,28 @@ def test_recovery_rechecks_fresh_heartbeat_inside_transaction(repo, monkeypatch)
     assert repo.get_pending_transactions(cid)
 
 
+def test_missing_heartbeat_pending_recovers_stopped_and_unblocks_start(repo):
+    cycle_a = snapshot(repo, 1); cycle_b = snapshot(repo, 1)
+    repo.confirm_and_start(cycle_a, "executor-a", 120)
+    repo._conn.execute("UPDATE manual_adjust_cycles SET lease_heartbeat_at=NULL WHERE cycle_id=?", (cycle_a,))
+    assert repo.is_lease_stale(cycle_a, 120) is True
+    with pytest.raises(ValueError, match="recover stale"):
+        repo.confirm_and_start(cycle_b, "executor-b", 120)
+    assert repo.recover_stale_cycle(cycle_a, 120) == "STOPPED"
+    repo.confirm_and_start(cycle_b, "executor-b", 120)
+
+
+def test_missing_heartbeat_submitting_recovers_unknown(repo):
+    cid = snapshot(repo, 1); repo.confirm_and_start(cid, "one", 120)
+    tx = repo.get_pending_transactions(cid)[0]
+    attempt = repo.claim_pending(tx.transaction_id, "one")
+    repo.record_attempt_phase(attempt["attempt_id"], "one", "SUBMIT_CLICK_BOUNDARY")
+    repo._conn.execute("UPDATE manual_adjust_cycles SET lease_heartbeat_at=NULL WHERE cycle_id=?", (cid,))
+    assert repo.recover_stale_cycle(cid, 120) == "REVIEW_REQUIRED"
+    history = repo.get_attempt_history(tx.transaction_id)[0]
+    assert history["result"] == "UNKNOWN" and history["click_crossed"] is None
+
+
 def test_stale_submitting_is_unknown(repo):
     cid = snapshot(repo, 1); repo.confirm_and_start(cid, "one", 120)
     tx = repo.get_pending_transactions(cid)[0]; repo.claim_pending(tx.transaction_id, "one")

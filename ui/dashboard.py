@@ -924,6 +924,12 @@ class Dashboard(QMainWindow):
             self.metrics_timer.stop()
             self.manual_view.set_sheet_connected(self.sheet.is_connected)
             self.manual_state.active_cycle_id = None
+            self.manual_view.reset_unselected_state(
+                execution_enabled=self.config.get("manual_adjust", {}).get(
+                    "execution_enabled", False) is True,
+                panel_attached=self.panel.is_attached,
+                panel_open=self.panel.is_alive(),
+            )
             self.manual_view.display_nonterminal_cycles(
                 self.manual_repository.list_nonterminal_cycles())
             self.logger.info("[MANUAL] Mode selected")
@@ -1009,7 +1015,7 @@ class Dashboard(QMainWindow):
         execution = self.manual_repository.get_cycle_execution_summary(cycle["cycle_id"])
         self.manual_view.set_execution_state(cycle["status"], execution,
             execution_enabled=self.config.get("manual_adjust", {}).get("execution_enabled", False) is True,
-            panel_attached=self.panel.is_attached)
+            panel_attached=self.panel.is_attached, panel_open=self.panel.is_alive())
         self.logger.info(f"[MANUAL] Snapshot frozen — cycle {cycle['cycle_id']}")
         self.logger.info(
             f"[MANUAL] {summary.ready} READY / {summary.duplicates} DUPLICATE / "
@@ -1167,7 +1173,8 @@ class Dashboard(QMainWindow):
         cycle = self.manual_repository.get_cycle(self.manual_state.active_cycle_id)
         summary = self.manual_repository.get_cycle_execution_summary(self.manual_state.active_cycle_id)
         if cycle: self.manual_view.set_execution_state(cycle["status"], summary,
-            execution_enabled=self.config.get("manual_adjust", {}).get("execution_enabled", False) is True, panel_attached=self.panel.is_attached)
+            execution_enabled=self.config.get("manual_adjust", {}).get("execution_enabled", False) is True,
+            panel_attached=self.panel.is_attached, panel_open=self.panel.is_alive())
         if cycle and cycle["status"] == "FAILURE_REVIEW":
             self.manual_view.display_failure_review(self.manual_repository.get_transactions_by_status(
                 self.manual_state.active_cycle_id, "FAILED_NOT_SUBMITTED"))

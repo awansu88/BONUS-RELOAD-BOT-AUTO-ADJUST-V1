@@ -68,6 +68,49 @@ def test_stopped_is_the_only_paused_state_and_continue_keeps_progress():
         assert view.execution_status.text() != "PAUSED"
 
 
+def test_submitting_remains_in_invariant_progress_total():
+    view = _view()
+    view.set_execution_state("RUNNING", {"success": 37, "submitting": 1, "pending": 62})
+    assert view.progress_text.text() == "Processed 37 / 100"
+    assert view.execution_values["SUBMITTING"].text() == "1"
+
+
+def test_current_execution_uses_no_nonexistent_summary_fields():
+    view = _view()
+    view.set_execution_state("RUNNING", {"success": 1, "pending": 2})
+    assert set(view.current_values) == {"STATE", "ACTIVE TRANSACTION"}
+    assert view.current_values["STATE"].text() == "Running"
+    assert view.current_values["ACTIVE TRANSACTION"].text() == "—"
+
+
+@pytest.mark.parametrize("old_state", ["STOPPED", "FAILURE_REVIEW", "REVIEW_REQUIRED", "COMPLETED"])
+def test_reenter_manual_clears_old_selection_and_actions(old_state):
+    view = _view()
+    view.set_execution_state(old_state, {"success": 37, "pending": 63},
+                             execution_enabled=True, panel_attached=True)
+    view.table.setRowCount(3)
+    view.values["SOURCE ROWS"].setText("100")
+    view.status_values["LAST SNAPSHOT"].setText("yesterday")
+    view.reset_unselected_state(execution_enabled=False, panel_attached=False)
+    assert view.status_values["MANUAL CYCLE"].text() == "No snapshot"
+    assert view.execution_status.text() == "NO SNAPSHOT"
+    assert view.status_values["LAST SNAPSHOT"].text() == "Never"
+    assert view.table.rowCount() == 0
+    assert all(value.text() == "0" for value in view.values.values())
+    assert not any(_visible(view, key) for key in
+                   ("stop", "resume", "retry", "finalize", "reconcile"))
+
+
+def test_unselected_shared_context_is_immediately_authoritative():
+    view = _view()
+    view.reset_unselected_state(execution_enabled=True, panel_attached=True, panel_open=True)
+    assert view.status_values["PANEL"].text() == "Attached"
+    assert view.status_values["EXECUTION GATE"].text() == "ENABLED"
+    view.reset_unselected_state(execution_enabled=False, panel_attached=False, panel_open=True)
+    assert view.status_values["PANEL"].text() == "Open"
+    assert view.status_values["EXECUTION GATE"].text() == "DISABLED"
+
+
 def test_review_and_completed_actions_are_state_specific():
     view = _view()
     view.set_execution_state("FAILURE_REVIEW")

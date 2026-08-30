@@ -50,6 +50,20 @@ def test_phase4_dashboard_wires_review_and_recovery_actions():
     assert '"manual_worker_timer", "manual_heartbeat_timer"' in source
 
 
+def test_manual_entry_resets_view_with_shared_context_and_auto_controls_stay_frozen():
+    source = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text(encoding="utf-8")
+    mode_method = source[source.index("    def _on_mode_selected"):
+                         source.index("    def _manual_live_cycle_id")]
+    assert "self.manual_state.active_cycle_id = None" in mode_method
+    assert "self.manual_view.reset_unselected_state(" in mode_method
+    assert "panel_attached=self.panel.is_attached" in mode_method
+    assert "panel_open=self.panel.is_alive()" in mode_method
+    assert '"execution_enabled", False) is True' in mode_method
+    # Manual corrections must not rename the accepted AUTO controls.
+    assert 'self.btn_start = QPushButton("START")' in source
+    assert 'self.btn_stop = QPushButton("STOP")' in source
+
+
 def test_manual_running_panel_controls_and_handlers_are_locked():
     root = Path(__file__).parents[2]
     view_source = (root / "ui" / "manual_adjust_view.py").read_text(encoding="utf-8")

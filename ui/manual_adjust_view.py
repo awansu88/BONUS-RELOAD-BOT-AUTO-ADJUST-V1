@@ -106,8 +106,10 @@ class ManualAdjustView(QWidget):
         current = QFrame(); current.setObjectName("SubCard")
         current_grid = QGridLayout(current); current_grid.setContentsMargins(10, 8, 10, 8)
         self.current_values = {}
-        for row, (key, value) in enumerate((("USERNAME", "—"), ("TRUE AMOUNT", "0"),
-                                            ("STATE", "Idle"), ("ATTEMPT", "—"))):
+        # The repository execution summary is aggregate-only.  Keep this card
+        # deliberately limited to values the view can state authoritatively.
+        for row, (key, value) in enumerate((("STATE", "Idle"),
+                                            ("ACTIVE TRANSACTION", "—"))):
             caption = QLabel(key); caption.setObjectName("KpiCaption")
             label = QLabel(value); label.setAlignment(Qt.AlignRight); label.setObjectName("KpiSmall")
             current_grid.addWidget(caption, row, 0); current_grid.addWidget(label, row, 1)
@@ -126,7 +128,9 @@ class ManualAdjustView(QWidget):
         summary_card = QFrame(); summary_card.setObjectName("SubCard")
         summary_grid = QGridLayout(summary_card); summary_grid.setContentsMargins(10, 8, 10, 8)
         self.execution_values = {}
-        colors = {"SUCCESS": "#4ADE80", "FAILED": "#EF4444", "UNKNOWN": "#F59E0B", "PENDING": "#C7C6BE", "TOTAL ADJUSTED": "#F5B301"}
+        colors = {"SUCCESS": "#4ADE80", "FAILED": "#EF4444", "UNKNOWN": "#F59E0B",
+                  "PENDING": "#C7C6BE", "SUBMITTING": "#3B82F6",
+                  "TOTAL ADJUSTED": "#F5B301"}
         for index, key in enumerate(colors):
             caption = QLabel(key); caption.setObjectName("KpiCaption")
             value = QLabel("0"); value.setStyleSheet(f"color:{colors[key]};font-size:15px;font-weight:700")
@@ -203,32 +207,53 @@ class ManualAdjustView(QWidget):
                 "REVIEW_REQUIRED": "REVIEW REQUIRED", "HARD_STOPPED": "HARD STOPPED"}.get(status, status)
 
     def set_execution_state(self, status: str, summary: dict | None = None, *,
-                            execution_enabled: bool = False, panel_attached: bool = False) -> None:
+                            execution_enabled: bool = False, panel_attached: bool = False,
+                            panel_open: bool = False) -> None:
         summary = summary or {}; self._execution_status = status
         if status != "RUNNING": self._pause_requested = False
         shown = self._operator_status(status)
         self.execution_status.setText(shown); self.status_values["MANUAL CYCLE"].setText(shown)
         self.status_values["EXECUTION GATE"].setText("ENABLED" if execution_enabled else "DISABLED")
         self.status_values["EXECUTION GATE"].setStyleSheet(f"color:{'#4ADE80' if execution_enabled else '#EF4444'};font-weight:700")
-        self.status_values["PANEL"].setText("Attached" if panel_attached else "Closed")
+        self.status_values["PANEL"].setText(
+            "Attached" if panel_attached else "Open" if panel_open else "Closed")
         state_names = {"PREVIEW": "Idle", "RUNNING": "Pausing" if self._pause_requested else "Running",
                        "STOPPED": "Paused", "FAILURE_REVIEW": "Failure Review", "REVIEW_REQUIRED": "Review Required",
                        "COMPLETED": "Completed", "HARD_STOPPED": "Hard Stopped"}
         self.current_values["STATE"].setText(state_names.get(status, shown.title()))
-        self.current_values["USERNAME"].setText(str(summary.get("current_username") or "—"))
-        self.current_values["TRUE AMOUNT"].setText(f"{int(summary.get('current_amount') or 0):,}")
-        self.current_values["ATTEMPT"].setText(str(summary.get("attempt_no") or "—"))
+        self.current_values["ACTIVE TRANSACTION"].setText("—")
         success, failed = int(summary.get("success", 0)), int(summary.get("failed", 0))
         unknown, pending = int(summary.get("unknown", 0)), int(summary.get("pending", 0))
+        submitting = int(summary.get("submitting", 0))
         self._pending_count = pending
-        total = success + failed + unknown + pending; processed = success + failed + unknown
+        total = success + failed + unknown + pending + submitting
+        processed = success + failed + unknown
         percent = round(processed * 100 / total) if total else 0
         self.progress_text.setText(f"Processed {processed:,} / {total:,}"); self.progress_percent.setText(f"{percent}%"); self.progress_bar.setValue(percent)
-        for key, value in (("SUCCESS", success), ("FAILED", failed), ("UNKNOWN", unknown), ("PENDING", pending),
+        for key, value in (("SUCCESS", success), ("FAILED", failed), ("UNKNOWN", unknown),
+                           ("PENDING", pending), ("SUBMITTING", submitting),
                            ("TOTAL ADJUSTED", int(summary.get("total_adjusted_successfully", 0)))):
             self.execution_values[key].setText(f"{value:,}")
         self._execution_enabled = execution_enabled; self._panel_attached = panel_attached
         self._apply_action_state()
+
+    def reset_unselected_state(self, *, execution_enabled: bool, panel_attached: bool,
+                               panel_open: bool = False) -> None:
+        """Clear only the visible selection while preserving persisted cycles."""
+        self._pause_requested = False
+        self.frozen.setText("NO SNAPSHOT LOADED")
+        self.provenance.setText(
+            "Connect Google Sheets and click LOAD MANUAL DATA to freeze the current MASTER rows for review.")
+        self.table.clearContents(); self.table.setRowCount(0); self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(
+            ["ROW", "USER ID", "TRUE AMOUNT", "STATUS", "SOURCE TX_ID", "REASON"])
+        self._set_preview_column_widths()
+        for value in self.values.values(): value.setText("0")
+        self.status_values["LAST SNAPSHOT"].setText("Never")
+        self.set_execution_state("PREVIEW", {}, execution_enabled=execution_enabled,
+                                 panel_attached=panel_attached, panel_open=panel_open)
+        self.status_values["MANUAL CYCLE"].setText("No snapshot")
+        self.execution_status.setText("NO SNAPSHOT")
 
     def _apply_action_state(self) -> None:
         status = self._execution_status

@@ -1037,7 +1037,7 @@ class Dashboard(QMainWindow):
         self.manual_view.set_execution_state(cycle["status"], execution,
             execution_enabled=self.config.get("manual_adjust", {}).get("execution_enabled", False) is True,
             panel_attached=self.panel.is_attached, panel_open=self.panel.is_alive(),
-            active_cycle_selected=self.manual_state.active_cycle_id == cycle["cycle_id"])
+            has_current_cycle=self.manual_state.active_cycle_id is not None)
         self.logger.info(f"[MANUAL] Snapshot frozen — cycle {cycle['cycle_id']}")
         self.logger.info(
             f"[MANUAL] {summary.ready} READY / {summary.duplicates} DUPLICATE / "
@@ -1197,7 +1197,7 @@ class Dashboard(QMainWindow):
         if cycle: self.manual_view.set_execution_state(cycle["status"], summary,
             execution_enabled=self.config.get("manual_adjust", {}).get("execution_enabled", False) is True,
             panel_attached=self.panel.is_attached, panel_open=self.panel.is_alive(),
-            active_cycle_selected=self.manual_state.active_cycle_id == cycle["cycle_id"])
+            has_current_cycle=self.manual_state.active_cycle_id is not None)
         if cycle and cycle["status"] == "FAILURE_REVIEW":
             self.manual_view.display_failure_review(self.manual_repository.get_transactions_by_status(
                 self.manual_state.active_cycle_id, "FAILED_NOT_SUBMITTED"))

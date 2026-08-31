@@ -34,7 +34,7 @@ class ManualAdjustView(QWidget):
         self._execution_status = "PREVIEW"
         self._pause_requested = False
         self._pending_count = 0
-        self._active_cycle_selected = False
+        self._has_current_cycle = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -218,10 +218,10 @@ class ManualAdjustView(QWidget):
     def set_execution_state(self, status: str, summary: dict | None = None, *,
                             execution_enabled: bool = False, panel_attached: bool = False,
                             panel_open: bool = False,
-                            active_cycle_selected: bool | None = None) -> None:
+                            has_current_cycle: bool | None = None) -> None:
         summary = summary or {}; self._execution_status = status
-        if active_cycle_selected is not None:
-            self._active_cycle_selected = active_cycle_selected
+        if has_current_cycle is not None:
+            self._has_current_cycle = has_current_cycle
         if status != "RUNNING": self._pause_requested = False
         shown = self._operator_status(status)
         self.execution_status.setText(shown); self.status_values["MANUAL CYCLE"].setText(shown)
@@ -253,7 +253,7 @@ class ManualAdjustView(QWidget):
                                panel_open: bool = False) -> None:
         """Clear only the visible selection while preserving persisted cycles."""
         self._pause_requested = False
-        self._active_cycle_selected = False
+        self._has_current_cycle = False
         self.frozen.setText("NO SNAPSHOT LOADED")
         self.provenance.setText(
             "Connect Google Sheets and click LOAD MANUAL DATA to freeze the current MASTER rows for review.")
@@ -278,7 +278,7 @@ class ManualAdjustView(QWidget):
             self.actions["open_panel"].setEnabled(True); self.actions["attach_panel"].setEnabled(True)
             self.actions["start"].setEnabled(getattr(self, "_execution_enabled", False)
                                              and getattr(self, "_panel_attached", False)
-                                             and self._active_cycle_selected
+                                             and self._has_current_cycle
                                              and self._pending_count > 0)
         elif status == "RUNNING":
             self.actions["stop"].show(); self.actions["stop"].setText("PAUSING..." if self._pause_requested else "PAUSE")

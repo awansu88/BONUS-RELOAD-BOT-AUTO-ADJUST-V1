@@ -154,6 +154,8 @@ def test_fresh_snapshot_is_the_active_cycle_through_panel_ready_and_start_flow(t
         assert "self.manual_controller.start(cid, confirmed=True)" in start_method
         assert "manual_loader" not in open_method + ready_method + start_method
         assert loader.calls == 1
+        assert "has_current_cycle=self.manual_state.active_cycle_id is not None" in dashboard
+        assert "active_cycle_selected" not in dashboard
     finally:
         repository.close()
 

@@ -32,17 +32,30 @@ def test_manual_signals_and_preview_actions_remain_available():
                  "open_cycle_requested", "recover_requested"):
         assert hasattr(view, name)
     view.set_execution_state("PREVIEW", {"pending": 2}, execution_enabled=True,
-                             panel_attached=True, active_cycle_selected=True)
+                             panel_attached=True, has_current_cycle=True)
     assert all(_visible(view, key) for key in ("load", "open_panel", "attach_panel", "start"))
     assert view.actions["start"].isEnabled()
     assert view.actions["attach_panel"].text() == "READY"
 
 
-def test_start_requires_an_explicitly_active_cycle_and_recovery_ui_remains_available():
+def test_start_uses_current_cycle_not_recovery_selector_state():
     view = _view()
+    view.display_nonterminal_cycles([
+        {"status": "STOPPED", "created_at": "yesterday", "cycle_id": "old-cycle"}
+    ])
+    assert view.cycle_selector.currentData() is None
     view.set_execution_state("PREVIEW", {"pending": 2}, execution_enabled=True,
-                             panel_attached=True, active_cycle_selected=False)
+                             panel_attached=True, has_current_cycle=True)
+    assert view.actions["start"].isEnabled()
+
+    view.set_execution_state("PREVIEW", {"pending": 2}, execution_enabled=False,
+                             panel_attached=True, has_current_cycle=True)
     assert not view.actions["start"].isEnabled()
+
+    view.set_execution_state("PREVIEW", {"pending": 2}, execution_enabled=True,
+                             panel_attached=True, has_current_cycle=False)
+    assert not view.actions["start"].isEnabled()
+    assert view.cycle_selector.count() == 2
     assert view.cycle_selector.placeholderText() == "SELECT PERSISTED CYCLE"
     assert view.open_cycle_button.text() == "OPEN"
 

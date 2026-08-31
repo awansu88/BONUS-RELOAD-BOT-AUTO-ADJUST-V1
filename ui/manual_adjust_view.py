@@ -1,12 +1,18 @@
-"""Read-only Phase 3 preview widget for Full Manual Adjust."""
+"""Compact, state-aware presentation for Full Manual Adjust.
+
+This widget intentionally owns presentation only.  All execution signals still
+delegate to :class:`Dashboard` and the existing Manual controller.
+"""
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QHeaderView,
-    QComboBox, QLabel, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (
+    QAbstractItemView, QComboBox, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSplitter,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+)
 
 
 class ManualAdjustView(QWidget):
@@ -21,213 +27,374 @@ class ManualAdjustView(QWidget):
     reconcile_requested = Signal()
     open_cycle_requested = Signal(str)
     recover_requested = Signal()
+    remark_save_requested = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, manual_remark: str = ""):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(14)
-
-        title_row = QHBoxLayout()
-        title = QLabel("FULL MANUAL ADJUST")
-        title.setStyleSheet("color:#F5B301;font-size:22px;font-weight:800;letter-spacing:4px")
-        self.load_button = QPushButton("LOAD MANUAL DATA")
-        self.load_button.setProperty("cls", "primary")
-        self.load_button.setEnabled(False)
-        self.load_button.clicked.connect(self.load_requested)
-        title_row.addWidget(title); title_row.addStretch(1); title_row.addWidget(self.load_button)
-        layout.addLayout(title_row)
-        note = QLabel("TRUE AMOUNT is submitted exactly 1:1. Execution requires explicit confirmation and the Manual safety gate.")
-        note.setStyleSheet("color:#C7C6BE;font-size:12px")
-        layout.addWidget(note)
-
-        self.frozen = QLabel("NO SNAPSHOT LOADED")
-        self.frozen.setStyleSheet("color:#6E7180;font-weight:700;letter-spacing:2px")
-        self.provenance = QLabel("Load is operator-initiated and reads MASTER exactly once.")
-        self.provenance.setStyleSheet("color:#8A8C99")
-        layout.addWidget(self.frozen); layout.addWidget(self.provenance)
-
-        discovery = QHBoxLayout()
-        self.cycle_selector = QComboBox()
-        self.cycle_selector.setPlaceholderText("SELECT A PERSISTED CYCLE")
-        self.open_cycle_button = QPushButton("OPEN SELECTED CYCLE")
-        self.recover_button = QPushButton("RECOVER STALE CYCLE")
-        self.open_cycle_button.clicked.connect(self._emit_open_cycle)
-        self.recover_button.clicked.connect(self.recover_requested)
-        self.recover_button.setEnabled(False)
-        discovery.addWidget(self.cycle_selector, 1)
-        discovery.addWidget(self.open_cycle_button)
-        discovery.addWidget(self.recover_button)
-        layout.addLayout(discovery)
-
-        controls = QHBoxLayout()
-        specs = (("OPEN PANEL", "open_panel", self.open_panel_requested),
-                 ("ATTACH PANEL", "attach_panel", self.attach_panel_requested),
-                 ("START MANUAL ADJUST", "start", self.start_requested),
-                 ("STOP", "stop", self.stop_requested), ("RESUME", "resume", self.resume_requested),
-                 ("RETRY SELECTED", "retry", self.retry_requested),
-                 ("FINALIZE WITH FAILURES", "finalize", self.finalize_requested),
-                 ("RECONCILE UNKNOWN", "reconcile", self.reconcile_requested))
-        self.actions = {}
         self._sheet_connected = False
         self._execution_status = "PREVIEW"
-        for text, key, signal in specs:
-            button = QPushButton(text); button.clicked.connect(signal); button.setEnabled(False)
-            controls.addWidget(button); self.actions[key] = button
-        layout.addLayout(controls)
-        self.execution_status = QLabel("PREVIEW")
-        self.execution_status.setObjectName("StatusBadge")
-        self.progress = QLabel("SUCCESS 0  •  FAILED 0  •  UNKNOWN 0  •  PENDING 0  •  TOTAL ADJUSTED SUCCESSFULLY 0")
-        layout.addWidget(self.execution_status); layout.addWidget(self.progress)
+        self._pause_requested = False
+        self._pending_count = 0
+        self._has_current_cycle = False
 
-        cards = QGridLayout()
-        self.values = {}
-        for i, key in enumerate(("SOURCE ROWS", "UNIQUE USERS", "READY", "DUPLICATE", "INVALID", "TOTAL ADJUSTMENT")):
-            card = QFrame(); card.setObjectName("SubCard")
-            box = QVBoxLayout(card)
-            value = QLabel("0"); value.setStyleSheet("color:#F5B301;font-size:20px;font-weight:800")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+        remark_bar = QFrame(); remark_bar.setObjectName("Card")
+        remark_layout = QHBoxLayout(remark_bar)
+        remark_layout.setContentsMargins(14, 8, 14, 8); remark_layout.setSpacing(10)
+        remark_label = QLabel("MANUAL REMARK"); remark_label.setObjectName("SectionTitle")
+        self.remark_input = QLineEdit(manual_remark)
+        self.remark_input.setObjectName("manual-remark-input")
+        self.remark_save_button = QPushButton("SAVE")
+        self.remark_save_button.setObjectName("manual-remark-save-btn")
+        self.remark_save_button.clicked.connect(self._emit_remark_save)
+        remark_layout.addWidget(remark_label); remark_layout.addWidget(self.remark_input, 1)
+        remark_layout.addWidget(self.remark_save_button)
+        root.addWidget(remark_bar)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setObjectName("manual-dashboard-splitter")
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self._build_left_scroll())
+        splitter.addWidget(self._build_workspace())
+        splitter.setStretchFactor(0, 43)
+        splitter.setStretchFactor(1, 57)
+        splitter.setSizes([430, 570])
+        root.addWidget(splitter)
+
+    @staticmethod
+    def _title(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("SectionTitle")
+        return label
+
+    @staticmethod
+    def _divider() -> QFrame:
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet("background:#23252E;max-height:1px")
+        return line
+
+    def _build_left_scroll(self) -> QScrollArea:
+        panel = QFrame(); panel.setObjectName("Card")
+        box = QVBoxLayout(panel); box.setContentsMargins(16, 14, 16, 14); box.setSpacing(12)
+
+        box.addWidget(self._title("Status"))
+        status = QGridLayout(); status.setHorizontalSpacing(24); status.setVerticalSpacing(8)
+        self.status_values = {}
+        self.status_dots = {}
+        for row, (key, value) in enumerate((
+            ("GOOGLE SHEETS", "Not connected"), ("PANEL", "Closed"),
+            ("MANUAL CYCLE", "No snapshot"), ("EXECUTION GATE", "DISABLED"),
+            ("LAST SNAPSHOT", "Never"),
+        )):
+            caption = QLabel(key.title()); caption.setObjectName("StatLabel")
+            label = QLabel(value); label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            caption.setMinimumHeight(24); label.setMinimumHeight(24)
+            status.addWidget(caption, row, 0)
+            if key in ("GOOGLE SHEETS", "PANEL"):
+                dot = QLabel("●"); dot.setObjectName("DotIdle")
+                wrapper = QWidget(); value_row = QHBoxLayout(wrapper)
+                value_row.setContentsMargins(0, 0, 0, 0); value_row.setSpacing(8)
+                value_row.addStretch(1); value_row.addWidget(dot); value_row.addWidget(label)
+                status.addWidget(wrapper, row, 1); self.status_dots[key] = dot
+            else:
+                status.addWidget(label, row, 1)
+            self.status_values[key] = label
+        box.addLayout(status); box.addWidget(self._divider())
+
+        box.addWidget(self._title("Actions"))
+        self.action_grid = QGridLayout()
+        self.action_grid.setHorizontalSpacing(10); self.action_grid.setVerticalSpacing(10)
+        specs = (
+            ("LOAD MANUAL DATA", "load", self.load_requested),
+            ("OPEN PANEL", "open_panel", self.open_panel_requested),
+            ("READY", "attach_panel", self.attach_panel_requested),
+            ("START MANUAL ADJUST", "start", self.start_requested),
+            ("PAUSE", "stop", self.stop_requested), ("CONTINUE", "resume", self.resume_requested),
+            ("RETRY SELECTED", "retry", self.retry_requested),
+            ("FINALIZE WITH FAILURES", "finalize", self.finalize_requested),
+            ("RECONCILE UNKNOWN", "reconcile", self.reconcile_requested),
+        )
+        self.actions = {}
+        for index, (text, key, signal) in enumerate(specs):
+            button = QPushButton(text); button.setObjectName(f"manual-{key}-btn")
+            button.setMinimumHeight(44 if key in ("start", "stop", "resume") else 38)
+            if key == "stop": button.clicked.connect(self._request_pause)
+            else: button.clicked.connect(signal)
+            self.action_grid.addWidget(button, index // 2, index % 2)
+            self.actions[key] = button
+        self.load_button = self.actions["load"]  # compatibility for dashboard/tests
+        box.addLayout(self.action_grid); box.addWidget(self._divider())
+
+        box.addWidget(self._title("Current Execution"))
+        current = QFrame(); current.setObjectName("SubCard")
+        current.setMinimumHeight(72)
+        current_grid = QGridLayout(current); current_grid.setContentsMargins(12, 12, 12, 12)
+        current_grid.setVerticalSpacing(8)
+        self.current_values = {}
+        # The repository execution summary is aggregate-only.  Keep this card
+        # deliberately limited to values the view can state authoritatively.
+        for row, (key, value) in enumerate((("STATE", "Idle"),
+                                            ("ACTIVE TRANSACTION", "—"))):
             caption = QLabel(key); caption.setObjectName("KpiCaption")
-            box.addWidget(value); box.addWidget(caption)
-            cards.addWidget(card, i // 3, i % 3)
-            self.values[key] = value
-        layout.addLayout(cards)
+            label = QLabel(value); label.setAlignment(Qt.AlignRight); label.setObjectName("KpiSmall")
+            current_grid.addWidget(caption, row, 0); current_grid.addWidget(label, row, 1)
+            self.current_values[key] = label
+        box.addWidget(current)
 
-        self.table = QTableWidget(0, 6)
+        box.addWidget(self._title("Progress"))
+        progress_card = QFrame(); progress_card.setObjectName("SubCard")
+        progress_card.setMinimumHeight(70)
+        progress_box = QVBoxLayout(progress_card); progress_box.setContentsMargins(12, 12, 12, 12)
+        progress_box.setSpacing(8)
+        self.progress_text = QLabel("Processed 0 / 0"); self.progress_percent = QLabel("0%")
+        progress_row = QHBoxLayout(); progress_row.addWidget(self.progress_text); progress_row.addStretch(1); progress_row.addWidget(self.progress_percent)
+        self.progress_bar = QProgressBar(); self.progress_bar.setRange(0, 100); self.progress_bar.setValue(0); self.progress_bar.setTextVisible(False)
+        progress_box.addLayout(progress_row); progress_box.addWidget(self.progress_bar); box.addWidget(progress_card)
+
+        box.addWidget(self._title("Execution Summary"))
+        summary_card = QFrame(); summary_card.setObjectName("SubCard")
+        summary_card.setMinimumHeight(112)
+        summary_grid = QGridLayout(summary_card); summary_grid.setContentsMargins(12, 12, 12, 12)
+        summary_grid.setHorizontalSpacing(12); summary_grid.setVerticalSpacing(8)
+        self.execution_values = {}
+        colors = {"SUCCESS": "#4ADE80", "FAILED": "#EF4444", "UNKNOWN": "#F59E0B",
+                  "PENDING": "#C7C6BE", "SUBMITTING": "#3B82F6",
+                  "TOTAL ADJUSTED": "#F5B301"}
+        for index, key in enumerate(colors):
+            caption = QLabel(key); caption.setObjectName("KpiCaption")
+            value = QLabel("0"); value.setStyleSheet(f"color:{colors[key]};font-size:15px;font-weight:700")
+            cell = QVBoxLayout(); cell.setSpacing(3); cell.addWidget(value); cell.addWidget(caption)
+            summary_grid.addLayout(cell, index // 2, index % 2)
+            self.execution_values[key] = value
+        box.addWidget(summary_card); box.addStretch(1)
+
+        scroll = QScrollArea(); scroll.setObjectName("manual-controls-scroll")
+        scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame); scroll.setWidget(panel)
+        return scroll
+
+    def _build_workspace(self) -> QFrame:
+        panel = QFrame(); panel.setObjectName("Card")
+        box = QVBoxLayout(panel); box.setContentsMargins(14, 12, 14, 12); box.setSpacing(9)
+        box.addWidget(self._title("Manual Snapshot"))
+        self.frozen = QLabel("NO SNAPSHOT LOADED"); self.frozen.setStyleSheet("color:#6E7180;font-weight:700;letter-spacing:2px")
+        self.provenance = QLabel("Connect Google Sheets and click LOAD MANUAL DATA to freeze the current MASTER rows for review.")
+        self.provenance.setWordWrap(True); self.provenance.setStyleSheet("color:#8A8C99;font-size:11px")
+        box.addWidget(self.frozen); box.addWidget(self.provenance)
+
+        box.addWidget(self._title("Previous / Recovery Cycles"))
+        cycle_row = QHBoxLayout(); cycle_row.setSpacing(8)
+        self.cycle_selector = QComboBox(); self.cycle_selector.setObjectName("manual-cycle-selector")
+        self.cycle_selector.setPlaceholderText("SELECT PERSISTED CYCLE")
+        self.open_cycle_button = QPushButton("OPEN")
+        self.recover_button = QPushButton("RECOVER STALE CYCLE")
+        self.open_cycle_button.clicked.connect(self._emit_open_cycle); self.recover_button.clicked.connect(self.recover_requested)
+        cycle_row.addWidget(self.cycle_selector, 1); cycle_row.addWidget(self.open_cycle_button); cycle_row.addWidget(self.recover_button)
+        box.addLayout(cycle_row)
+
+        box.addWidget(self._title("Snapshot Summary"))
+        metrics = QFrame(); metrics.setObjectName("SubCard")
+        metric_grid = QGridLayout(metrics); metric_grid.setContentsMargins(10, 6, 10, 6); metric_grid.setSpacing(6)
+        self.values = {}
+        for index, key in enumerate(("SOURCE ROWS", "UNIQUE USERS", "READY", "DUPLICATE", "INVALID", "TOTAL ADJUSTMENT")):
+            value = QLabel("0"); value.setStyleSheet("color:#ECEBE4;font-size:15px;font-weight:700")
+            caption = QLabel(key); caption.setObjectName("KpiCaption")
+            cell = QVBoxLayout(); cell.setSpacing(0); cell.addWidget(value); cell.addWidget(caption)
+            metric_grid.addLayout(cell, index // 3, index % 3); self.values[key] = value
+        box.addWidget(metrics)
+
+        table_header = QHBoxLayout(); table_header.addWidget(self._title("Transactions")); table_header.addStretch(1)
+        self.execution_status = QLabel("NO SNAPSHOT"); self.execution_status.setObjectName("StatusBadge"); table_header.addWidget(self.execution_status)
+        box.addLayout(table_header)
+        self.table = QTableWidget(0, 6); self.table.setObjectName("manual-transactions")
         self.table.setHorizontalHeaderLabels(["ROW", "USER ID", "TRUE AMOUNT", "STATUS", "SOURCE TX_ID", "REASON"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        layout.addWidget(self.table, 1)
+        self.table.verticalHeader().setVisible(False); self.table.verticalHeader().setDefaultSectionSize(28)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers); self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True); self._set_preview_column_widths()
+        box.addWidget(self.table, 1)
+        return panel
+
+    def _set_preview_column_widths(self) -> None:
+        header = self.table.horizontalHeader()
+        for column in range(self.table.columnCount()): header.setSectionResizeMode(column, QHeaderView.Interactive)
+        for column, width in enumerate((55, 150, 110, 95, 125)): self.table.setColumnWidth(column, width)
+        header.setSectionResizeMode(self.table.columnCount() - 1, QHeaderView.Stretch)
+
+    def _request_pause(self) -> None:
+        if self._execution_status != "RUNNING" or self._pause_requested: return
+        self._pause_requested = True
+        self.actions["stop"].setText("PAUSING..."); self.actions["stop"].setEnabled(False)
+        self.current_values["STATE"].setText("Pausing")
+        self.remark_input.setEnabled(False); self.remark_save_button.setEnabled(False)
+        self.stop_requested.emit()
+
+    def _emit_remark_save(self) -> None:
+        remark = self.remark_input.text().strip()
+        if not remark:
+            QMessageBox.warning(self, "Manual Remark", "Manual Remark must not be empty.")
+            return
+        self.remark_save_requested.emit(remark)
+
+    def set_manual_remark(self, remark: str) -> None:
+        self.remark_input.setText(remark)
+
+    def _set_status_dot(self, key: str, state: str) -> None:
+        dot = self.status_dots[key]
+        dot.setObjectName({"ok": "DotOk", "warn": "DotWarn", "err": "DotErr"}.get(state, "DotIdle"))
+        dot.style().unpolish(dot); dot.style().polish(dot)
 
     def set_sheet_connected(self, connected: bool) -> None:
         self._sheet_connected = connected
-        self.load_button.setEnabled(connected and self._execution_status != "RUNNING")
-        self.load_button.setToolTip("" if connected else "Connect the Google Sheet before loading Manual data.")
+        self.status_values["GOOGLE SHEETS"].setText("Connected" if connected else "Not connected")
+        self._set_status_dot("GOOGLE SHEETS", "ok" if connected else "idle")
+        self._apply_action_state()
+
+    @staticmethod
+    def _operator_status(status: str) -> str:
+        return {"STOPPED": "PAUSED", "FAILURE_REVIEW": "FAILURE REVIEW",
+                "REVIEW_REQUIRED": "REVIEW REQUIRED", "HARD_STOPPED": "HARD STOPPED"}.get(status, status)
 
     def set_execution_state(self, status: str, summary: dict | None = None, *,
-                            execution_enabled: bool = False, panel_attached: bool = False) -> None:
-        summary = summary or {}
-        self._execution_status = status
-        self.execution_status.setText(status)
-        self.progress.setText("SUCCESS {success}  •  FAILED {failed}  •  UNKNOWN {unknown}  •  PENDING {pending}  •  TOTAL ADJUSTED SUCCESSFULLY {total_adjusted_successfully:,}".format(
-            success=summary.get("success", 0), failed=summary.get("failed", 0),
-            unknown=summary.get("unknown", 0), pending=summary.get("pending", 0),
-            total_adjusted_successfully=summary.get("total_adjusted_successfully", 0)))
-        for button in self.actions.values(): button.setEnabled(False)
-        panel_mutation_enabled = status != "RUNNING"
-        self.actions["open_panel"].setEnabled(panel_mutation_enabled)
-        self.actions["attach_panel"].setEnabled(panel_mutation_enabled)
-        self.actions["start"].setEnabled(status == "PREVIEW" and execution_enabled and panel_attached and summary.get("pending", 0) > 0)
-        self.actions["stop"].setEnabled(status == "RUNNING")
-        self.actions["resume"].setEnabled(status == "STOPPED" and execution_enabled and panel_attached)
-        self.actions["retry"].setEnabled(status == "FAILURE_REVIEW")
-        self.actions["finalize"].setEnabled(status == "FAILURE_REVIEW")
-        self.actions["reconcile"].setEnabled(status == "REVIEW_REQUIRED")
-        self.recover_button.setEnabled(status == "RUNNING")
+                            execution_enabled: bool = False, panel_attached: bool = False,
+                            panel_open: bool = False,
+                            has_current_cycle: bool | None = None) -> None:
+        summary = summary or {}; self._execution_status = status
+        if has_current_cycle is not None:
+            self._has_current_cycle = has_current_cycle
+        if status != "RUNNING": self._pause_requested = False
+        shown = self._operator_status(status)
+        self.execution_status.setText(shown); self.status_values["MANUAL CYCLE"].setText(shown)
+        self.status_values["EXECUTION GATE"].setText("ENABLED" if execution_enabled else "DISABLED")
+        self.status_values["EXECUTION GATE"].setStyleSheet(f"color:{'#4ADE80' if execution_enabled else '#EF4444'};font-weight:700")
+        self.status_values["PANEL"].setText(
+            "Attached" if panel_attached else "Open" if panel_open else "Closed")
+        self._set_status_dot("PANEL", "ok" if panel_attached else "warn" if panel_open else "idle")
+        state_names = {"PREVIEW": "Idle", "RUNNING": "Pausing" if self._pause_requested else "Running",
+                       "STOPPED": "Paused", "FAILURE_REVIEW": "Failure Review", "REVIEW_REQUIRED": "Review Required",
+                       "COMPLETED": "Completed", "HARD_STOPPED": "Hard Stopped"}
+        self.current_values["STATE"].setText(state_names.get(status, shown.title()))
+        self.current_values["ACTIVE TRANSACTION"].setText("—")
+        success, failed = int(summary.get("success", 0)), int(summary.get("failed", 0))
+        unknown, pending = int(summary.get("unknown", 0)), int(summary.get("pending", 0))
+        submitting = int(summary.get("submitting", 0))
+        self._pending_count = pending
+        total = success + failed + unknown + pending + submitting
+        processed = success + failed + unknown
+        percent = round(processed * 100 / total) if total else 0
+        self.progress_text.setText(f"Processed {processed:,} / {total:,}"); self.progress_percent.setText(f"{percent}%"); self.progress_bar.setValue(percent)
+        for key, value in (("SUCCESS", success), ("FAILED", failed), ("UNKNOWN", unknown),
+                           ("PENDING", pending), ("SUBMITTING", submitting),
+                           ("TOTAL ADJUSTED", int(summary.get("total_adjusted_successfully", 0)))):
+            self.execution_values[key].setText(f"{value:,}")
+        self._execution_enabled = execution_enabled; self._panel_attached = panel_attached
+        remark_editable = status in ("PREVIEW", "COMPLETED")
+        self.remark_input.setEnabled(remark_editable)
+        self.remark_save_button.setEnabled(remark_editable)
+        self._apply_action_state()
+
+    def reset_unselected_state(self, *, execution_enabled: bool, panel_attached: bool,
+                               panel_open: bool = False) -> None:
+        """Clear only the visible selection while preserving persisted cycles."""
+        self._pause_requested = False
+        self._has_current_cycle = False
+        self.frozen.setText("NO SNAPSHOT LOADED")
+        self.provenance.setText(
+            "Connect Google Sheets and click LOAD MANUAL DATA to freeze the current MASTER rows for review.")
+        self.table.clearContents(); self.table.setRowCount(0); self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(
+            ["ROW", "USER ID", "TRUE AMOUNT", "STATUS", "SOURCE TX_ID", "REASON"])
+        self._set_preview_column_widths()
+        for value in self.values.values(): value.setText("0")
+        self.status_values["LAST SNAPSHOT"].setText("Never")
+        self.set_execution_state("PREVIEW", {}, execution_enabled=execution_enabled,
+                                 panel_attached=panel_attached, panel_open=panel_open)
+        self.status_values["MANUAL CYCLE"].setText("No snapshot")
+        self.execution_status.setText("NO SNAPSHOT")
+
+    def _apply_action_state(self) -> None:
+        status = self._execution_status
+        for button in self.actions.values(): button.hide(); button.setEnabled(False)
+        self.recover_button.setVisible(status == "RUNNING"); self.recover_button.setEnabled(status == "RUNNING")
+        if status == "PREVIEW":
+            for key in ("load", "open_panel", "attach_panel", "start"): self.actions[key].show()
+            self.actions["load"].setEnabled(self._sheet_connected)
+            self.actions["open_panel"].setEnabled(True); self.actions["attach_panel"].setEnabled(True)
+            self.actions["start"].setEnabled(getattr(self, "_execution_enabled", False)
+                                             and getattr(self, "_panel_attached", False)
+                                             and self._has_current_cycle
+                                             and self._pending_count > 0)
+        elif status == "RUNNING":
+            self.actions["stop"].show(); self.actions["stop"].setText("PAUSING..." if self._pause_requested else "PAUSE")
+            self.actions["stop"].setEnabled(not self._pause_requested)
+        elif status == "STOPPED":
+            self.actions["resume"].show(); self.actions["resume"].setEnabled(getattr(self, "_execution_enabled", False) and getattr(self, "_panel_attached", False))
+        elif status == "FAILURE_REVIEW":
+            for key in ("retry", "finalize"): self.actions[key].show(); self.actions[key].setEnabled(True)
+        elif status == "REVIEW_REQUIRED":
+            self.actions["reconcile"].show(); self.actions["reconcile"].setEnabled(True)
         navigation_enabled = status != "RUNNING"
-        self.load_button.setEnabled(self._sheet_connected and navigation_enabled)
-        self.cycle_selector.setEnabled(navigation_enabled)
-        self.open_cycle_button.setEnabled(navigation_enabled)
+        self.cycle_selector.setEnabled(navigation_enabled); self.open_cycle_button.setEnabled(navigation_enabled)
 
     def show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Manual snapshot failed", message)
 
     def display_nonterminal_cycles(self, cycles: list[dict]) -> None:
-        """List restart candidates without implicitly activating one."""
-        self.cycle_selector.clear()
-        self.cycle_selector.addItem("SELECT A PERSISTED CYCLE", None)
+        self.cycle_selector.clear(); self.cycle_selector.addItem("SELECT PERSISTED CYCLE", None)
         for cycle in cycles:
-            self.cycle_selector.addItem(
-                f"{cycle['status']} • {cycle['created_at']} • {cycle['cycle_id']}",
-                cycle["cycle_id"],
-            )
+            self.cycle_selector.addItem(f"{self._operator_status(cycle['status'])} • {cycle['created_at']} • {cycle['cycle_id']}", cycle["cycle_id"])
 
     def _emit_open_cycle(self) -> None:
         cycle_id = self.cycle_selector.currentData()
-        if cycle_id:
-            self.open_cycle_requested.emit(str(cycle_id))
+        if cycle_id: self.open_cycle_requested.emit(str(cycle_id))
 
     def selected_failure_ids(self) -> list[int]:
         selected = []
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
-            if item and item.checkState() == Qt.Checked:
-                selected.append(int(item.data(Qt.UserRole)))
+            if item and item.checkState() == Qt.Checked: selected.append(int(item.data(Qt.UserRole)))
         return selected
 
     def selected_unknown(self) -> dict | None:
         row = self.table.currentRow()
-        if row < 0:
-            return None
+        if row < 0: return None
         item = self.table.item(row, 0)
         return item.data(Qt.UserRole) if item else None
 
     def display_failure_review(self, rows: list[dict]) -> None:
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(
-            ["SELECT", "USER ID", "TRUE AMOUNT", "ATTEMPT", "PHASE", "ERROR / EVIDENCE"])
-        self.table.setRowCount(len(rows))
+        self.table.setColumnCount(6); self.table.setHorizontalHeaderLabels(["SELECT", "USER ID", "TRUE AMOUNT", "ATTEMPT", "PHASE", "ERROR / EVIDENCE"])
+        self.table.setRowCount(len(rows)); self._set_preview_column_widths()
         for index, row in enumerate(rows):
-            select = QTableWidgetItem("")
-            select.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
-            select.setCheckState(Qt.Unchecked)
-            select.setData(Qt.UserRole, int(row["transaction_id"]))
-            values = (row["username"], f"{row['adjust_amount']:,}", row.get("attempt_no") or "",
-                      row.get("submission_phase") or "",
-                      " • ".join(x for x in (row.get("error_detail"), row.get("evidence_detail")) if x))
-            self.table.setItem(index, 0, select)
-            for column, value in enumerate(values, 1):
-                self.table.setItem(index, column, QTableWidgetItem(str(value)))
+            select = QTableWidgetItem(""); select.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable); select.setCheckState(Qt.Unchecked); select.setData(Qt.UserRole, int(row["transaction_id"])); self.table.setItem(index, 0, select)
+            values = (row["username"], f"{row['adjust_amount']:,}", row.get("attempt_no") or "", row.get("submission_phase") or "", " • ".join(x for x in (row.get("error_detail"), row.get("evidence_detail")) if x))
+            for column, value in enumerate(values, 1): self.table.setItem(index, column, QTableWidgetItem(str(value)))
 
     def display_unknown_review(self, rows: list[dict]) -> None:
-        headers = ["USER ID", "TRUE AMOUNT", "ATTEMPT", "ATTEMPT ID", "CLAIMED", "SUBMIT STARTED",
-                   "CLICK BOUNDARY", "PHASE", "CLICK CROSSED", "ERROR", "EVIDENCE"]
-        self.table.setColumnCount(len(headers)); self.table.setHorizontalHeaderLabels(headers)
-        self.table.setRowCount(len(rows))
+        headers = ["USER ID", "TRUE AMOUNT", "ATTEMPT", "ATTEMPT ID", "CLAIMED", "SUBMIT STARTED", "CLICK BOUNDARY", "PHASE", "CLICK CROSSED", "ERROR", "EVIDENCE"]
+        self.table.setColumnCount(len(headers)); self.table.setHorizontalHeaderLabels(headers); self.table.setRowCount(len(rows)); self._set_preview_column_widths()
         for index, row in enumerate(rows):
-            identity = {"transaction_id": int(row["transaction_id"]),
-                        "attempt_id": row["current_attempt_id"]}
-            values = (row["username"], f"{row['adjust_amount']:,}", row.get("attempt_no") or "",
-                      row["current_attempt_id"], row.get("claimed_at") or "", row.get("submit_started_at") or "",
-                      row.get("submit_clicked_at") or "", row.get("submission_phase") or "",
-                      "UNKNOWN" if row.get("click_crossed") is None else bool(row["click_crossed"]),
-                      row.get("error_detail") or "", row.get("evidence_detail") or "")
+            identity = {"transaction_id": int(row["transaction_id"]), "attempt_id": row["current_attempt_id"]}
+            values = (row["username"], f"{row['adjust_amount']:,}", row.get("attempt_no") or "", row["current_attempt_id"], row.get("claimed_at") or "", row.get("submit_started_at") or "", row.get("submit_clicked_at") or "", row.get("submission_phase") or "", "UNKNOWN" if row.get("click_crossed") is None else bool(row["click_crossed"]), row.get("error_detail") or "", row.get("evidence_detail") or "")
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 if column == 0: item.setData(Qt.UserRole, identity)
                 self.table.setItem(index, column, item)
 
     def display_preview(self, cycle: dict, summary, rows: list[dict]) -> None:
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["ROW", "USER ID", "TRUE AMOUNT", "STATUS", "SOURCE TX_ID", "REASON"])
-        self.values["SOURCE ROWS"].setText(f"{summary.source_rows:,}")
-        self.values["UNIQUE USERS"].setText(f"{summary.unique_users:,}")
-        self.values["READY"].setText(f"{summary.ready:,}")
-        self.values["DUPLICATE"].setText(f"{summary.duplicates:,}")
-        self.values["INVALID"].setText(f"{summary.invalid:,}")
-        self.values["TOTAL ADJUSTMENT"].setText(f"{summary.total_adjustment_amount:,}")
+        self.table.setColumnCount(6); self.table.setHorizontalHeaderLabels(["ROW", "USER ID", "TRUE AMOUNT", "STATUS", "SOURCE TX_ID", "REASON"]); self._set_preview_column_widths()
+        for key, value in (("SOURCE ROWS", summary.source_rows), ("UNIQUE USERS", summary.unique_users), ("READY", summary.ready), ("DUPLICATE", summary.duplicates), ("INVALID", summary.invalid), ("TOTAL ADJUSTMENT", summary.total_adjustment_amount)):
+            self.values[key].setText(f"{value:,}")
         self.frozen.setText("SNAPSHOT FROZEN — READ ONLY")
-        fp = cycle["snapshot_fingerprint"][:12]
-        self.provenance.setText(
-            f"Cycle {cycle['cycle_id']}  •  Loaded {cycle['loaded_at']}  •  "
-            f"{cycle['sheet_name']}  •  Fingerprint {fp}…"
-        )
-        self.table.setRowCount(len(rows))
-        colors = {"READY": "#4ADE80", "DUPLICATE": "#F5B301", "INVALID": "#EF4444"}
-        source_rows_by_id = {row["source_row_id"]: row["source_row"] for row in rows}
+        self.status_values["LAST SNAPSHOT"].setText(str(cycle["loaded_at"])); self.status_values["MANUAL CYCLE"].setText(self._operator_status(cycle["status"]))
+        self.provenance.setText(f"{cycle['loaded_at']}  •  Cycle {cycle['cycle_id'][:12]}…  •  Source: {cycle['sheet_name']}  •  TRUE AMOUNT: Exact 1:1  •  Fingerprint {cycle['snapshot_fingerprint'][:12]}…")
+        self.table.setRowCount(len(rows)); colors = {"READY": "#4ADE80", "DUPLICATE": "#F5B301", "INVALID": "#EF4444"}; source_rows_by_id = {row["source_row_id"]: row["source_row"] for row in rows}
         for index, row in enumerate(rows):
             amount = f"{row['parsed_amount']:,}" if row["parsed_amount"] is not None else str(row["amount_raw"] or "")
-            winner = ""
-            if row["winner_source_row_id"] is not None:
-                winner_row = source_rows_by_id.get(row["winner_source_row_id"], "?")
-                winner = f" (first occurrence: row {winner_row})"
-            values = (row["source_row"], row["username"] or str(row["username_raw"] or ""),
-                      amount, row["classification"], row["source_tx_id"] or "",
-                      (row["reason"] or "") + winner)
+            winner = f" (first occurrence: row {source_rows_by_id.get(row['winner_source_row_id'], '?')})" if row["winner_source_row_id"] is not None else ""
+            values = (row["source_row"], row["username"] or str(row["username_raw"] or ""), amount, row["classification"], row["source_tx_id"] or "", (row["reason"] or "") + winner)
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
-                if column == 3:
-                    item.setForeground(QColor(colors.get(row["classification"], "#ECEBE4")))
+                if column == 2: item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if column == 3: item.setForeground(QColor(colors.get(row["classification"], "#ECEBE4")))
                 self.table.setItem(index, column, item)
         self.set_execution_state(cycle["status"], {"pending": summary.ready})

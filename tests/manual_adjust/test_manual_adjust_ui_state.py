@@ -48,14 +48,71 @@ def test_phase4_dashboard_wires_review_and_recovery_actions():
     ):
         assert connection in source
     assert '"manual_worker_timer", "manual_heartbeat_timer"' in source
+    assert 'remark_save_requested.connect(self._on_manual_remark_save)' in source
+
+
+def test_auto_and_manual_remarks_are_independent_and_production_gate_is_enabled():
+    root = Path(__file__).parents[2]
+    dashboard = (root / "ui" / "dashboard.py").read_text(encoding="utf-8")
+    settings = dashboard[dashboard.index("class SettingsDialog"):dashboard.index("class PreviewDialog")]
+    assert 'form.addRow("AUTO REMARK", self.remark)' in settings
+    assert 'self.config["remark"] = self.remark.text().strip() or "BONUS RELOAD AUTO"' in settings
+    assert 'self.config["manual_adjust"]' not in settings
+    config = __import__("json").loads((root / "config" / "config.json").read_text())
+    assert config["manual_adjust"]["execution_enabled"] is True
+
+
+def test_manual_entry_resets_view_with_shared_context_and_auto_controls_stay_frozen():
+    source = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text(encoding="utf-8")
+    mode_method = source[source.index("    def _on_mode_selected"):
+                         source.index("    def _manual_live_cycle_id")]
+    assert "self.manual_state.active_cycle_id = None" in mode_method
+    assert "self.manual_view.reset_unselected_state(" in mode_method
+    assert "panel_attached=self.panel.is_attached" in mode_method
+    assert "panel_open=self.panel.is_alive()" in mode_method
+    assert '"execution_enabled", False) is True' in mode_method
+    # Manual corrections must not rename the accepted AUTO controls.
+    assert 'self.btn_start = QPushButton("START")' in source
+    assert 'self.btn_stop = QPushButton("STOP")' in source
+
+
+def test_mode_selector_keeps_options_dimensions_font_and_clear_chevron():
+    source = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text(encoding="utf-8")
+    assert "class HeaderModeSelector(QComboBox):" in source
+    assert "self.mode_selector = HeaderModeSelector()" in source
+    assert "self.mode_selector.setFixedSize(205, 36)" in source
+    assert 'self.mode_selector.setFont(QFont("Segoe UI", 9, QFont.DemiBold))' in source
+    assert "self.mode_selector.view().setFont(self.mode_selector.font())" in source
+    assert "self.mode_selector.addItems([mode.value for mode in OperatingMode])" in source
+    assert 'QColor("#F5B301")' in source
+    assert "painter.drawLine(center_x - 4" in source
+    assert "QComboBox#operating-mode-selector::down-arrow { image: none; }" in source
+    assert "QComboBox::down-arrow { image: none; }" not in source
+
+
+def test_manual_left_panel_uses_auto_status_typography_and_comfortable_spacing():
+    source = (Path(__file__).parents[2] / "ui" / "manual_adjust_view.py").read_text(encoding="utf-8")
+    assert 'caption = QLabel(key.title()); caption.setObjectName("StatLabel")' in source
+    status_block = source[source.index("status = QGridLayout()"):
+                          source.index("box.addLayout(status)")]
+    assert 'setObjectName("KpiCaption")' not in status_block
+    assert 'setObjectName("KpiSmall")' not in status_block
+    assert "status.setVerticalSpacing(8)" in status_block
+    assert "caption.setMinimumHeight(24); label.setMinimumHeight(24)" in status_block
+    assert 'button.setMinimumHeight(44 if key in ("start", "stop", "resume") else 38)' in source
+    assert "current.setMinimumHeight(72)" in source
+    assert "progress_card.setMinimumHeight(70)" in source
+    assert "summary_card.setMinimumHeight(112)" in source
 
 
 def test_manual_running_panel_controls_and_handlers_are_locked():
     root = Path(__file__).parents[2]
     view_source = (root / "ui" / "manual_adjust_view.py").read_text(encoding="utf-8")
-    assert 'panel_mutation_enabled = status != "RUNNING"' in view_source
-    assert 'self.actions["open_panel"].setEnabled(panel_mutation_enabled)' in view_source
-    assert 'self.actions["attach_panel"].setEnabled(panel_mutation_enabled)' in view_source
+    running_actions = view_source[view_source.index('elif status == "RUNNING"'):
+                                  view_source.index('elif status == "STOPPED"')]
+    assert 'self.actions["stop"].show()' in running_actions
+    assert 'self.actions["open_panel"]' not in running_actions
+    assert 'self.actions["attach_panel"]' not in running_actions
 
     dashboard = (root / "ui" / "dashboard.py").read_text(encoding="utf-8")
     open_method = dashboard[dashboard.index("    def _on_open_panel"):dashboard.index("    def _on_ready")]
@@ -83,6 +140,41 @@ def test_running_cycle_pins_load_and_persisted_selection():
     with pytest.raises(RuntimeError, match="opening another cycle"):
         state.select_persisted_cycle("cycle-b", live_cycle_id="cycle-a")
     assert state.active_cycle_id == "cycle-a"
+
+
+def test_fresh_snapshot_is_the_active_cycle_through_panel_ready_and_start_flow(tmp_path):
+    repository = ManualAdjustRepository(tmp_path / "normal-flow.db")
+    repository.initialize_schema()
+    try:
+        state, loader = ManualPreviewState(), Loader(repository)
+        cycle = state.load_snapshot(loader, repository)[0]
+        assert loader.calls == 1
+        assert state.active_cycle_id == cycle["cycle_id"]
+
+        dashboard = (Path(__file__).parents[2] / "ui" / "dashboard.py").read_text(encoding="utf-8")
+        open_method = dashboard[dashboard.index("    def _on_open_panel"):
+                                dashboard.index("    def _on_ready")]
+        ready_method = dashboard[dashboard.index("    def _on_ready"):
+                                 dashboard.index("    def _poll_panel_alive")]
+        start_method = dashboard[dashboard.index("    def _on_manual_start"):
+                                 dashboard.index("    def _on_manual_open_cycle")]
+        assert "active_cycle_id =" not in open_method
+        assert "active_cycle_id =" not in ready_method
+        assert "self.panel.open_panel(url)" in open_method
+        assert "self.panel.attach()" in ready_method
+        assert "cid = self.manual_state.active_cycle_id" in start_method
+        assert "self.manual_controller.start(cid, confirmed=True)" in start_method
+        assert "manual_loader" not in open_method + ready_method + start_method
+        assert loader.calls == 1
+        assert "has_current_cycle=self.manual_state.active_cycle_id is not None" in dashboard
+        assert "active_cycle_selected" not in dashboard
+    finally:
+        repository.close()
+
+
+def test_fresh_startup_does_not_choose_an_old_cycle():
+    state = ManualPreviewState(manual_backend_ready=True)
+    assert state.active_cycle_id is None
 
 
 def test_authoritative_manual_execution_blocks_auto_without_ui_selection():

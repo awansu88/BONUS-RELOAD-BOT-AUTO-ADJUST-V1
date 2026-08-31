@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QPalette
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -68,7 +68,8 @@ from core.manual_adjust_loader import ManualAdjustLoader
 from core.manual_adjust_repository import ManualAdjustRepository
 from core.manual_adjust_controller import ManualAdjustController
 from ui.manual_adjust_state import (ManualPreviewState, OperatingMode,
-                                    manual_execution_blocks_auto)
+                                    manual_execution_blocks_auto,
+                                    persist_manual_remark)
 from ui.manual_adjust_view import ManualAdjustView
 
 
@@ -114,6 +115,28 @@ QLineEdit, QSpinBox, QPlainTextEdit, QTableWidget {
 }
 QLineEdit:focus, QSpinBox:focus, QPlainTextEdit:focus, QTableWidget:focus {
     border: 1px solid #F5B301;
+}
+QComboBox {
+    background-color: #17181F;
+    border: 1px solid #2F313C;
+    border-radius: 8px;
+    padding: 0 34px 0 14px;
+    color: #ECEBE4;
+    min-height: 34px;
+    font-size: 11px;
+    font-weight: 600;
+}
+QComboBox:hover, QComboBox:focus, QComboBox:on { border-color: #F5B301; }
+QComboBox::drop-down { border: 0; width: 32px; }
+QComboBox#operating-mode-selector::down-arrow { image: none; }
+QComboBox QAbstractItemView {
+    background-color: #17181F;
+    color: #ECEBE4;
+    border: 1px solid #2F313C;
+    selection-background-color: #3B2E00;
+    selection-color: #F5B301;
+    outline: 0;
+    padding: 4px;
 }
 QPlainTextEdit {
     font-family: 'JetBrains Mono', 'Consolas', monospace;
@@ -221,6 +244,25 @@ def status_color(status: str) -> str:
     }.get(s, "#ECEBE4")
 
 
+class HeaderModeSelector(QComboBox):
+    """Header combo with a platform-independent, clearly visible chevron."""
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        separator_x = self.width() - 32
+        painter.setPen(QPen(QColor("#2F313C"), 1))
+        painter.drawLine(separator_x, 8, separator_x, self.height() - 8)
+
+        center_x = self.width() - 16
+        center_y = self.height() // 2
+        painter.setPen(QPen(QColor("#F5B301"), 1.5))
+        painter.drawLine(center_x - 4, center_y - 2, center_x, center_y + 2)
+        painter.drawLine(center_x, center_y + 2, center_x + 4, center_y - 2)
+
+
 # =========================================================================
 # Settings dialog
 # =========================================================================
@@ -265,7 +307,7 @@ class SettingsDialog(QDialog):
         form.addRow("Monitoring Interval (s)", self.monitoring_iv)
 
         self.remark = QLineEdit(config.get("remark", "BONUS RELOAD AUTO"))
-        form.addRow("Remark", self.remark)
+        form.addRow("AUTO REMARK", self.remark)
 
         self.creds = QLineEdit(config.get("google_credentials", "credentials/service_account.json"))
         form.addRow("Google Credentials", self.creds)
@@ -755,9 +797,14 @@ class Dashboard(QMainWindow):
 
         top.addWidget(title)
         top.addWidget(subtitle)
-        self.mode_selector = QComboBox()
+        self.mode_selector = HeaderModeSelector()
         self.mode_selector.setObjectName("operating-mode-selector")
+        self.mode_selector.setFixedSize(205, 36)
+        self.mode_selector.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
         self.mode_selector.addItems([mode.value for mode in OperatingMode])
+        self.mode_selector.view().setMinimumWidth(205)
+        self.mode_selector.view().setFont(self.mode_selector.font())
+        self.mode_selector.view().setStyleSheet("QListView::item { min-height:32px; padding:0 12px; }")
         self.mode_selector.currentTextChanged.connect(self._on_mode_selected)
         top.addWidget(self.mode_selector)
         top.addStretch(1)
@@ -854,7 +901,8 @@ class Dashboard(QMainWindow):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
         self.auto_view = splitter
-        self.manual_view = ManualAdjustView(self)
+        self.manual_view = ManualAdjustView(
+            self, manual_remark=self.config.get("manual_adjust", {}).get("remark", ""))
         self.manual_view.load_requested.connect(self._on_manual_load)
         self.manual_view.open_panel_requested.connect(self._on_open_panel)
         self.manual_view.attach_panel_requested.connect(self._on_ready)
@@ -866,6 +914,7 @@ class Dashboard(QMainWindow):
         self.manual_view.reconcile_requested.connect(self._on_manual_reconcile)
         self.manual_view.open_cycle_requested.connect(self._on_manual_open_cycle)
         self.manual_view.recover_requested.connect(self._on_manual_recover)
+        self.manual_view.remark_save_requested.connect(self._on_manual_remark_save)
         self.mode_stack = QStackedWidget()
         self.mode_stack.addWidget(self.auto_view)
         self.mode_stack.addWidget(self.manual_view)
@@ -899,6 +948,12 @@ class Dashboard(QMainWindow):
             self.metrics_timer.stop()
             self.manual_view.set_sheet_connected(self.sheet.is_connected)
             self.manual_state.active_cycle_id = None
+            self.manual_view.reset_unselected_state(
+                execution_enabled=self.config.get("manual_adjust", {}).get(
+                    "execution_enabled", False) is True,
+                panel_attached=self.panel.is_attached,
+                panel_open=self.panel.is_alive(),
+            )
             self.manual_view.display_nonterminal_cycles(
                 self.manual_repository.list_nonterminal_cycles())
             self.logger.info("[MANUAL] Mode selected")
@@ -984,12 +1039,22 @@ class Dashboard(QMainWindow):
         execution = self.manual_repository.get_cycle_execution_summary(cycle["cycle_id"])
         self.manual_view.set_execution_state(cycle["status"], execution,
             execution_enabled=self.config.get("manual_adjust", {}).get("execution_enabled", False) is True,
-            panel_attached=self.panel.is_attached)
+            panel_attached=self.panel.is_attached, panel_open=self.panel.is_alive(),
+            has_current_cycle=self.manual_state.active_cycle_id is not None)
         self.logger.info(f"[MANUAL] Snapshot frozen — cycle {cycle['cycle_id']}")
         self.logger.info(
             f"[MANUAL] {summary.ready} READY / {summary.duplicates} DUPLICATE / "
             f"{summary.invalid} INVALID"
         )
+
+    def _on_manual_remark_save(self, remark: str) -> None:
+        try:
+            saved = persist_manual_remark(self.config, self.config_path, remark)
+        except (OSError, ValueError, TypeError) as exc:
+            self.manual_view.show_error(str(exc))
+            return
+        self.manual_view.set_manual_remark(saved)
+        self.logger.info("[MANUAL] Manual Remark saved")
 
     def _on_manual_start(self) -> None:
         if not self.manual_controller or not self.manual_repository or not self.manual_state.active_cycle_id:
@@ -1142,7 +1207,9 @@ class Dashboard(QMainWindow):
         cycle = self.manual_repository.get_cycle(self.manual_state.active_cycle_id)
         summary = self.manual_repository.get_cycle_execution_summary(self.manual_state.active_cycle_id)
         if cycle: self.manual_view.set_execution_state(cycle["status"], summary,
-            execution_enabled=self.config.get("manual_adjust", {}).get("execution_enabled", False) is True, panel_attached=self.panel.is_attached)
+            execution_enabled=self.config.get("manual_adjust", {}).get("execution_enabled", False) is True,
+            panel_attached=self.panel.is_attached, panel_open=self.panel.is_alive(),
+            has_current_cycle=self.manual_state.active_cycle_id is not None)
         if cycle and cycle["status"] == "FAILURE_REVIEW":
             self.manual_view.display_failure_review(self.manual_repository.get_transactions_by_status(
                 self.manual_state.active_cycle_id, "FAILED_NOT_SUBMITTED"))

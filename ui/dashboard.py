@@ -68,7 +68,8 @@ from core.manual_adjust_loader import ManualAdjustLoader
 from core.manual_adjust_repository import ManualAdjustRepository
 from core.manual_adjust_controller import ManualAdjustController
 from ui.manual_adjust_state import (ManualPreviewState, OperatingMode,
-                                    manual_execution_blocks_auto)
+                                    manual_execution_blocks_auto,
+                                    persist_manual_remark)
 from ui.manual_adjust_view import ManualAdjustView
 
 
@@ -306,7 +307,7 @@ class SettingsDialog(QDialog):
         form.addRow("Monitoring Interval (s)", self.monitoring_iv)
 
         self.remark = QLineEdit(config.get("remark", "BONUS RELOAD AUTO"))
-        form.addRow("Remark", self.remark)
+        form.addRow("AUTO REMARK", self.remark)
 
         self.creds = QLineEdit(config.get("google_credentials", "credentials/service_account.json"))
         form.addRow("Google Credentials", self.creds)
@@ -900,7 +901,8 @@ class Dashboard(QMainWindow):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 4)
         self.auto_view = splitter
-        self.manual_view = ManualAdjustView(self)
+        self.manual_view = ManualAdjustView(
+            self, manual_remark=self.config.get("manual_adjust", {}).get("remark", ""))
         self.manual_view.load_requested.connect(self._on_manual_load)
         self.manual_view.open_panel_requested.connect(self._on_open_panel)
         self.manual_view.attach_panel_requested.connect(self._on_ready)
@@ -912,6 +914,7 @@ class Dashboard(QMainWindow):
         self.manual_view.reconcile_requested.connect(self._on_manual_reconcile)
         self.manual_view.open_cycle_requested.connect(self._on_manual_open_cycle)
         self.manual_view.recover_requested.connect(self._on_manual_recover)
+        self.manual_view.remark_save_requested.connect(self._on_manual_remark_save)
         self.mode_stack = QStackedWidget()
         self.mode_stack.addWidget(self.auto_view)
         self.mode_stack.addWidget(self.manual_view)
@@ -1043,6 +1046,15 @@ class Dashboard(QMainWindow):
             f"[MANUAL] {summary.ready} READY / {summary.duplicates} DUPLICATE / "
             f"{summary.invalid} INVALID"
         )
+
+    def _on_manual_remark_save(self, remark: str) -> None:
+        try:
+            saved = persist_manual_remark(self.config, self.config_path, remark)
+        except (OSError, ValueError, TypeError) as exc:
+            self.manual_view.show_error(str(exc))
+            return
+        self.manual_view.set_manual_remark(saved)
+        self.logger.info("[MANUAL] Manual Remark saved")
 
     def _on_manual_start(self) -> None:
         if not self.manual_controller or not self.manual_repository or not self.manual_state.active_cycle_id:

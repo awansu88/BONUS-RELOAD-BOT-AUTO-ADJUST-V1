@@ -48,6 +48,18 @@ def test_phase4_dashboard_wires_review_and_recovery_actions():
     ):
         assert connection in source
     assert '"manual_worker_timer", "manual_heartbeat_timer"' in source
+    assert 'remark_save_requested.connect(self._on_manual_remark_save)' in source
+
+
+def test_auto_and_manual_remarks_are_independent_and_production_gate_is_enabled():
+    root = Path(__file__).parents[2]
+    dashboard = (root / "ui" / "dashboard.py").read_text(encoding="utf-8")
+    settings = dashboard[dashboard.index("class SettingsDialog"):dashboard.index("class PreviewDialog")]
+    assert 'form.addRow("AUTO REMARK", self.remark)' in settings
+    assert 'self.config["remark"] = self.remark.text().strip() or "BONUS RELOAD AUTO"' in settings
+    assert 'self.config["manual_adjust"]' not in settings
+    config = __import__("json").loads((root / "config" / "config.json").read_text())
+    assert config["manual_adjust"]["execution_enabled"] is True
 
 
 def test_manual_entry_resets_view_with_shared_context_and_auto_controls_stay_frozen():

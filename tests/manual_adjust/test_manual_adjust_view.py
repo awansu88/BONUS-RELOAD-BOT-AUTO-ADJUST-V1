@@ -13,8 +13,8 @@ from ui.manual_adjust_view import ManualAdjustView
 _APP = QApplication.instance() or QApplication([])
 
 
-def _view():
-    view = ManualAdjustView()
+def _view(manual_remark=""):
+    view = ManualAdjustView(manual_remark=manual_remark)
     view.set_sheet_connected(True)
     return view
 
@@ -36,6 +36,40 @@ def test_manual_signals_and_preview_actions_remain_available():
     assert all(_visible(view, key) for key in ("load", "open_panel", "attach_panel", "start"))
     assert view.actions["start"].isEnabled()
     assert view.actions["attach_panel"].text() == "READY"
+
+
+def test_manual_remark_initialization_validation_and_state_locking(monkeypatch):
+    view = _view("BONUS CASHBACK MINGGUAN SPORTS")
+    assert view.remark_input.text() == "BONUS CASHBACK MINGGUAN SPORTS"
+    emitted = []
+    view.remark_save_requested.connect(emitted.append)
+    view.remark_input.setText("  NEW MANUAL REMARK  "); view.remark_save_button.click()
+    assert emitted == ["NEW MANUAL REMARK"]
+
+    warnings = []
+    monkeypatch.setattr("ui.manual_adjust_view.QMessageBox.warning",
+                        lambda *args: warnings.append(args[2]))
+    view.remark_input.setText("   "); view.remark_save_button.click()
+    assert warnings == ["Manual Remark must not be empty."]
+    assert emitted == ["NEW MANUAL REMARK"]
+
+    for status in ("RUNNING", "STOPPED", "FAILURE_REVIEW", "REVIEW_REQUIRED", "HARD_STOPPED"):
+        view.set_execution_state(status)
+        assert not view.remark_input.isEnabled() and not view.remark_save_button.isEnabled()
+    view.set_execution_state("COMPLETED")
+    assert view.remark_input.isEnabled() and view.remark_save_button.isEnabled()
+
+
+def test_manual_status_uses_auto_dot_states():
+    view = _view()
+    assert view.status_dots["GOOGLE SHEETS"].objectName() == "DotIdle"
+    assert view.status_dots["PANEL"].objectName() == "DotIdle"
+    view.set_sheet_connected(True)
+    assert view.status_dots["GOOGLE SHEETS"].objectName() == "DotOk"
+    view.set_execution_state("PREVIEW", panel_open=True)
+    assert view.status_dots["PANEL"].objectName() == "DotWarn"
+    view.set_execution_state("PREVIEW", panel_attached=True)
+    assert view.status_dots["PANEL"].objectName() == "DotOk"
 
 
 def test_start_uses_current_cycle_not_recovery_selector_state():
@@ -79,6 +113,7 @@ def test_running_pause_request_is_cooperative_and_locks_navigation():
     view.actions["stop"].click()
     assert calls == ["request_stop"]
     assert view.actions["stop"].text() == "PAUSING..." and not view.actions["stop"].isEnabled()
+    assert not view.remark_input.isEnabled() and not view.remark_save_button.isEnabled()
     assert not _visible(view, "resume")
     # A RUNNING refresh cannot prematurely offer CONTINUE.
     view.set_execution_state("RUNNING", {"pending": 3, "success": 2}, execution_enabled=True, panel_attached=True)

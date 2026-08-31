@@ -8,11 +8,34 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import json
+from pathlib import Path
 
 
 class OperatingMode(str, Enum):
     AUTO = "AUTO BONUS RELOAD"
     MANUAL = "FULL MANUAL ADJUST"
+
+
+def persist_manual_remark(config: dict, config_path: Path, raw_remark: str) -> str:
+    """Persist a Manual-only remark without replacing its shared config dict."""
+    remark = raw_remark.strip()
+    if not remark:
+        raise ValueError("Manual Remark must not be empty.")
+    manual_config = config.setdefault("manual_adjust", {})
+    if not isinstance(manual_config, dict):
+        raise ValueError("manual_adjust configuration must be an object.")
+    previous = manual_config.get("remark")
+    manual_config["remark"] = remark
+    try:
+        Path(config_path).write_text(json.dumps(config, indent=4), encoding="utf-8")
+    except Exception:
+        if previous is None:
+            manual_config.pop("remark", None)
+        else:
+            manual_config["remark"] = previous
+        raise
+    return remark
 
 
 @dataclass

@@ -10,7 +10,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFrame, QGridLayout, QHBoxLayout, QHeaderView,
-    QLabel, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSplitter,
+    QLabel, QLineEdit, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSplitter,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -27,8 +27,9 @@ class ManualAdjustView(QWidget):
     reconcile_requested = Signal()
     open_cycle_requested = Signal(str)
     recover_requested = Signal()
+    remark_save_requested = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, manual_remark: str = ""):
         super().__init__(parent)
         self._sheet_connected = False
         self._execution_status = "PREVIEW"
@@ -38,6 +39,19 @@ class ManualAdjustView(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+        remark_bar = QFrame(); remark_bar.setObjectName("Card")
+        remark_layout = QHBoxLayout(remark_bar)
+        remark_layout.setContentsMargins(14, 8, 14, 8); remark_layout.setSpacing(10)
+        remark_label = QLabel("MANUAL REMARK"); remark_label.setObjectName("SectionTitle")
+        self.remark_input = QLineEdit(manual_remark)
+        self.remark_input.setObjectName("manual-remark-input")
+        self.remark_save_button = QPushButton("SAVE")
+        self.remark_save_button.setObjectName("manual-remark-save-btn")
+        self.remark_save_button.clicked.connect(self._emit_remark_save)
+        remark_layout.addWidget(remark_label); remark_layout.addWidget(self.remark_input, 1)
+        remark_layout.addWidget(self.remark_save_button)
+        root.addWidget(remark_bar)
         splitter = QSplitter(Qt.Horizontal)
         splitter.setObjectName("manual-dashboard-splitter")
         splitter.setChildrenCollapsible(False)
@@ -68,6 +82,7 @@ class ManualAdjustView(QWidget):
         box.addWidget(self._title("Status"))
         status = QGridLayout(); status.setHorizontalSpacing(24); status.setVerticalSpacing(8)
         self.status_values = {}
+        self.status_dots = {}
         for row, (key, value) in enumerate((
             ("GOOGLE SHEETS", "Not connected"), ("PANEL", "Closed"),
             ("MANUAL CYCLE", "No snapshot"), ("EXECUTION GATE", "DISABLED"),
@@ -76,7 +91,15 @@ class ManualAdjustView(QWidget):
             caption = QLabel(key.title()); caption.setObjectName("StatLabel")
             label = QLabel(value); label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             caption.setMinimumHeight(24); label.setMinimumHeight(24)
-            status.addWidget(caption, row, 0); status.addWidget(label, row, 1)
+            status.addWidget(caption, row, 0)
+            if key in ("GOOGLE SHEETS", "PANEL"):
+                dot = QLabel("●"); dot.setObjectName("DotIdle")
+                wrapper = QWidget(); value_row = QHBoxLayout(wrapper)
+                value_row.setContentsMargins(0, 0, 0, 0); value_row.setSpacing(8)
+                value_row.addStretch(1); value_row.addWidget(dot); value_row.addWidget(label)
+                status.addWidget(wrapper, row, 1); self.status_dots[key] = dot
+            else:
+                status.addWidget(label, row, 1)
             self.status_values[key] = label
         box.addLayout(status); box.addWidget(self._divider())
 
@@ -203,11 +226,28 @@ class ManualAdjustView(QWidget):
         self._pause_requested = True
         self.actions["stop"].setText("PAUSING..."); self.actions["stop"].setEnabled(False)
         self.current_values["STATE"].setText("Pausing")
+        self.remark_input.setEnabled(False); self.remark_save_button.setEnabled(False)
         self.stop_requested.emit()
+
+    def _emit_remark_save(self) -> None:
+        remark = self.remark_input.text().strip()
+        if not remark:
+            QMessageBox.warning(self, "Manual Remark", "Manual Remark must not be empty.")
+            return
+        self.remark_save_requested.emit(remark)
+
+    def set_manual_remark(self, remark: str) -> None:
+        self.remark_input.setText(remark)
+
+    def _set_status_dot(self, key: str, state: str) -> None:
+        dot = self.status_dots[key]
+        dot.setObjectName({"ok": "DotOk", "warn": "DotWarn", "err": "DotErr"}.get(state, "DotIdle"))
+        dot.style().unpolish(dot); dot.style().polish(dot)
 
     def set_sheet_connected(self, connected: bool) -> None:
         self._sheet_connected = connected
         self.status_values["GOOGLE SHEETS"].setText("Connected" if connected else "Not connected")
+        self._set_status_dot("GOOGLE SHEETS", "ok" if connected else "idle")
         self._apply_action_state()
 
     @staticmethod
@@ -229,6 +269,7 @@ class ManualAdjustView(QWidget):
         self.status_values["EXECUTION GATE"].setStyleSheet(f"color:{'#4ADE80' if execution_enabled else '#EF4444'};font-weight:700")
         self.status_values["PANEL"].setText(
             "Attached" if panel_attached else "Open" if panel_open else "Closed")
+        self._set_status_dot("PANEL", "ok" if panel_attached else "warn" if panel_open else "idle")
         state_names = {"PREVIEW": "Idle", "RUNNING": "Pausing" if self._pause_requested else "Running",
                        "STOPPED": "Paused", "FAILURE_REVIEW": "Failure Review", "REVIEW_REQUIRED": "Review Required",
                        "COMPLETED": "Completed", "HARD_STOPPED": "Hard Stopped"}
@@ -247,6 +288,9 @@ class ManualAdjustView(QWidget):
                            ("TOTAL ADJUSTED", int(summary.get("total_adjusted_successfully", 0)))):
             self.execution_values[key].setText(f"{value:,}")
         self._execution_enabled = execution_enabled; self._panel_attached = panel_attached
+        remark_editable = status in ("PREVIEW", "COMPLETED")
+        self.remark_input.setEnabled(remark_editable)
+        self.remark_save_button.setEnabled(remark_editable)
         self._apply_action_state()
 
     def reset_unselected_state(self, *, execution_enabled: bool, panel_attached: bool,

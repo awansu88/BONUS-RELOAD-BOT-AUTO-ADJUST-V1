@@ -34,7 +34,7 @@
     "monitoring_interval_sec": 10,
     "remark": "BONUS RELOAD AUTO",
     "manual_adjust": {
-        "execution_enabled": false,
+        "execution_enabled": true,
         "remark": "MANUAL ADJUST",
         "lease_timeout_sec": 120,
         "heartbeat_interval_sec": 10

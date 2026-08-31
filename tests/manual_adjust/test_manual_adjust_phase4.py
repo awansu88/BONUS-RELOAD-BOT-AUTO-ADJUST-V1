@@ -7,6 +7,7 @@ from core.manual_adjust_models import AttemptResult, ClassifiedSourceRow, Source
 from core.manual_adjust_repository import ManualAdjustRepository
 from core.panel_service import ManualSubmitOutcome, ManualSubmitResult
 from core.panel_service import PanelService
+from ui.manual_adjust_state import persist_manual_remark
 from playwright.sync_api import TimeoutError as PWTimeout
 
 
@@ -46,6 +47,30 @@ def test_execution_gate_blocks_before_claim(repo):
         ctl.start(cid, confirmed=True)
     assert repo.get_pending_transactions(cid)[0].attempt_count == 0
     assert not panel.calls
+
+
+def test_saved_manual_remark_is_seen_in_place_by_preflight_and_submission(repo, tmp_path):
+    cid = snapshot(repo, 1)
+    cfg = config(); cfg["remark"] = "AUTO REMAINS"; nested = cfg["manual_adjust"]
+    panel = Panel([ManualSubmitResult(ManualSubmitOutcome.SUCCESS, True, "SUCCESS_OBSERVED")])
+    controller = ManualAdjustController(repo, panel, cfg)
+    path = tmp_path / "config.json"
+    saved = persist_manual_remark(cfg, path, "  BONUS CASHBACK MINGGUAN SPORTS  ")
+    assert cfg["manual_adjust"] is nested
+    assert cfg["remark"] == "AUTO REMAINS"
+    assert saved == nested["remark"] == "BONUS CASHBACK MINGGUAN SPORTS"
+    assert __import__("json").loads(path.read_text())["manual_adjust"]["remark"] == saved
+    assert controller._validate_execution_settings().remark == saved
+    controller.start(cid, confirmed=True); controller.step()
+    assert panel.calls == [("u0", 101, saved)]
+
+
+def test_empty_manual_remark_is_not_persisted(tmp_path):
+    cfg = config(); before = dict(cfg["manual_adjust"])
+    with pytest.raises(ValueError, match="must not be empty"):
+        persist_manual_remark(cfg, tmp_path / "config.json", "  ")
+    assert cfg["manual_adjust"] == before
+    assert not (tmp_path / "config.json").exists()
 
 
 def test_finite_success_and_failure_review(repo):

@@ -2114,7 +2114,8 @@ class Dashboard(QMainWindow):
         else:
             try:
                 self.db.mark_auto_unknown(
-                    item.tx_id, result.detail, result.phase, result.evidence
+                    item.tx_id, result.detail, result.phase, result.evidence,
+                    proven_click_crossed=result.click_crossed,
                 )
             except Exception as exc:
                 self.logger.error(f"{item.username}  UNKNOWN finalization failed; worker halted: {exc}")

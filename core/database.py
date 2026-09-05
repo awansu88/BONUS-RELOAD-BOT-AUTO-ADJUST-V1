@@ -369,8 +369,10 @@ class DatabaseService:
                 self._conn.execute("ROLLBACK")
             raise
 
-    def mark_auto_unknown(self, tx_id: str, detail: str = "", phase: str = "AMBIGUOUS_RESPONSE",
-                          evidence: str = "") -> None:
+    def mark_auto_unknown(
+        self, tx_id: str, detail: str = "", phase: str = "AMBIGUOUS_RESPONSE",
+        evidence: str = "", proven_click_crossed: bool = False,
+    ) -> None:
         now = datetime.now().isoformat(timespec="seconds")
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -380,11 +382,21 @@ class DatabaseService:
             ).fetchone()
             if tx is None:
                 raise sqlite3.IntegrityError("AUTO transaction is not SUBMITTING")
-            cur = self._conn.execute(
-                "UPDATE auto_adjust_attempts SET result='UNKNOWN',finished_at=?,error_detail=?,"
-                "evidence_detail=?,submission_phase=? WHERE attempt_id=? AND result='IN_PROGRESS'",
-                (now, str(detail), str(evidence), str(phase), tx[0])
-            )
+            if proven_click_crossed:
+                cur = self._conn.execute(
+                    "UPDATE auto_adjust_attempts SET result='UNKNOWN',finished_at=?,error_detail=?,"
+                    "evidence_detail=?,submission_phase=?,click_crossed=1,"
+                    "submit_clicked_at=COALESCE(submit_clicked_at,?) "
+                    "WHERE attempt_id=? AND result='IN_PROGRESS'",
+                    (now, str(detail), str(evidence), str(phase), now, tx[0]),
+                )
+            else:
+                cur = self._conn.execute(
+                    "UPDATE auto_adjust_attempts SET result='UNKNOWN',finished_at=?,error_detail=?,"
+                    "evidence_detail=?,submission_phase=? "
+                    "WHERE attempt_id=? AND result='IN_PROGRESS'",
+                    (now, str(detail), str(evidence), str(phase), tx[0]),
+                )
             if cur.rowcount != 1:
                 raise sqlite3.IntegrityError("AUTO attempt is not in progress")
             self._conn.execute(
@@ -479,7 +491,8 @@ class DatabaseService:
                     "UPDATE auto_adjust_transactions SET status='FAILED_NOT_SUBMITTED',updated_at=?,"
                     "resolved_at=? WHERE tx_id=?", (now, now, tx_id))
             pre_click = {"REMOTE_CALL_STARTED", "FORM_STARTED", "USERNAME_FILLED",
-                         "AMOUNT_FILLED", "REMARK_FILLED", "READY_TO_CLICK"}
+                         "AMOUNT_FILLED", "REMARK_FILLED", "READY_TO_CLICK",
+                         "FAILED_PRE_CLICK"}
             recovered_pre = 0
             recovered_unknown = 0
             for tx_id, attempt_id, phase, crossed, clicked_at in submitting:

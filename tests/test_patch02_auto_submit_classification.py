@@ -208,3 +208,97 @@ def test_worker_failed_not_submitted_stop_boundary(tmp_path):
     run_worker(fake)
     assert db.get_auto_transaction("one")["status"] == "FAILED_NOT_SUBMITTED"
     assert finalised == ["Worker stopped"] and manager.next_ready().tx_id == "two"
+
+
+def test_failed_pre_click_crash_recovers_failed_not_submitted_idempotently(tmp_path):
+    path = tmp_path / "failed-pre-click"
+    db = DatabaseService(str(path))
+    reserved = claim(db)
+    db.record_auto_attempt_phase("tx", reserved["attempt_id"], "FAILED_PRE_CLICK")
+    attempt = db.get_auto_attempts("tx")[0]
+    assert attempt["click_crossed"] == 0
+    assert attempt["submit_clicked_at"] is None
+    db.close()
+
+    reopened = DatabaseService(str(path))
+    tx = reopened.get_auto_transaction("tx")
+    attempt = reopened.get_auto_attempts("tx")[0]
+    assert tx["status"] == "FAILED_NOT_SUBMITTED"
+    assert tx["resolved_at"] is not None
+    assert attempt["result"] == "FAILED_NOT_SUBMITTED"
+    assert reopened.daily_bonus_exposure_for_transaction_date("alice", "2025-08-01") == 0
+    assert reopened.has_known_auto_tx("tx")
+    assert reopened.recover_auto_journal() == {"failed_not_submitted": 0, "unknown": 0}
+
+
+def test_failed_pre_click_phase_with_positive_click_proof_recovers_unknown(tmp_path):
+    path = tmp_path / "failed-pre-click-with-proof"
+    db = DatabaseService(str(path))
+    reserved = claim(db)
+    db.record_auto_attempt_phase("tx", reserved["attempt_id"], "FAILED_PRE_CLICK")
+    db._conn.execute(
+        "UPDATE auto_adjust_attempts SET click_crossed=1,submit_clicked_at=? "
+        "WHERE attempt_id=?", ("2025-08-01T10:00:00", reserved["attempt_id"]),
+    )
+    db.close()
+
+    reopened = DatabaseService(str(path))
+    tx = reopened.get_auto_transaction("tx")
+    assert tx["status"] == "UNKNOWN"
+    assert tx["resolved_at"] is None
+    assert reopened.daily_bonus_exposure_for_transaction_date("alice", "2025-08-01") == 5000
+
+
+def test_worker_preserves_returned_click_proof_when_phase_persistence_fails(
+    tmp_path, monkeypatch
+):
+    db = DatabaseService(str(tmp_path / "db"))
+    manager = QueueManager(
+        Sheet([row("TX-A", "alice", 50_000), row("TX-B", "bob", 50_000)]),
+        MemoryCache(), Validator(RULES), db,
+    )
+    manager.refill()
+    page = FakePage()
+    panel = service(page)
+    original = db.record_auto_attempt_phase
+
+    def fail_click_returned(tx_id, attempt_id, phase, evidence=""):
+        if phase == "CLICK_RETURNED":
+            raise OSError("forced CLICK_RETURNED persistence failure")
+        return original(tx_id, attempt_id, phase, evidence)
+
+    monkeypatch.setattr(db, "record_auto_attempt_phase", fail_click_returned)
+    dashboard, _, finalised = worker_dashboard(db, manager, panel=panel)
+    run_worker(dashboard)
+
+    tx = db.get_auto_transaction("TX-A")
+    attempt = db.get_auto_attempts("TX-A")[0]
+    assert tx["status"] == "UNKNOWN" and tx["resolved_at"] is None
+    assert attempt["result"] == "UNKNOWN"
+    assert attempt["submission_phase"] == "CLICK_RETURNED"
+    assert attempt["click_crossed"] == 1 and attempt["submit_clicked_at"] is not None
+    assert db.daily_bonus_exposure_for_transaction_date("alice", "2025-08-01") == 5000
+    assert db._conn.execute(
+        "SELECT count(*) FROM processed_transactions WHERE tx_id='TX-A'"
+    ).fetchone()[0] == 0
+    assert page.clicks == 1
+    assert finalised == ["Worker stopped"]
+    assert manager.next_ready().tx_id == "TX-B" and not manager.next_ready().processed
+
+
+def test_worker_click_uncertain_does_not_fabricate_positive_proof(tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    manager = QueueManager(
+        Sheet([row("TX-A", "alice", 50_000)]), MemoryCache(), Validator(RULES), db,
+    )
+    manager.refill()
+    page = FakePage(fail="submit")
+    dashboard, _, _ = worker_dashboard(db, manager, panel=service(page))
+    run_worker(dashboard)
+
+    tx = db.get_auto_transaction("TX-A")
+    attempt = db.get_auto_attempts("TX-A")[0]
+    assert tx["status"] == "UNKNOWN" and tx["resolved_at"] is None
+    assert attempt["submission_phase"] == "CLICK_UNCERTAIN"
+    assert attempt["click_crossed"] == 0 and attempt["submit_clicked_at"] is None
+    assert db.daily_bonus_exposure_for_transaction_date("alice", "2025-08-01") == 5000

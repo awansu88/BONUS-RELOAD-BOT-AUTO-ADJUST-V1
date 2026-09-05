@@ -21,6 +21,7 @@ from .memory_cache import MemoryCache
 from .sheet_service import MasterRow, SheetService
 from .timestamp_utils import parse_transaction_date
 from .validator import ValidationResult, Validator
+from .source_integrity import SourceIntegrityError, canonical_username_key
 
 
 @dataclass(slots=True)
@@ -93,6 +94,26 @@ class QueueManager:
             retry_ids = {t for t in known if self.db.is_auto_retry_eligible(t)}
             already = known - retry_ids
         pending = [r for r in rows if r.tx_id not in already]
+
+        # Validate/collapse candidate identities before any preview, cache, or
+        # database mutation. Known terminal IDs were removed above deliberately.
+        unique = []
+        seen = {}
+        for r in pending:
+            identity = (
+                str(r.tx_id).strip(), canonical_username_key(r.user_id),
+                int(r.true_amount), str(r.timestamp or "").strip(),
+            )
+            previous = seen.get(identity[0])
+            if previous is None:
+                seen[identity[0]] = (identity, r)
+                unique.append(r)
+            elif previous[0] != identity:
+                raise SourceIntegrityError(
+                    f"conflicting duplicate TX_ID {r.tx_id!r} at MASTER rows "
+                    f"{previous[1].row_index} and {r.row_index}"
+                )
+        pending = unique
         batch = pending[: self.batch_size]
 
         manual_set = self.cache.manual_set()
@@ -112,7 +133,7 @@ class QueueManager:
             return db_cache[key]
 
         def current(uid: str, ts_iso: str) -> int:
-            uid = str(uid).strip()
+            uid = canonical_username_key(uid)
             base = db_daily_bonus(uid, ts_iso)
             return base + simulated.get((uid, ts_iso), 0)
 
@@ -124,11 +145,12 @@ class QueueManager:
 
         for r in batch:
             tx_date = parse_transaction_date(r.timestamp)
-            # Fallback: use today if the sheet cell is unparseable. We keep
-            # today so we don't accidentally grant an unlimited bonus for a
-            # user with a corrupt timestamp cell — but the operator will
-            # see the log warning through the caller.
-            ts_iso = (tx_date or date.today()).isoformat()
+            if tx_date is None:
+                raise SourceIntegrityError(
+                    f"TX_ID {r.tx_id!r}, MASTER row {r.row_index}: invalid "
+                    f"TIME STAMP {r.timestamp!r}"
+                )
+            ts_iso = tx_date.isoformat()
 
             result = self.validator.validate(
                 user_id=r.user_id,
@@ -152,7 +174,7 @@ class QueueManager:
             if result.status == "READY":
                 stats.ready += 1
                 ready.append(item)
-                uid = str(r.user_id).strip()
+                uid = canonical_username_key(r.user_id)
                 simulated[(uid, ts_iso)] = (
                     simulated.get((uid, ts_iso), 0) + int(result.bonus)
                 )

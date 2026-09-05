@@ -13,6 +13,8 @@ from datetime import date
 from threading import RLock
 from typing import Dict, Set
 
+from .source_integrity import canonical_username_key
+
 
 class MemoryCache:
     def __init__(self) -> None:
@@ -24,16 +26,16 @@ class MemoryCache:
     # ---------- daily bonus ----------
     def set_daily_bonus(self, mapping: Dict[str, int]) -> None:
         with self._lock:
-            self._daily_bonus = {str(k).strip(): int(v or 0) for k, v in mapping.items() if k}
+            self._daily_bonus = {canonical_username_key(k): int(v or 0) for k, v in mapping.items() if k}
             self._loaded_date = date.today()
 
     def get_daily_bonus(self, user_id: str) -> int:
         with self._lock:
-            return int(self._daily_bonus.get(str(user_id).strip(), 0))
+            return int(self._daily_bonus.get(canonical_username_key(user_id), 0))
 
     def add_bonus(self, user_id: str, amount: int) -> None:
         with self._lock:
-            uid = str(user_id).strip()
+            uid = canonical_username_key(user_id)
             self._daily_bonus[uid] = self._daily_bonus.get(uid, 0) + int(amount)
 
     def loaded_date(self) -> date | None:
@@ -47,7 +49,7 @@ class MemoryCache:
     # ---------- manual list ----------
     def set_manual(self, users: Set[str]) -> None:
         with self._lock:
-            self._manual = {str(u).strip() for u in users if str(u).strip()}
+            self._manual = {canonical_username_key(u) for u in users if canonical_username_key(u)}
 
     def manual_set(self) -> Set[str]:
         with self._lock:
@@ -55,4 +57,4 @@ class MemoryCache:
 
     def in_manual(self, user_id: str) -> bool:
         with self._lock:
-            return str(user_id).strip() in self._manual
+            return canonical_username_key(user_id) in self._manual

@@ -1888,6 +1888,14 @@ class Dashboard(QMainWindow):
                 self.stop_requested = True
                 self._finalise_stop("Worker halted: AUTO accounting integrity failure")
                 return
+            except Exception as exc:
+                self.logger.error(
+                    f"{item.username}  AUTO accounting preflight database "
+                    f"failure; worker halted: {exc}"
+                )
+                self.stop_requested = True
+                self._finalise_stop("Worker halted: AUTO accounting database failure")
+                return
 
         # If the operator closed the browser mid-run, bail cleanly.
         if not self.panel.is_alive():

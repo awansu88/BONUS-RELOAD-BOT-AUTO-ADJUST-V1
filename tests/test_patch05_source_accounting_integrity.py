@@ -442,6 +442,34 @@ def test_worker_accounting_failure_preempts_panel_and_recovery(alive, tmp_path):
     assert db.get_auto_transaction("candidate") is None
 
 
+def test_accounting_preflight_database_failure_hard_stops_before_panel(
+    monkeypatch, tmp_path
+):
+    db = DatabaseService(str(tmp_path / "db"))
+    q = queue(db, [row("candidate")])
+    q.refill()
+    monkeypatch.setattr(
+        db,
+        "assert_auto_accounting_integrity",
+        lambda _: (_ for _ in ()).throw(sqlite3.DatabaseError("database unavailable")),
+    )
+    liveness, recoveries, submissions = [], [], []
+    panel = SimpleNamespace(
+        is_alive=lambda: liveness.append(True) or False,
+        submit_deposit_classified=lambda **values: submissions.append(values),
+    )
+    dashboard, _, finalised = worker_dashboard(db, q, panel=panel)
+    dashboard._handle_active_panel_loss = lambda reason: recoveries.append(reason)
+
+    run_worker(dashboard)
+
+    assert dashboard.stop_requested and len(finalised) == 1
+    assert liveness == [] and recoveries == [] and submissions == []
+    assert db.get_auto_transaction("candidate") is None
+    assert db.get_auto_attempts("candidate") == []
+    assert not q.next_ready().processed
+
+
 def test_monitoring_accounting_integrity_error_hard_stops():
     finalised, recoveries = [], []
     host = SimpleNamespace(

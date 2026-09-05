@@ -218,3 +218,190 @@ def test_manual_bonus_added_before_retry_blocks_remote_and_future_retry(tmp_path
     worker, calls, _ = worker_dashboard(db, q, refresh=lambda: worker.cache.set_manual({"alice"}))
     run_worker(worker)
     assert calls == [] and db.has_tx("tx") and not db.is_auto_retry_eligible("tx")
+
+
+def test_retry_fresh_limit_blocks_remote_and_future_retry(tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    failed_once(db)
+    q = manager(db, [row("tx", "alice", 100_000)])
+    q.refill()
+    first_before = dict(db.get_auto_attempts("tx")[0])
+    # This award lands after preview, so only the shipped worker's fresh
+    # transaction-date validation can observe it.
+    db.insert("new-award", "alice", 100_000, 10_000, "SUCCESS", "MASTER", DAY)
+    worker, calls, _ = worker_dashboard(db, q)
+    run_worker(worker)
+    assert calls == []
+    assert db.get_auto_attempts("tx") == [first_before]
+    assert db._conn.execute(
+        "SELECT result FROM processed_transactions WHERE tx_id='tx'"
+    ).fetchone() == ("LIMIT",)
+    assert not db.is_auto_retry_eligible("tx")
+
+
+def test_retry_fresh_invalid_blocks_remote_and_future_retry(tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    failed_once(db)
+    q = manager(db, [row("tx", "alice", 100_000)])
+    q.refill()
+    first_before = dict(db.get_auto_attempts("tx")[0])
+    # The worker validates its current MASTER-derived QueueItem again.  An
+    # amount below the frozen 50k tier is deterministically INVALID.
+    q.next_ready().amount = 49_999
+    worker, calls, _ = worker_dashboard(db, q)
+    run_worker(worker)
+    assert calls == []
+    assert db.get_auto_attempts("tx") == [first_before]
+    assert db._conn.execute(
+        "SELECT result FROM processed_transactions WHERE tx_id='tx'"
+    ).fetchone() == ("INVALID",)
+    assert not db.is_auto_retry_eligible("tx")
+
+
+def test_worker_retry_source_mismatch_never_reaches_panel(tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    failed_once(db, amount=100_000)
+    first_before = dict(db.get_auto_attempts("tx")[0])
+    q = manager(db, [row("tx", "alice", 50_000)])
+    q.refill()
+    assert q.next_ready().retry_attempt
+    worker, calls, _ = worker_dashboard(db, q)
+    run_worker(worker)
+    assert calls == [] and db.get_auto_attempts("tx") == [first_before]
+    tx = db.get_auto_transaction("tx")
+    assert tx["status"] == "FAILED_NOT_SUBMITTED" and tx["attempt_count"] == 1
+
+
+def test_worker_retry_full_quota_blocks_panel(tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    failed_once(db)
+    q = manager(db, [row("tx", "alice", 100_000)])
+    q.refill()
+    # Simulate a concurrent award after fresh validation but before the atomic
+    # retry claim, forcing the authoritative reservation guard to reject it.
+    original = db.reserve_auto_retry_transaction
+
+    def concurrent_award_then_claim(**kwargs):
+        db.insert("concurrent", "alice", 100_000, 10_000, "SUCCESS", "MASTER", DAY)
+        return original(**kwargs)
+
+    db.reserve_auto_retry_transaction = concurrent_award_then_claim
+    worker, calls, _ = worker_dashboard(db, q)
+    run_worker(worker)
+    assert calls == [] and len(db.get_auto_attempts("tx")) == 1
+    assert db.get_auto_transaction("tx")["status"] == "FAILED_NOT_SUBMITTED"
+
+
+def _crash_attempt_two(path, phase):
+    db = DatabaseService(str(path))
+    failed_once(db)
+    claim = db.reserve_auto_retry_transaction("tx", "alice", DAY, 100_000, 10_000)
+    db.mark_auto_submitting("tx", claim["attempt_id"])
+    db.record_auto_attempt_phase("tx", claim["attempt_id"], phase)
+    db.close()
+    return DatabaseService(str(path))
+
+
+def test_attempt_two_preclick_submitting_crash_recovers_failed_not_submitted(tmp_path):
+    db = _crash_attempt_two(tmp_path / "db", "FORM_STARTED")
+    tx = db.get_auto_transaction("tx")
+    attempts = db.get_auto_attempts("tx")
+    assert tx["status"] == "FAILED_NOT_SUBMITTED" and tx["resolved_at"] is not None
+    assert tx["attempt_count"] == 2 and attempts[1]["result"] == "FAILED_NOT_SUBMITTED"
+    assert not db.is_auto_retry_eligible("tx")
+    assert db.recover_auto_journal() == {"failed_not_submitted": 0, "unknown": 0}
+
+
+def test_attempt_two_click_boundary_crash_recovers_unknown(tmp_path):
+    db = _crash_attempt_two(tmp_path / "db", "SUBMIT_CLICK_BOUNDARY")
+    tx = db.get_auto_transaction("tx")
+    attempts = db.get_auto_attempts("tx")
+    assert tx["status"] == "UNKNOWN" and tx["resolved_at"] is None
+    assert tx["attempt_count"] == 2 and attempts[1]["result"] == "UNKNOWN"
+    assert db.daily_bonus_exposure_for_transaction_date("alice", DAY) == 10_000
+    assert not db.is_auto_retry_eligible("tx")
+
+
+def test_attempt_two_postclick_crash_recovers_unknown(tmp_path):
+    db = _crash_attempt_two(tmp_path / "db", "CLICK_RETURNED")
+    tx = db.get_auto_transaction("tx")
+    attempt = db.get_auto_attempts("tx")[1]
+    assert tx["status"] == "UNKNOWN" and tx["resolved_at"] is None
+    assert tx["attempt_count"] == 2 and attempt["result"] == "UNKNOWN"
+    assert attempt["click_crossed"] == 1 and attempt["submit_clicked_at"] is not None
+    assert db.daily_bonus_exposure_for_transaction_date("alice", DAY) == 10_000
+    assert not db.is_auto_retry_eligible("tx")
+
+
+def test_retry_mark_submitting_failure_halts_before_panel(tmp_path, monkeypatch):
+    db = DatabaseService(str(tmp_path / "db"))
+    failed_once(db, "TX-A")
+    q = manager(db, [row("TX-A", "alice", 100_000), row("TX-B", "bob", 50_000)])
+    q.refill()
+    monkeypatch.setattr(
+        db, "mark_auto_submitting", lambda *_: (_ for _ in ()).throw(OSError("disk"))
+    )
+    worker, calls, stopped = worker_dashboard(db, q)
+    run_worker(worker)
+    tx = db.get_auto_transaction("TX-A")
+    assert calls == [] and stopped == ["Worker halted: AUTO journal database failure"]
+    assert tx["status"] == "FAILED_NOT_SUBMITTED" and tx["attempt_count"] == 2
+    assert len(db.get_auto_attempts("TX-A")) == 2 and not db.is_auto_retry_eligible("TX-A")
+    tx_b = next(item for item in q.preview_items() if item.tx_id == "TX-B")
+    assert not tx_b.processed
+
+
+def test_retry_outcome_accounting_failure_hard_stops_before_next_tx(tmp_path, monkeypatch):
+    db = DatabaseService(str(tmp_path / "db"))
+    failed_once(db, "TX-A")
+    q = manager(db, [row("TX-A", "alice", 100_000), row("TX-B", "bob", 50_000)])
+    q.refill()
+    monkeypatch.setattr(
+        db, "finalize_auto_success", lambda *_: (_ for _ in ()).throw(OSError("disk"))
+    )
+    worker, calls, stopped = worker_dashboard(db, q)
+    run_worker(worker)
+    tx = db.get_auto_transaction("TX-A")
+    assert len(calls) == 1 and stopped == ["Worker halted: AUTO accounting state lost"]
+    assert tx["status"] == "SUBMITTING" and tx["attempt_count"] == 2
+    assert db.get_auto_attempts("TX-A")[1]["click_crossed"] == 1
+    assert not any(item.processed for item in q.preview_items() if item.tx_id == "TX-B")
+
+
+@pytest.mark.parametrize(
+    "outcome,expected",
+    [
+        (AutoSubmitOutcome.SUCCESS, "SUCCESS"),
+        (AutoSubmitOutcome.FAILED_NOT_SUBMITTED, "FAILED_NOT_SUBMITTED"),
+        (AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, "UNKNOWN"),
+    ],
+)
+def test_stop_during_retry_finalises_boundary_without_consuming_tx_b(tmp_path, outcome, expected):
+    db = DatabaseService(str(tmp_path / "db"))
+    failed_once(db, "TX-A")
+    q = manager(db, [row("TX-A", "alice", 100_000), row("TX-B", "bob", 50_000)])
+    q.refill()
+    calls = []
+    worker = None
+
+    def submit(phase_hook=None, **kwargs):
+        calls.append(kwargs)
+        worker.stop_requested = True
+        if outcome is AutoSubmitOutcome.SUCCESS:
+            phase_hook("CLICK_RETURNED")
+        elif outcome is AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT:
+            phase_hook("SUBMIT_CLICK_BOUNDARY")
+        return AutoSubmitResult(
+            outcome,
+            outcome is AutoSubmitOutcome.SUCCESS,
+            "FINISHED" if outcome is AutoSubmitOutcome.SUCCESS else "FAILED_PRE_CLICK",
+            "classified",
+        )
+
+    panel = SimpleNamespace(is_alive=lambda: True, submit_deposit_classified=submit)
+    worker, _, stopped = worker_dashboard(db, q, panel=panel)
+    run_worker(worker)
+    assert len(calls) == 1 and db.get_auto_transaction("TX-A")["status"] == expected
+    assert stopped == ["Worker stopped"]
+    tx_b = next(item for item in q.preview_items() if item.tx_id == "TX-B")
+    assert not tx_b.processed

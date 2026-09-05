@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
 from .manual_adjust_models import RawManualAdjustRow
+from .source_integrity import normalize_header
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -92,8 +93,16 @@ class SheetService:
         )
         return gspread.authorize(creds)
 
+    def _clear_connection_state(self) -> None:
+        """Remove every handle that can make a rejected source look usable."""
+        self._spreadsheet = None
+        self._master = None
+        self._manual = None
+        self._spreadsheet_id = ""
+
     # ---------------------------------------------------------------- connect
     def connect(self, url_or_id: str) -> ConnectionInfo:
+        self._clear_connection_state()
         sid = self.extract_spreadsheet_id(url_or_id)
         if not sid:
             return ConnectionInfo(False, error="Invalid spreadsheet URL")
@@ -106,12 +115,14 @@ class SheetService:
             tabs = [ws.title for ws in self._spreadsheet.worksheets()]
 
             if self.sheet_names["master"] not in tabs:
+                self._clear_connection_state()
                 return ConnectionInfo(
                     False,
                     error=f"Missing worksheet: {self.sheet_names['master']}",
                     tabs=tabs,
                 )
             if self.sheet_names["manual_bonus_reload"] not in tabs:
+                self._clear_connection_state()
                 return ConnectionInfo(
                     False,
                     error=f"Missing worksheet: {self.sheet_names['manual_bonus_reload']}",
@@ -126,11 +137,14 @@ class SheetService:
             # --- Required column validation on connect -------------------
             missing = self._validate_headers()
             if missing:
+                # Do not leave a usable source handle behind after a failed
+                # contract check; callers must correct and reconnect.
+                title = self._spreadsheet.title
+                self._clear_connection_state()
                 return ConnectionInfo(
                     False,
                     error="MASTER is missing required columns: " + ", ".join(missing),
-                    title=self._spreadsheet.title,
-                    spreadsheet_id=sid,
+                    title=title,
                     tabs=tabs,
                     missing_columns=missing,
                 )
@@ -142,31 +156,54 @@ class SheetService:
                 tabs=tabs,
             )
         except APIError as exc:
+            self._clear_connection_state()
             return ConnectionInfo(False, error=f"Google API error: {exc}")
         except FileNotFoundError:
+            self._clear_connection_state()
             return ConnectionInfo(
                 False, error=f"Credentials file not found: {self.credentials_path}"
             )
         except Exception as exc:  # pragma: no cover - defensive
+            self._clear_connection_state()
             return ConnectionInfo(False, error=str(exc))
 
     def _validate_headers(self) -> List[str]:
-        """Return the list of required columns whose header is empty."""
-        if not self._master or not self.required_headers:
-            return []
+        """Return exact fixed-position MASTER contract violations."""
+        required_keys = ("user_id", "sheet_data", "time_stamp", "true_amount", "tx_id")
         try:
             header_row = self._master.row_values(1)
         except APIError as exc:
             raise RuntimeError(f"Failed reading header row: {exc}")
 
         missing: List[str] = []
-        for key, expected in self.required_headers.items():
-            col_index = int(self.cols.get(key, 0))
-            if col_index <= 0:
+        used = {}
+        for key in required_keys:
+            if key not in self.required_headers:
+                missing.append(f"{key} (required header configuration missing)")
                 continue
+            expected = self.required_headers[key]
+            if key not in self.cols:
+                missing.append(f"{key} (configured column missing)")
+                continue
+            try:
+                col_index = int(self.cols[key])
+            except (TypeError, ValueError):
+                missing.append(f"{key} (invalid configured column {self.cols[key]!r})")
+                continue
+            if col_index <= 0:
+                missing.append(f"{key} (invalid configured column {col_index})")
+                continue
+            if col_index in used:
+                missing.append(
+                    f"{key} (column {self._col_letter(col_index)} duplicates {used[col_index]})"
+                )
+                continue
+            used[col_index] = key
             actual = header_row[col_index - 1] if col_index - 1 < len(header_row) else ""
-            if not actual.strip():
-                missing.append(f"{self._col_letter(col_index)} ({expected})")
+            if normalize_header(actual) != normalize_header(expected):
+                missing.append(
+                    f"{self._col_letter(col_index)} expected {expected!r}, found {actual!r}"
+                )
         return missing
 
     # ---------------------------------------------------------------- reads

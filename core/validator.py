@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+from .source_integrity import canonical_username_key
+
 
 @dataclass
 class ValidationResult:
@@ -49,7 +51,9 @@ class Validator:
         manual_set: set,
     ) -> ValidationResult:
         # 1. Manual bonus reload
-        if user_id and user_id in manual_set:
+        if user_id and canonical_username_key(user_id) in {
+            canonical_username_key(value) for value in manual_set
+        }:
             return ValidationResult(self.manual_status, 0, "user in manual list")
 
         # 2. Parse deposit

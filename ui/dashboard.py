@@ -59,6 +59,7 @@ from core.memory_cache import MemoryCache
 from core.panel_service import AutoSubmitOutcome, PanelService
 from core.queue_manager import QueueItem, QueueManager
 from core.sheet_service import SheetService
+from core.source_integrity import AccountingIntegrityError
 from core.validator import Validator
 from core.recovery import DEFAULT_LADDER, RetryExhausted, retry_with_ladder, safe_run
 from core.health import HealthMonitor, LeakThresholds
@@ -1861,6 +1862,41 @@ class Dashboard(QMainWindow):
         if getattr(self, "_recovery_active", False) or self.state == "recovering":
             return
 
+        item = self.queue.next_ready()
+        # Source/accounting uncertainty outranks infrastructure recovery. A
+        # malformed queued candidate is rejected even if the browser is also
+        # unavailable, and can never start PATCH-04's recovery ladder.
+        if item is not None:
+            from core.timestamp_utils import parse_transaction_date
+            from core.source_integrity import AccountingIntegrityError
+            tx_date = parse_transaction_date(item.timestamp)
+            if tx_date is None:
+                self.logger.error(
+                    f"{item.username}  source integrity failure for TX_ID "
+                    f"{item.tx_id!r}: invalid TIME STAMP {item.timestamp!r}"
+                )
+                self.stop_requested = True
+                self._finalise_stop("Worker halted: AUTO source integrity failure")
+                return
+            try:
+                self.db.assert_auto_accounting_integrity(item.username)
+            except AccountingIntegrityError as exc:
+                self.logger.error(
+                    f"{item.username}  AUTO accounting integrity preflight "
+                    f"failed; worker halted: {exc}"
+                )
+                self.stop_requested = True
+                self._finalise_stop("Worker halted: AUTO accounting integrity failure")
+                return
+            except Exception as exc:
+                self.logger.error(
+                    f"{item.username}  AUTO accounting preflight database "
+                    f"failure; worker halted: {exc}"
+                )
+                self.stop_requested = True
+                self._finalise_stop("Worker halted: AUTO accounting database failure")
+                return
+
         # If the operator closed the browser mid-run, bail cleanly.
         if not self.panel.is_alive():
             if hasattr(self, "_handle_active_panel_loss"):
@@ -1869,8 +1905,6 @@ class Dashboard(QMainWindow):
                 self._on_panel_lost()
                 self._finalise_stop("Worker halted: browser closed")
             return
-
-        item = self.queue.next_ready()
 
         # ----------------------------------------------------------
         # No READY items => Monitoring mode (Improvement #1)
@@ -1941,7 +1975,8 @@ class Dashboard(QMainWindow):
         # concurrent addition wins before we submit.
         self._refresh_manual_list_now()
         manual_set = self.cache.manual_set()
-        if item.username and str(item.username).strip() in manual_set:
+        from core.source_integrity import canonical_username_key
+        if item.username and canonical_username_key(item.username) in manual_set:
             try:
                 self.db.insert(
                     tx_id=item.tx_id, username=item.username,
@@ -1963,20 +1998,19 @@ class Dashboard(QMainWindow):
         # (3) Daily bonus validation — BUG-015.
         # Key by the TRANSACTION DATE parsed from the sheet cell, NOT by
         # `processed_at`.
-        from core.timestamp_utils import parse_transaction_date
-        from datetime import date as _date
-
-        tx_date = parse_transaction_date(item.timestamp)
-        if tx_date is None:
-            self.logger.warn(
-                f"{item.username}  unparseable timestamp "
-                f"{item.timestamp!r} - falling back to today for daily bonus rule"
-            )
-            tx_date = _date.today()
         tx_date_iso = tx_date.isoformat()
-        current = self.db.daily_bonus_exposure_for_transaction_date(
-            item.username, tx_date_iso
-        )
+        try:
+            current = self.db.daily_bonus_exposure_for_transaction_date(
+                item.username, tx_date_iso
+            )
+        except Exception as exc:
+            self.logger.error(
+                f"{item.username}  AUTO accounting integrity check failed; "
+                f"worker halted: {exc}"
+            )
+            self.stop_requested = True
+            self._finalise_stop("Worker halted: AUTO accounting integrity failure")
+            return
         revalidated = self.validator.validate(
             user_id=item.username,
             deposit_raw=item.amount,
@@ -2013,7 +2047,7 @@ class Dashboard(QMainWindow):
                 reservation = self.db.reserve_auto_retry_transaction(
                     tx_id=item.tx_id, username=item.username,
                     business_date=tx_date_iso, deposit_amount=item.amount,
-                    requested_bonus=item.bonus,
+                    requested_bonus=item.bonus, source_timestamp=item.timestamp,
                 )
             else:
                 reservation = self.db.reserve_auto_transaction(
@@ -2240,6 +2274,11 @@ class Dashboard(QMainWindow):
                 # Reset countdown silently.
                 self._next_refresh_ts = time.monotonic() + self._monitoring_interval
                 self._update_countdown_label()
+        except AccountingIntegrityError as exc:
+            self.logger.error(f"Monitoring accounting integrity failure: {exc}")
+            self.stop_requested = True
+            self._finalise_stop("Worker halted: AUTO accounting integrity failure")
+            return
         except Exception as exc:
             self.logger.error(f"Monitoring refresh failed: {exc}")
             # Keep monitoring; retry after the normal interval.

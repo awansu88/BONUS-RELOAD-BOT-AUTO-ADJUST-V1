@@ -24,12 +24,19 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from .timestamp_utils import parse_transaction_date
+from .source_integrity import (
+    AccountingIntegrityError,
+    canonical_username_key,
+    require_iso_business_date,
+    require_source_date,
+)
 
 
 SCHEMA_TABLE = """
 CREATE TABLE IF NOT EXISTS processed_transactions (
     tx_id          TEXT PRIMARY KEY,
     username       TEXT NOT NULL,
+    username_key   TEXT,
     amount         INTEGER,
     bonus          INTEGER,
     result         TEXT NOT NULL,
@@ -49,6 +56,7 @@ CREATE INDEX IF NOT EXISTS idx_processed_at    ON processed_transactions(process
 CREATE INDEX IF NOT EXISTS idx_username_date   ON processed_transactions(username, processed_at);
 CREATE INDEX IF NOT EXISTS idx_result          ON processed_transactions(result);
 CREATE INDEX IF NOT EXISTS idx_username_txdate ON processed_transactions(username, timestamp_date);
+CREATE INDEX IF NOT EXISTS idx_username_key_txdate ON processed_transactions(username_key, timestamp_date);
 """
 
 AUTO_JOURNAL_SCHEMA = """
@@ -100,8 +108,10 @@ class DatabaseService:
         except sqlite3.DatabaseError:
             pass
         self._migrate_timestamp_date_column()
+        self._migrate_processed_username_key()
         self._conn.executescript(SCHEMA_INDEXES)
         self._conn.executescript(AUTO_JOURNAL_SCHEMA)
+        self._migrate_journal_username_key()
         self.recover_auto_journal()
 
     # ---------------------------------------------------------------- migrations
@@ -124,8 +134,12 @@ class DatabaseService:
                     "ALTER TABLE processed_transactions ADD COLUMN timestamp_date TEXT"
                 )
             except sqlite3.DatabaseError:
-                # Race / already-added by another process — safe to ignore.
-                pass
+                # Only tolerate a concurrent successful additive migration.
+                current = {r[1] for r in self._conn.execute(
+                    "PRAGMA table_info(processed_transactions)"
+                ).fetchall()}
+                if "timestamp_date" not in current:
+                    raise
 
         # Backfill any NULL timestamp_date values from the `timestamp` column.
         rows = self._conn.execute(
@@ -144,6 +158,55 @@ class DatabaseService:
                 "UPDATE processed_transactions SET timestamp_date = ? WHERE tx_id = ?",
                 updates,
             )
+
+    def _migrate_processed_username_key(self) -> None:
+        cols = {r[1] for r in self._conn.execute(
+            "PRAGMA table_info(processed_transactions)"
+        ).fetchall()}
+        if "username_key" not in cols:
+            self._conn.execute(
+                "ALTER TABLE processed_transactions ADD COLUMN username_key TEXT"
+            )
+        rows = self._conn.execute(
+            "SELECT tx_id,username,username_key FROM processed_transactions"
+        ).fetchall()
+        updates = [(canonical_username_key(username), tx_id) for tx_id, username, old in rows
+                   if old != canonical_username_key(username)]
+        if updates:
+            self._conn.executemany(
+                "UPDATE processed_transactions SET username_key=? WHERE tx_id=?", updates
+            )
+
+    def _migrate_journal_username_key(self) -> None:
+        rows = self._conn.execute(
+            "SELECT tx_id,username,username_key FROM auto_adjust_transactions"
+        ).fetchall()
+        updates = [(canonical_username_key(username), tx_id) for tx_id, username, old in rows
+                   if old != canonical_username_key(username)]
+        if updates:
+            self._conn.executemany(
+                "UPDATE auto_adjust_transactions SET username_key=? WHERE tx_id=?", updates
+            )
+
+    def _assert_known_success_dates(self, username_key: str) -> None:
+        row = self._conn.execute(
+            "SELECT tx_id FROM processed_transactions WHERE username_key=? "
+            "AND result='SUCCESS' AND timestamp_date IS NULL LIMIT 1",
+            (username_key,),
+        ).fetchone()
+        if row:
+            raise AccountingIntegrityError(
+                f"AUTO accounting blocked for {username_key!r}: SUCCESS TX_ID "
+                f"{row[0]!r} has no provable transaction date"
+            )
+
+    def assert_auto_accounting_integrity(self, username: str) -> None:
+        """Fail closed if AUTO quota history is ambiguous for ``username``.
+
+        This mutation-free preflight is intentionally not a quota decision;
+        preview exposure and the atomic reservation remain authoritative.
+        """
+        self._assert_known_success_dates(canonical_username_key(username))
 
     # ---------------------------------------------------------------- dedup
     def has_tx(self, tx_id: str) -> bool:
@@ -231,7 +294,9 @@ class DatabaseService:
     ) -> int:
         if not username or not transaction_date_iso:
             return 0
-        key = str(username).strip()
+        key = canonical_username_key(username)
+        require_iso_business_date(transaction_date_iso)
+        self._assert_known_success_dates(key)
         committed = self.daily_bonus_for_transaction_date(key, transaction_date_iso)
         row = self._conn.execute(
             "SELECT COALESCE(SUM(reserved_bonus),0) FROM auto_adjust_transactions "
@@ -248,9 +313,13 @@ class DatabaseService:
     ) -> Optional[Dict]:
         """Atomically reserve the remaining quota and claim attempt number one."""
         now = datetime.now().isoformat(timespec="seconds")
-        key = str(username).strip()
+        key = canonical_username_key(username)
+        require_iso_business_date(business_date)
+        if source_timestamp:
+            require_source_date(source_timestamp, business_date, tx_id=str(tx_id))
         try:
             self._conn.execute("BEGIN IMMEDIATE")
+            self._assert_known_success_dates(key)
             known = self._conn.execute(
                 "SELECT 1 FROM processed_transactions WHERE tx_id=? UNION ALL "
                 "SELECT 1 FROM auto_adjust_transactions WHERE tx_id=? LIMIT 1",
@@ -261,7 +330,7 @@ class DatabaseService:
                 return None
             success = self._conn.execute(
                 "SELECT COALESCE(SUM(bonus),0) FROM processed_transactions "
-                "WHERE username=? AND timestamp_date=? AND result='SUCCESS'",
+                "WHERE username_key=? AND timestamp_date=? AND result='SUCCESS'",
                 (key, str(business_date)),
             ).fetchone()[0]
             reserved = self._conn.execute(
@@ -297,6 +366,7 @@ class DatabaseService:
     def reserve_auto_retry_transaction(
         self, tx_id: str, username: str, business_date: str, deposit_amount: int,
         requested_bonus: int, daily_limit: int = 10_000,
+        source_timestamp: str = "",
     ) -> Optional[Dict]:
         """Atomically re-prove safety, recompute quota, and create attempt two.
 
@@ -306,7 +376,10 @@ class DatabaseService:
         """
         now = datetime.now().isoformat(timespec="seconds")
         tx_id = str(tx_id)
-        key = str(username).strip()
+        key = canonical_username_key(username)
+        require_iso_business_date(business_date)
+        if source_timestamp:
+            require_source_date(source_timestamp, business_date, tx_id=tx_id)
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             tx = self._conn.execute(
@@ -329,9 +402,11 @@ class DatabaseService:
                 self._conn.execute("ROLLBACK")
                 return None
 
+            self._assert_known_success_dates(key)
+
             success = self._conn.execute(
                 "SELECT COALESCE(SUM(bonus),0) FROM processed_transactions "
-                "WHERE username=? AND timestamp_date=? AND result='SUCCESS'",
+                "WHERE username_key=? AND timestamp_date=? AND result='SUCCESS'",
                 (tx[0], tx[1]),
             ).fetchone()[0]
             reserved = self._conn.execute(
@@ -451,9 +526,9 @@ class DatabaseService:
             if proof is None:
                 raise sqlite3.IntegrityError("AUTO SUCCESS lacks durable click evidence")
             self._conn.execute(
-                "INSERT INTO processed_transactions (tx_id,username,amount,bonus,result,"
-                "processed_at,sheet_name,timestamp,timestamp_date) VALUES (?,?,?,?,?,?,?,?,?)",
-                (str(tx_id), tx[0], tx[1], tx[2], "SUCCESS", now, tx[3], tx[4], tx[6]),
+                "INSERT INTO processed_transactions (tx_id,username,username_key,amount,bonus,result,"
+                "processed_at,sheet_name,timestamp,timestamp_date) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (str(tx_id), tx[0], canonical_username_key(tx[0]), tx[1], tx[2], "SUCCESS", now, tx[3], tx[4], tx[6]),
             )
             self._conn.execute(
                 "UPDATE auto_adjust_attempts SET result='SUCCESS',finished_at=?,submission_phase='FINISHED' "
@@ -637,12 +712,13 @@ class DatabaseService:
         ts_date = parse_transaction_date(timestamp)
         self._conn.execute(
             "INSERT OR IGNORE INTO processed_transactions "
-            "(tx_id, username, amount, bonus, result, processed_at, "
+            "(tx_id, username, username_key, amount, bonus, result, processed_at, "
             " sheet_name, timestamp, timestamp_date) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 str(tx_id),
                 str(username),
+                canonical_username_key(username),
                 int(amount or 0),
                 int(bonus or 0),
                 str(result),
@@ -666,6 +742,7 @@ class DatabaseService:
                 (
                     str(r[0]),
                     str(r[1]),
+                    canonical_username_key(r[1]),
                     int(r[2] or 0),
                     int(r[3] or 0),
                     str(r[4]),
@@ -677,9 +754,9 @@ class DatabaseService:
             )
         self._conn.executemany(
             "INSERT OR IGNORE INTO processed_transactions "
-            "(tx_id, username, amount, bonus, result, processed_at, "
+            "(tx_id, username, username_key, amount, bonus, result, processed_at, "
             " sheet_name, timestamp, timestamp_date) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             payload,
         )
         return len(payload)
@@ -700,11 +777,11 @@ class DatabaseService:
         """
         rows = self._conn.execute(
             """
-            SELECT username, COALESCE(SUM(bonus), 0)
+            SELECT username_key, COALESCE(SUM(bonus), 0)
             FROM processed_transactions
             WHERE date(processed_at) = date('now', 'localtime')
               AND result = 'SUCCESS'
-            GROUP BY username
+            GROUP BY username_key
             """
         ).fetchall()
         return {str(r[0]): int(r[1] or 0) for r in rows if r[0]}
@@ -721,15 +798,18 @@ class DatabaseService:
         """
         if not username or not transaction_date_iso:
             return 0
+        key = canonical_username_key(username)
+        require_iso_business_date(transaction_date_iso)
+        self._assert_known_success_dates(key)
         row = self._conn.execute(
             """
             SELECT COALESCE(SUM(bonus), 0)
             FROM processed_transactions
-            WHERE username = ?
+            WHERE username_key = ?
               AND result = 'SUCCESS'
               AND timestamp_date = ?
             """,
-            (str(username).strip(), str(transaction_date_iso)),
+            (key, str(transaction_date_iso)),
         ).fetchone()
         return int(row[0] or 0) if row else 0
 

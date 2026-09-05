@@ -106,7 +106,7 @@ def test_retry_claim_atomically_creates_new_attempt_and_keeps_first_immutable(tm
     assert db.reserve_auto_retry_transaction("tx", "alice", DAY, 100_000, 10_000) is None
 
 
-@pytest.mark.parametrize("field,value", [("username", "ALICE"), ("amount", 50_000), ("day", "2025-08-02")])
+@pytest.mark.parametrize("field,value", [("username", "Alice2"), ("amount", 50_000), ("day", "2025-08-02")])
 def test_retry_source_mismatch_has_no_attempt_two_or_remote_call(tmp_path, field, value):
     db = DatabaseService(str(tmp_path / "db"))
     failed_once(db)

@@ -35,6 +35,7 @@ class QueueItem:
     timestamp: str = ""
     row_index: int = 0
     processed: bool = False
+    retry_attempt: bool = False
 
 
 @dataclass
@@ -81,13 +82,16 @@ class QueueManager:
         """
         rows = self.sheet.read_master_rows()
 
-        # Pre-filter: keep only tx_ids we haven't processed yet.
+        # Pre-filter: ordinary known transactions remain deduplicated, while
+        # the one strictly proven retry state is admitted as a distinct type.
         already = set()
+        retry_ids = set()
         tx_ids = [r.tx_id for r in rows]
         if tx_ids:
-            # `filter_new_tx_ids` returns the NEW ones; invert to get 'already'.
             new_set = self.db.filter_new_auto_tx_ids(tx_ids)
-            already = {t for t in tx_ids if t not in new_set}
+            known = {t for t in tx_ids if t not in new_set}
+            retry_ids = {t for t in known if self.db.is_auto_retry_eligible(t)}
+            already = known - retry_ids
         pending = [r for r in rows if r.tx_id not in already]
         batch = pending[: self.batch_size]
 
@@ -141,6 +145,7 @@ class QueueManager:
                 status=result.status,
                 timestamp=r.timestamp,
                 row_index=r.row_index,
+                retry_attempt=r.tx_id in retry_ids,
             )
             preview.append(item)
 

@@ -1899,8 +1899,28 @@ class Dashboard(QMainWindow):
         #   4. Submit adjustment.
         # ----------------------------------------------------------
 
-        # (1) SQLite duplicate protection — belt-and-braces vs pre-filter.
-        if self.db.has_known_auto_tx(item.tx_id):
+        # (1) SQLite duplicate protection — known and retryable are distinct.
+        # Queue eligibility is only a preview; the retry claim re-checks every
+        # durable guard atomically below.
+        if item.retry_attempt:
+            try:
+                retry_eligible = self.db.is_auto_retry_eligible(item.tx_id)
+            except Exception as exc:
+                self.logger.error(
+                    f"{item.username}  SAFE RETRY eligibility failed; worker halted: {exc}"
+                )
+                self.stop_requested = True
+                self._finalise_stop("Worker halted: AUTO retry database failure")
+                return
+            if not retry_eligible:
+                self.queue.mark_processed(item, False)
+                self.logger.info(f"{item.username}  SAFE RETRY no longer eligible - skipped")
+                self._refresh_stats()
+                if self.stop_requested:
+                    self._finalise_stop()
+                return
+            self.logger.info(f"{item.username}  SAFE RETRY attempt 2")
+        elif self.db.has_known_auto_tx(item.tx_id):
             self.queue.mark_processed(item, False)
             self.logger.info(f"{item.username}  tx {item.tx_id} already in DB - skipped")
             self._refresh_stats()
@@ -1982,12 +2002,19 @@ class Dashboard(QMainWindow):
         # the remote API is entered.  The atomic reservation performs its own
         # exposure check and may clamp a stale preview to the remaining quota.
         try:
-            reservation = self.db.reserve_auto_transaction(
-                tx_id=item.tx_id, username=item.username,
-                business_date=tx_date_iso, deposit_amount=item.amount,
-                requested_bonus=item.bonus, sheet_name=item.sheet_name,
-                source_timestamp=item.timestamp,
-            )
+            if item.retry_attempt:
+                reservation = self.db.reserve_auto_retry_transaction(
+                    tx_id=item.tx_id, username=item.username,
+                    business_date=tx_date_iso, deposit_amount=item.amount,
+                    requested_bonus=item.bonus,
+                )
+            else:
+                reservation = self.db.reserve_auto_transaction(
+                    tx_id=item.tx_id, username=item.username,
+                    business_date=tx_date_iso, deposit_amount=item.amount,
+                    requested_bonus=item.bonus, sheet_name=item.sheet_name,
+                    source_timestamp=item.timestamp,
+                )
         except Exception as exc:
             self.logger.error(
                 f"{item.username}  AUTO safety reservation failed; worker halted: {exc}"
@@ -1999,7 +2026,8 @@ class Dashboard(QMainWindow):
             # A concurrent committed/reserved award consumed the quota, or the
             # TX became known.  In either case no remote call is safe.
             self.queue.mark_processed(item, False)
-            self.logger.info(f"{item.username}  LIMIT/duplicate at atomic reservation - skipped")
+            marker = "SAFE RETRY source/journal mismatch, quota, or eligibility" if item.retry_attempt else "LIMIT/duplicate"
+            self.logger.info(f"{item.username}  {marker} at atomic reservation - skipped")
             self._refresh_stats()
             if self.stop_requested:
                 self._finalise_stop()

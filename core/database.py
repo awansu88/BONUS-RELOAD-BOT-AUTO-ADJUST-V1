@@ -184,6 +184,29 @@ class DatabaseService:
     def filter_new_auto_tx_ids(self, tx_ids: Iterable[str]) -> Set[str]:
         return {str(tx) for tx in tx_ids if tx and not self.has_known_auto_tx(str(tx))}
 
+    def is_auto_retry_eligible(self, tx_id: str) -> bool:
+        """Return whether durable state proves one bounded retry is safe.
+
+        This is deliberately separate from :meth:`has_known_auto_tx`: a retry
+        candidate remains a known transaction.  Absence of click evidence is
+        useful only when *both* journal records explicitly say that attempt
+        one failed before submission.
+        """
+        if not tx_id:
+            return False
+        row = self._conn.execute(
+            "SELECT 1 FROM auto_adjust_transactions t "
+            "JOIN auto_adjust_attempts a ON a.attempt_id=t.current_attempt_id "
+            "WHERE t.tx_id=? AND t.status='FAILED_NOT_SUBMITTED' "
+            "AND t.attempt_count=1 AND a.tx_id=t.tx_id AND a.attempt_no=1 "
+            "AND a.result='FAILED_NOT_SUBMITTED' AND a.click_crossed=0 "
+            "AND a.submit_clicked_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM processed_transactions p WHERE p.tx_id=t.tx_id) "
+            "LIMIT 1",
+            (str(tx_id),),
+        ).fetchone()
+        return row is not None
+
     def get_auto_transaction(self, tx_id: str):
         row = self._conn.execute(
             "SELECT * FROM auto_adjust_transactions WHERE tx_id=?", (str(tx_id),)
@@ -266,6 +289,83 @@ class DatabaseService:
             )
             self._conn.execute("COMMIT")
             return {"tx_id": str(tx_id), "attempt_id": attempt_id, "reserved_bonus": bonus}
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def reserve_auto_retry_transaction(
+        self, tx_id: str, username: str, business_date: str, deposit_amount: int,
+        requested_bonus: int, daily_limit: int = 10_000,
+    ) -> Optional[Dict]:
+        """Atomically re-prove safety, recompute quota, and create attempt two.
+
+        The original transaction and attempt are never rewritten.  Every
+        guard is evaluated while holding ``BEGIN IMMEDIATE`` so a queue
+        preview or competing worker cannot authorize a remote submission.
+        """
+        now = datetime.now().isoformat(timespec="seconds")
+        tx_id = str(tx_id)
+        key = str(username).strip()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            tx = self._conn.execute(
+                "SELECT t.username_key,t.business_date,t.deposit_amount,t.current_attempt_id "
+                "FROM auto_adjust_transactions t "
+                "JOIN auto_adjust_attempts a ON a.attempt_id=t.current_attempt_id "
+                "WHERE t.tx_id=? AND t.status='FAILED_NOT_SUBMITTED' "
+                "AND t.attempt_count=1 AND a.tx_id=t.tx_id AND a.attempt_no=1 "
+                "AND a.result='FAILED_NOT_SUBMITTED' AND a.click_crossed=0 "
+                "AND a.submit_clicked_at IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM processed_transactions p WHERE p.tx_id=t.tx_id)",
+                (tx_id,),
+            ).fetchone()
+            source_matches = tx is not None and (
+                key == tx[0]
+                and str(business_date) == tx[1]
+                and int(deposit_amount) == int(tx[2])
+            )
+            if not source_matches:
+                self._conn.execute("ROLLBACK")
+                return None
+
+            success = self._conn.execute(
+                "SELECT COALESCE(SUM(bonus),0) FROM processed_transactions "
+                "WHERE username=? AND timestamp_date=? AND result='SUCCESS'",
+                (tx[0], tx[1]),
+            ).fetchone()[0]
+            reserved = self._conn.execute(
+                "SELECT COALESCE(SUM(reserved_bonus),0) FROM auto_adjust_transactions "
+                "WHERE username_key=? AND business_date=? "
+                "AND status IN ('PENDING','SUBMITTING','UNKNOWN')",
+                (tx[0], tx[1]),
+            ).fetchone()[0]
+            bonus = min(
+                int(requested_bonus),
+                max(0, int(daily_limit) - int(success or 0) - int(reserved or 0)),
+            )
+            if bonus <= 0:
+                self._conn.execute("ROLLBACK")
+                return None
+
+            attempt_id = uuid.uuid4().hex
+            self._conn.execute(
+                "INSERT INTO auto_adjust_attempts "
+                "(attempt_id,tx_id,attempt_no,claimed_at,result,click_crossed,submission_phase) "
+                "VALUES (?,?,?,?, 'IN_PROGRESS',0,'RESERVED')",
+                (attempt_id, tx_id, 2, now),
+            )
+            cur = self._conn.execute(
+                "UPDATE auto_adjust_transactions SET current_attempt_id=?,attempt_count=2,"
+                "status='PENDING',reserved_bonus=?,updated_at=?,resolved_at=NULL "
+                "WHERE tx_id=? AND current_attempt_id=? AND attempt_count=1 "
+                "AND status='FAILED_NOT_SUBMITTED'",
+                (attempt_id, bonus, now, tx_id, tx[3]),
+            )
+            if cur.rowcount != 1:
+                raise sqlite3.IntegrityError("AUTO retry ownership changed")
+            self._conn.execute("COMMIT")
+            return {"tx_id": tx_id, "attempt_id": attempt_id, "reserved_bonus": bonus}
         except Exception:
             if self._conn.in_transaction:
                 self._conn.execute("ROLLBACK")

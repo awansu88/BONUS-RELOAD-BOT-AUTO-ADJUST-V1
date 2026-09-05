@@ -9,6 +9,7 @@ import pytest
 
 from core import database as database_module
 from core.database import DatabaseService
+from core.source_integrity import SourceIntegrityError
 from tests.test_patch00_auto_baseline import (
     queue as worker_queue,
     row as worker_row,
@@ -399,6 +400,104 @@ def test_worker_ledger_select_failure_halts_before_reservation_or_next_tx(
     assert db.get_auto_transaction("first") is None
     assert db.get_auto_transaction("next") is None
     assert manager.next_ready().tx_id == "first"
+
+
+def test_retry_source_mismatch_nonready_refill_fails_before_publish(tmp_path):
+    db, manager = worker_queue(
+        tmp_path, [worker_row("old", "bob", 50_000, timestamp=STAMP)]
+    )
+    old_stats = manager.refill()
+    old_preview = manager.preview_items()
+    old_ready = manager.next_ready()
+    old_cache = manager.cache.get_daily_bonus("bob")
+    failed_once(db)
+    attempt_one = db.get_auto_attempts("tx")[0]
+    manager.sheet.rows = [
+        worker_row("tx", "Alice", 49_999, timestamp=STAMP)
+    ]
+
+    with pytest.raises(sqlite3.IntegrityError, match="persistence refused"):
+        manager.refill()
+
+    assert manager.preview_items() == old_preview
+    assert manager.next_ready() is old_ready
+    assert manager.stats() is old_stats
+    assert manager.cache.get_daily_bonus("bob") == old_cache
+    assert db._conn.execute(
+        "SELECT 1 FROM processed_transactions WHERE tx_id='tx'"
+    ).fetchone() is None
+    assert db.get_auto_transaction("tx")["status"] == "FAILED_NOT_SUBMITTED"
+    assert db.get_auto_attempts("tx") == [attempt_one]
+    assert db.has_tx("tx") and db.is_auto_retry_eligible("tx")
+
+
+def test_mixed_terminal_refill_refusal_rolls_back_entire_database_batch(tmp_path):
+    db, manager = worker_queue(tmp_path, [])
+    manager.refill()
+    old_stats = manager.stats()
+    failed_once(db)
+    attempt_one = db.get_auto_attempts("tx")[0]
+    manager.sheet.rows = [
+        worker_row("new-invalid", "bob", 1, timestamp=STAMP),
+        worker_row("tx", "Alice", 49_999, timestamp=STAMP, index=2),
+    ]
+
+    with pytest.raises(sqlite3.IntegrityError, match="persistence refused"):
+        manager.refill()
+
+    assert manager.preview_items() == [] and manager.next_ready() is None
+    assert manager.stats() is old_stats
+    assert not db.has_tx("new-invalid")
+    assert db._conn.execute(
+        "SELECT 1 FROM processed_transactions WHERE tx_id IN ('new-invalid','tx')"
+    ).fetchone() is None
+    assert db.get_auto_transaction("tx")["status"] == "FAILED_NOT_SUBMITTED"
+    assert db.get_auto_attempts("tx") == [attempt_one]
+    assert db.has_tx("tx") and db.is_auto_retry_eligible("tx")
+
+
+def test_refill_rejects_short_terminal_bulk_persistence_count(tmp_path, monkeypatch):
+    db, manager = worker_queue(
+        tmp_path, [worker_row("old", "bob", 50_000, timestamp=STAMP)]
+    )
+    old_stats = manager.refill()
+    old_preview = manager.preview_items()
+    old_ready = manager.next_ready()
+    old_cache = manager.cache.get_daily_bonus("bob")
+    manager.sheet.rows = [
+        worker_row("terminal", "Alice", 1, timestamp=STAMP)
+    ]
+    monkeypatch.setattr(db, "bulk_insert", lambda rows, **kwargs: len(rows) - 1)
+
+    with pytest.raises(SourceIntegrityError, match="persistence incomplete"):
+        manager.refill()
+
+    assert manager.preview_items() == old_preview
+    assert manager.next_ready() is old_ready
+    assert manager.stats() is old_stats
+    assert manager.cache.get_daily_bonus("bob") == old_cache
+    assert not db.has_tx("terminal")
+
+
+def test_exact_match_retry_terminal_refill_publishes_only_after_closure(tmp_path):
+    db, manager = worker_queue(
+        tmp_path, [worker_row("tx", "Alice", 100_000, timestamp=STAMP)]
+    )
+    failed_once(db)
+    attempt_one = db.get_auto_attempts("tx")[0]
+    manager.cache.set_manual({"alice"})
+
+    stats = manager.refill()
+
+    assert stats.skipped == 1 and stats.manual == 1 and stats.ready == 0
+    assert manager.preview_items()[0].status == "MANUAL BONUS"
+    assert manager.next_ready() is None
+    assert db._conn.execute(
+        "SELECT result FROM processed_transactions WHERE tx_id='tx'"
+    ).fetchone() == ("MANUAL BONUS",)
+    assert db.get_auto_transaction("tx")["status"] == "MANUAL BONUS"
+    assert db.get_auto_attempts("tx") == [attempt_one]
+    assert not db.is_auto_retry_eligible("tx")
 
 
 def test_unknown_and_success_remain_known_without_processed_history(tmp_path):

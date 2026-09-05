@@ -200,7 +200,13 @@ class QueueManager:
 
         # Persist all non-READY outcomes in ONE SQLite call.
         if skip_rows:
-            self.db.bulk_insert(skip_rows)
+            expected = sum(1 for row in skip_rows if row[0])
+            persisted = self.db.bulk_insert(skip_rows, require_all=True)
+            if persisted != expected:
+                raise SourceIntegrityError(
+                    "terminal TX batch persistence incomplete: "
+                    f"expected {expected}, persisted {persisted}"
+                )
             stats.skipped = len(skip_rows)
 
         # Publish all externally visible in-memory state only after the whole

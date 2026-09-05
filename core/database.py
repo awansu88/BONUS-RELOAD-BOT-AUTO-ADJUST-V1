@@ -826,7 +826,7 @@ class DatabaseService:
                 self._conn.execute("ROLLBACK")
             raise
 
-    def bulk_insert(self, rows: List[Tuple]) -> int:
+    def bulk_insert(self, rows: List[Tuple], *, require_all: bool = False) -> int:
         """Rows: (tx_id, username, amount, bonus, result, sheet_name, timestamp)."""
         if not rows:
             return 0
@@ -855,7 +855,12 @@ class DatabaseService:
             for item in payload:
                 if not item[0]:
                     continue
-                if self._persist_processed_with_dedup(item):
+                persisted = self._persist_processed_with_dedup(item)
+                if require_all and not persisted:
+                    raise sqlite3.IntegrityError(
+                        f"required terminal TX persistence refused for {item[0]!r}"
+                    )
+                if persisted:
                     inserted += 1
             self._conn.execute("COMMIT")
             return inserted

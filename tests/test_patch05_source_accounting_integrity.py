@@ -281,7 +281,10 @@ def test_bulk_insert_failure_does_not_publish_cache_or_queue(monkeypatch, tmp_pa
     today = date.today().isoformat()
     feed.rows = [row("good", "Alice", timestamp=today),
                  row("skip", "Bob", amount=1, timestamp=today, index=3)]
-    monkeypatch.setattr(db, "bulk_insert", lambda _: (_ for _ in ()).throw(OSError("disk")))
+    monkeypatch.setattr(
+        db, "bulk_insert",
+        lambda _, **__: (_ for _ in ()).throw(OSError("disk")),
+    )
     with pytest.raises(OSError, match="disk"):
         q.refill()
     assert cache.get_daily_bonus("Alice") == 0

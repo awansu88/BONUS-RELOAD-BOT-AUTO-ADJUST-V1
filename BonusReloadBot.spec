@@ -6,9 +6,10 @@ Two goals:
     1. Bundle the Playwright Chromium build so the .exe works on a
        Windows PC that has no Python / no Playwright / no Chromium
        installed anywhere.
-    2. Keep every writable file (config/, credentials/, logs/,
-       screenshots/, processed.db, browser_profile_bonus_reload/)
-       *next to* the .exe rather than inside `_internal/`.
+    2. Bundle only read-only bootstrap templates.  Writable production data
+       belongs in %LOCALAPPDATA%\BonusReloadBot and is never packaged beside
+       the executable (no database, real credentials, profile, logs,
+       screenshots, or runtime state).
 
 Prerequisite (see build_portable.bat):
     * `pw-browsers/` must sit next to this spec BEFORE running PyInstaller.
@@ -68,6 +69,7 @@ hiddenimports = [
     "core.maintenance",
     "core.config_validator",
     "core.crash_state",
+    "core.runtime_paths",
     "ui.dashboard",
     "ui.maintenance_center",
     "gspread",

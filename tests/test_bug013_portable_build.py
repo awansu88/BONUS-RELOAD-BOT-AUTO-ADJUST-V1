@@ -5,9 +5,8 @@ We cannot execute a Windows .exe on Linux, but we CAN prove the source-
 side wiring is correct:
 
   * `main.py` sets PLAYWRIGHT_BROWSERS_PATH before any Playwright import.
-  * `_ensure_runtime_layout()` creates every required folder next to the
-    fake .exe (frozen mode) and seeds `config/` from the bundle when
-    missing.
+  * persistent writable folders are prepared under LOCALAPPDATA, never next
+    to the fake executable.
   * `BonusReloadBot.spec` bundles `pw-browsers/`, `config/`,
     `service_account.json.example`.
 
@@ -18,9 +17,8 @@ Checklist in HARDENING_REPORT_v1.1.md.
 
 from __future__ import annotations
 
-import importlib
+import json
 import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -44,6 +42,7 @@ def frozen_bundle(tmp_path, monkeypatch):
     (resource / "pw-browsers" / "chromium.marker").write_text("ok")
     (resource / "config").mkdir()
     (resource / "config" / "config.json").write_text('{"panel_url": ""}')
+    (resource / "config" / "selectors.json").write_text('{}')
     (resource / "credentials").mkdir()
     (resource / "credentials" / "service_account.json.example").write_text("{}")
 
@@ -56,42 +55,38 @@ def frozen_bundle(tmp_path, monkeypatch):
     # Clean any env var that would mask the test.
     monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
     monkeypatch.delenv("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", raising=False)
-    yield app, resource
+    monkeypatch.delenv("BONUS_RELOAD_DATA_DIR", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    yield app, resource, tmp_path / "local" / "BonusReloadBot"
 
 
 def test_frozen_layout_seeds_folders(frozen_bundle):
-    app, resource = frozen_bundle
-    # `main` imports PySide6 for the GUI shell. Skip the full-import
-    # variant when PySide6 isn't available on the CI host; the folder-
-    # seeding logic itself is exercised by the smaller `_ensure_runtime_layout`
-    # test below.
-    pytest.importorskip("PySide6")
+    app, resource, data = frozen_bundle
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    boot_end = src.index("# Now the app can import Playwright/Qt safely.")
+    ns: dict = {"__name__": "main_isolated"}
+    exec(compile(src[:boot_end], str(ROOT / "main.py"), "exec"), ns)
 
-    # Import main fresh in this environment.
-    sys.modules.pop("main", None)
-    main = importlib.import_module("main")  # noqa: F841
-
-    # The bootstrap ran at import-time.
+    # Playwright bootstrap ran at import-time; writable layout is explicit.
     assert Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"]) == resource / "pw-browsers"
     assert os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] == "1"
 
+    runtime_paths = ns["_resolve_startup_paths"]()
+    ns["prepare_config"](runtime_paths)
+    config = json.loads(runtime_paths.config_path.read_text())
+    ns["prepare_runtime"](runtime_paths, config)
     for sub in ("logs", "screenshots", "credentials", "browser_profile_bonus_reload"):
-        assert (app / sub).is_dir(), f"missing runtime folder: {sub}"
+        assert (data / sub).is_dir()
+        assert not (app / sub).exists()
+    assert (data / "config" / "config.json").exists()
+    assert (data / "credentials" / "service_account.json.example").exists()
 
-    # config/ was seeded from the bundle
-    assert (app / "config" / "config.json").exists()
-    # placeholder credentials copied
-    assert (app / "credentials" / "service_account.json.example").exists()
-
-    # Clean up singleton logger the bootstrap may have created.
-    from core.logger import AppLogger
-    AppLogger.reset()
 
 
 def test_frozen_layout_seeds_folders_without_pyside(frozen_bundle, monkeypatch):
     """PySide6-free variant that just exercises the runtime-layout logic
     from `main._ensure_runtime_layout` + `_prime_playwright_env`."""
-    app, resource = frozen_bundle
+    app, resource, data = frozen_bundle
 
     # Extract the two bootstrap helpers with a tiny AST-free re-import.
     import importlib.util
@@ -107,13 +102,15 @@ def test_frozen_layout_seeds_folders_without_pyside(frozen_bundle, monkeypatch):
     ns: dict = {"__name__": "main_isolated"}
     exec(compile(boot_src, str(ROOT / "main.py"), "exec"), ns)
 
-    # After the bootstrap block executed, environment + folders must exist.
+    # Import bootstrap only primes bundled Chromium and resolves stable paths;
+    # it never writes production state beside the executable.
     assert Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"]) == resource / "pw-browsers"
     assert os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] == "1"
-    for sub in ("logs", "screenshots", "credentials", "browser_profile_bonus_reload"):
-        assert (app / sub).is_dir(), f"missing runtime folder: {sub}"
-    assert (app / "config" / "config.json").exists()
-    assert (app / "credentials" / "service_account.json.example").exists()
+    runtime_paths = ns["_resolve_startup_paths"]()
+    ns["prepare_config"](runtime_paths)
+    ns["prepare_runtime"](runtime_paths, {"browser": {}})
+    assert data.is_dir()
+    assert not (app / "config").exists()
 
 
 def test_spec_bundles_required_assets():
@@ -135,7 +132,6 @@ def test_build_bat_installs_chromium_into_local_pw_browsers():
     assert "PLAYWRIGHT_BROWSERS_PATH=%CD%\\pw-browsers" in bat
     assert "python -m playwright install chromium" in bat
     assert "pyinstaller" in bat.lower()
-    # Seeds runtime folders next to the .exe (never bundled inside _internal).
-    for sub in ("config", "credentials", "logs", "screenshots",
-                "browser_profile_bonus_reload"):
-        assert sub in bat, f"build_portable.bat should seed {sub}/"
+    assert "%%LOCALAPPDATA%%\\BonusReloadBot" in bat
+    assert 'mkdir "%OUT%\\logs"' not in bat
+    assert "processed.db" in bat  # explicit warning not to deploy production state

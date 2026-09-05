@@ -115,6 +115,15 @@ class PanelService:
         except Exception:
             return False
 
+    def _context_is_alive(self) -> bool:
+        if self._context is None:
+            return False
+        try:
+            _ = self._context.pages
+            return True
+        except Exception:
+            return False
+
     def _dispose(self) -> None:
         """Drop dead references so the next open_panel() starts fresh."""
         self._attached = False
@@ -142,7 +151,7 @@ class PanelService:
             raise ValueError("Panel URL must start with http:// or https://")
 
         # If a previous context died (operator closed the window), drop it.
-        if self._context is not None and not self.is_alive():
+        if self._context is not None and not self._context_is_alive():
             self._dispose()
 
         if self._context is None:
@@ -177,6 +186,35 @@ class PanelService:
         if pages:
             self._page = pages[-1]
         self._attached = True
+
+    def probe_auto_panel_ready(self) -> None:
+        """Verify AUTO can use the panel without mutating the form.
+
+        This deliberately performs only a bounded selector visibility check.
+        In particular it does not focus, fill, inspect values, or submit any
+        field.  A login page therefore remains available to the operator but
+        is not reported as a recovered AUTO panel.
+        """
+        if not self.is_alive() or not self._page:
+            raise RuntimeError("panel page is not usable")
+        username = self.selectors["panel"]["username"]
+        field_wait = int(self.timeouts.get("field_wait_ms", 8000))
+        self._page.wait_for_selector(username, timeout=field_wait, state="visible")
+
+    def recover_auto_panel(self) -> None:
+        """Restore and verify AUTO browser infrastructure only.
+
+        ``open_panel`` owns defensive disposal/relaunch and always uses the
+        configured persistent profile.  Attaching and readiness probing are
+        intentionally separate from every financial form helper.
+        """
+        self.open_panel(self.panel_url)
+        self.attach()
+        try:
+            self.probe_auto_panel_ready()
+        except Exception:
+            self._attached = False
+            raise
 
     # ------------------------------------------------------------------
     def submit_deposit(self, user_id: str, bonus: int, remark: str) -> SubmitResult:

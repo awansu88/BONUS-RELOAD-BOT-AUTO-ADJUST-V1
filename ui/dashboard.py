@@ -696,16 +696,15 @@ class Dashboard(QMainWindow):
         # dead; try one gentle reopen using the persistent profile so
         # cookies survive.
         if (
-            self._auto_recover_panel
-            and self._panel_was_open
+            self._panel_was_open
             and not self.panel.is_alive()
             and self.state in ("running", "monitoring")
         ):
-            self._enter_panel_recovery("watchdog detected panel loss")
+            self._handle_active_panel_loss("watchdog detected panel loss")
 
     def _attempt_panel_recovery(self) -> None:
         """Compatibility entry point for the single AUTO recovery owner."""
-        self._enter_panel_recovery("panel unavailable")
+        self._handle_active_panel_loss("panel unavailable")
 
     def _restore_previous_state(self) -> None:
         """B-8: reinstate the last spreadsheet URL / window geometry
@@ -1648,7 +1647,7 @@ class Dashboard(QMainWindow):
             return
         # Defer while worker is actively processing to avoid extra Google API
         # requests during a run. Refresh will fire once the queue is drained.
-        if self.state == "running":
+        if self.state in ("running", "recovering"):
             self._manual_refresh_pending = True
             return
         try:
@@ -1741,7 +1740,7 @@ class Dashboard(QMainWindow):
         if self._panel_was_open and not alive:
             self._panel_was_open = False
             if self.state in ("running", "monitoring"):
-                self._enter_panel_recovery("panel liveness check failed")
+                self._handle_active_panel_loss("panel liveness check failed")
             else:
                 self._on_panel_lost()
                 if self.queue is not None:
@@ -1755,7 +1754,7 @@ class Dashboard(QMainWindow):
         traffic minimal."""
         if self.manual_state.mode is OperatingMode.MANUAL or self.queue is None:
             return
-        if self.state == "running":
+        if self.state in ("running", "recovering"):
             QMessageBox.information(
                 self,
                 "Worker is running",
@@ -1864,8 +1863,8 @@ class Dashboard(QMainWindow):
 
         # If the operator closed the browser mid-run, bail cleanly.
         if not self.panel.is_alive():
-            if hasattr(self, "_enter_panel_recovery"):
-                self._enter_panel_recovery("browser closed before next transaction")
+            if hasattr(self, "_handle_active_panel_loss"):
+                self._handle_active_panel_loss("browser closed before next transaction")
             else:  # compatibility for minimal non-Qt worker test hosts
                 self._on_panel_lost()
                 self._finalise_stop("Worker halted: browser closed")
@@ -2098,8 +2097,8 @@ class Dashboard(QMainWindow):
             if self.stop_requested:
                 self._finalise_stop()
             elif (not self.panel.is_alive()
-                  and hasattr(self, "_enter_panel_recovery")):
-                self._enter_panel_recovery("panel lost after durable UNKNOWN")
+                  and hasattr(self, "_handle_active_panel_loss")):
+                self._handle_active_panel_loss("panel lost after durable UNKNOWN")
             return
         submit_duration = time.monotonic() - submit_start
         self._submit_duration_sum += submit_duration
@@ -2147,8 +2146,8 @@ class Dashboard(QMainWindow):
             self.logger.error(f"{item.username}  FAILED_NOT_SUBMITTED  {result.detail}")
             if result.accounting_error:
                 self.stop_requested = True
-            elif self.state != "stopping" and hasattr(self, "_enter_panel_recovery"):
-                self._enter_panel_recovery(
+            elif self.state != "stopping" and hasattr(self, "_handle_active_panel_loss"):
+                self._handle_active_panel_loss(
                     f"pre-click panel failure: {result.detail or result.phase}"
                 )
         else:
@@ -2175,8 +2174,8 @@ class Dashboard(QMainWindow):
                 self.stop_requested = True
 
             if (not result.accounting_error and not self.panel.is_alive()
-                    and hasattr(self, "_enter_panel_recovery")):
-                self._enter_panel_recovery("panel lost after durable UNKNOWN")
+                    and hasattr(self, "_handle_active_panel_loss")):
+                self._handle_active_panel_loss("panel lost after durable UNKNOWN")
 
         self.current_item = None
         self._refresh_metrics()
@@ -2256,9 +2255,23 @@ class Dashboard(QMainWindow):
         self.eta_label.setText(f"Next Refresh {m:02d}:{s:02d}")
 
     # ---------------- AUTO panel recovery ----------------
+    def _handle_active_panel_loss(self, reason: str) -> None:
+        """Apply the configured AUTO panel-loss policy at a safe boundary."""
+        if self.state not in ("running", "monitoring"):
+            return
+        if self._auto_recover_panel:
+            self._enter_panel_recovery(reason)
+            return
+        self._on_panel_lost()
+        self.stop_requested = True
+        self._finalise_stop(f"Worker halted: {reason} (panel recovery disabled)")
+
     def _enter_panel_recovery(self, reason: str) -> None:
         """Start the one non-blocking infrastructure ladder, if eligible."""
         if self._recovery_active:
+            return
+        if not self._auto_recover_panel:
+            self._handle_active_panel_loss(reason)
             return
         if self.manual_state.mode is OperatingMode.MANUAL:
             return
@@ -2375,7 +2388,7 @@ class Dashboard(QMainWindow):
             self.logger.info("Settings updated")
 
     def _open_database(self) -> None:
-        running = self.state in ("running", "monitoring", "stopping")
+        running = self.state in ("running", "monitoring", "recovering", "stopping")
         dlg = DatabaseDialog(self.db, worker_running=running, parent=self)
         dlg.exec()
 
@@ -2385,7 +2398,7 @@ class Dashboard(QMainWindow):
         # (ui.maintenance_center imports from core.* only).
         from ui.maintenance_center import MaintenanceCenter
 
-        running = self.state in ("running", "monitoring", "stopping")
+        running = self.state in ("running", "monitoring", "recovering", "stopping")
         dlg = MaintenanceCenter(
             parent=self,
             maintenance=self.maintenance_service,
@@ -2434,8 +2447,9 @@ class Dashboard(QMainWindow):
     def closeEvent(self, event) -> None:
         # v1.2 B-7: graceful shutdown checklist.
         # Stop timers first so nothing races us.
+        self._cancel_panel_recovery()
         for name in (
-            "manual_timer", "worker_timer", "panel_timer",
+            "manual_timer", "worker_timer", "recovery_timer", "panel_timer",
             "metrics_timer", "watchdog_timer",
             "manual_worker_timer", "manual_heartbeat_timer",
         ):

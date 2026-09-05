@@ -11,7 +11,8 @@ from core.panel_service import PanelService
 from core.recovery import DEFAULT_LADDER
 from ui.manual_adjust_state import OperatingMode
 sys.path.insert(0, str(Path(__file__).parent))
-from test_patch00_auto_baseline import dashboard_method
+from test_patch00_auto_baseline import (dashboard_method, queue, row, run_worker,
+                                        worker_dashboard)
 
 
 SELECTORS = {
@@ -151,6 +152,7 @@ def recovery_host(outcomes, state="running"):
         dot_panel=Dot(), dot_bot=Dot(), txt_panel=Label(), txt_bot=Label(),
         btn_start=SimpleNamespace(setEnabled=lambda *_: None),
         _panel_was_open=False, _set_dot=lambda *_: None,
+        _auto_recover_panel=True,
     )
     globals_ = {"DEFAULT_LADDER": DEFAULT_LADDER, "OperatingMode": OperatingMode,
                 "time": __import__("time")}
@@ -158,6 +160,7 @@ def recovery_host(outcomes, state="running"):
     host._cancel_panel_recovery = bind("_cancel_panel_recovery")
     host._run_panel_recovery_attempt = bind("_run_panel_recovery_attempt")
     host._enter_panel_recovery = bind("_enter_panel_recovery")
+    host._handle_active_panel_loss = bind("_handle_active_panel_loss")
     return host, calls
 
 
@@ -209,3 +212,206 @@ def test_recovery_source_has_no_blocking_sleep_or_financial_calls():
     assert "sleep" not in names
     source_names = PanelService.recover_auto_panel.__code__.co_names
     assert not {"submit_deposit", "submit_deposit_classified", "submit_adjustment", "_fill"} & set(source_names)
+
+
+def attach_recovery(worker, *, enabled=True):
+    """Bind the shipped recovery methods to the established worker test host."""
+    worker._auto_recover_panel = enabled
+    worker._recovery_active = False
+    worker._recovery_reason = ""
+    worker._recovery_resume_state = None
+    worker._recovery_attempt_index = 0
+    worker._recovery_next_due = None
+    worker._recovery_last_error = ""
+    worker.recovery_timer = Timer()
+    worker.dot_panel = worker.dot_bot = Dot()
+    worker.txt_panel = worker.txt_bot = Label()
+    worker.btn_start = SimpleNamespace(setEnabled=lambda *_: None)
+    worker._set_dot = lambda *_: None
+    worker._panel_was_open = True
+    globals_ = {"DEFAULT_LADDER": DEFAULT_LADDER, "OperatingMode": OperatingMode,
+                "time": __import__("time")}
+    for name in ("_cancel_panel_recovery", "_run_panel_recovery_attempt",
+                 "_enter_panel_recovery", "_handle_active_panel_loss"):
+        setattr(worker, name, dashboard_method(name, globals_).__get__(worker))
+
+
+def test_worker_pre_transaction_loss_recovers_before_queue_or_reservation(tmp_path):
+    db, manager = queue(tmp_path, [row("TX-A", "alice", 50_000)])
+    manager.refill()
+    alive = {"value": False}
+    submits, recoveries = [], []
+    panel = SimpleNamespace(
+        is_alive=lambda: alive["value"], is_attached=True,
+        recover_auto_panel=lambda: recoveries.append(1),
+        submit_deposit_classified=lambda **kw: submits.append(kw),
+    )
+    worker, _, _ = worker_dashboard(db, manager, panel=panel)
+    attach_recovery(worker)
+    run_worker(worker)
+    assert worker.state == "running" and recoveries == [1]
+    assert manager.next_ready().tx_id == "TX-A"
+    assert db.get_auto_transaction("TX-A") is None and submits == []
+
+    alive["value"] = True
+    panel.submit_deposit_classified = lambda phase_hook=None, **kw: (
+        submits.append(kw) or phase_hook("CLICK_RETURNED") or
+        SimpleNamespace(outcome="SUCCESS", detail="", phase="SUCCESS_OBSERVED",
+                        evidence="", click_crossed=True, accounting_error=False)
+    )
+    run_worker(worker)
+    assert len(submits) == 1
+    assert db.get_auto_transaction("TX-A")["attempt_count"] == 1
+
+
+def test_worker_disabled_recovery_stops_before_consuming_ready_item(tmp_path):
+    db, manager = queue(tmp_path, [row("TX-A", "alice", 50_000)])
+    manager.refill()
+    panel = SimpleNamespace(is_alive=lambda: False, is_attached=False,
+                            recover_auto_panel=lambda: pytest.fail("recovery ran"))
+    worker, _, finalised = worker_dashboard(db, manager, panel=panel)
+    attach_recovery(worker, enabled=False)
+    worker._on_panel_lost = lambda: None
+    worker._finalise_stop = lambda note="": (finalised.append(note), setattr(worker, "state", "idle"))
+    run_worker(worker)
+    assert worker.state == "idle"
+    assert finalised and db.get_auto_transaction("TX-A") is None
+    assert manager.next_ready().tx_id == "TX-A" and not worker._recovery_active
+
+
+def test_monitoring_loss_recovers_without_refill_or_metric_reset(tmp_path):
+    db, manager = queue(tmp_path, [])
+    manager.refill()
+    calls = []
+    panel = SimpleNamespace(is_alive=lambda: False, is_attached=True,
+                            recover_auto_panel=lambda: calls.append("recover"))
+    worker, _, _ = worker_dashboard(db, manager, panel=panel, state="monitoring")
+    worker._processed_count = 7
+    attach_recovery(worker)
+    worker._handle_active_panel_loss("dead")
+    assert worker.state == "monitoring" and calls == ["recover"]
+    assert worker._processed_count == 7 and manager.ready_count() == 0
+
+
+def test_fns_is_durable_before_recovery_and_has_no_same_step_retry(tmp_path):
+    db, manager = queue(tmp_path, [row("TX-A", "alice", 50_000)])
+    manager.refill()
+    events, submits = [], []
+    original = db.finalize_auto_failed_not_submitted
+    db.finalize_auto_failed_not_submitted = lambda *a, **kw: (
+        events.append("finalize") or original(*a, **kw))
+    panel = SimpleNamespace(
+        is_alive=lambda: True, is_attached=True,
+        recover_auto_panel=lambda: events.append("recover"),
+        submit_deposit_classified=lambda **kw: submits.append(1) or
+            SimpleNamespace(outcome="FAILED_NOT_SUBMITTED", detail="selector timeout",
+                            phase="FAILED_PRE_CLICK", evidence="", click_crossed=False,
+                            accounting_error=False),
+    )
+    worker, _, _ = worker_dashboard(db, manager, panel=panel)
+    attach_recovery(worker)
+    run_worker(worker)
+    assert events == ["finalize", "recover"] and submits == [1]
+    assert db.get_auto_transaction("TX-A")["attempt_count"] == 1
+    assert db.is_auto_retry_eligible("TX-A")
+
+
+@pytest.mark.parametrize("outcome", ["FAILED_NOT_SUBMITTED", "UNKNOWN_AFTER_SUBMIT"])
+def test_accounting_error_hard_stops_without_recovery(tmp_path, outcome):
+    db, manager = queue(tmp_path, [row("TX-A", "alice", 50_000)])
+    manager.refill()
+    recoveries = []
+    alive = {"value": True}
+    def accounting_result(**kw):
+        alive["value"] = False
+        return SimpleNamespace(
+            outcome=outcome, detail="database phase failed", phase="FAILED_PRE_CLICK",
+            evidence="", click_crossed=outcome != "FAILED_NOT_SUBMITTED",
+            accounting_error=True)
+    panel = SimpleNamespace(
+        is_alive=lambda: alive["value"], is_attached=True,
+        recover_auto_panel=lambda: recoveries.append(1),
+        submit_deposit_classified=accounting_result,
+    )
+    worker, _, finalised = worker_dashboard(db, manager, panel=panel)
+    attach_recovery(worker)
+    run_worker(worker)
+    assert finalised and recoveries == []
+
+
+def test_unknown_is_durable_and_nonretryable_before_future_recovery(tmp_path):
+    db, manager = queue(tmp_path, [row("TX-A", "alice", 100_000)])
+    manager.refill()
+    alive, events = {"value": True}, []
+    def submit(**kw):
+        alive["value"] = False
+        events.append("submit")
+        return SimpleNamespace(outcome="UNKNOWN_AFTER_SUBMIT", detail="ambiguous",
+                               phase="CLICK_UNCERTAIN", evidence="", click_crossed=False,
+                               accounting_error=False)
+    panel = SimpleNamespace(is_alive=lambda: alive["value"], is_attached=True,
+                            recover_auto_panel=lambda: events.append("recover"),
+                            submit_deposit_classified=submit)
+    worker, _, _ = worker_dashboard(db, manager, panel=panel)
+    attach_recovery(worker)
+    run_worker(worker)
+    tx = db.get_auto_transaction("TX-A")
+    assert events == ["submit", "recover"]
+    assert tx["status"] == "UNKNOWN" and tx["resolved_at"] is None
+    assert tx["attempt_count"] == 1 and not db.is_auto_retry_eligible("TX-A")
+
+
+@pytest.mark.parametrize("delay_index", [1, 4])
+def test_stop_at_recovery_ladder_positions_cancels_without_finance(delay_index):
+    host, calls = recovery_host([RuntimeError("offline")] * 6)
+    final = []
+    host.stop_requested = False
+    host._finalise_stop = lambda note: final.append(note)
+    host._on_stop = dashboard_method("_on_stop", {"OperatingMode": OperatingMode}).__get__(host)
+    host._enter_panel_recovery("dead")
+    while host._recovery_attempt_index < delay_index:
+        host._run_panel_recovery_attempt()
+    host._on_stop()
+    before = len(calls)
+    host._run_panel_recovery_attempt()
+    assert len(calls) == before and final == ["STOP requested during panel recovery"]
+
+
+def test_recovering_is_active_for_database_and_maintenance(monkeypatch):
+    seen = []
+    class Dialog:
+        def __init__(self, *a, **kw): seen.append(kw["worker_running"])
+        def exec(self): pass
+    host = SimpleNamespace(state="recovering", db=object(), maintenance_service=object(),
+        health_monitor=object(), app_dir=Path("."), resource_dir=Path("."),
+        config_path=Path("config.json"), credentials_path=Path("credentials.json"),
+        config={"browser": {}}, selectors={})
+    dashboard_method("_open_database", {"DatabaseDialog": Dialog})(host)
+    monkeypatch.setitem(sys.modules, "ui.maintenance_center",
+                        SimpleNamespace(MaintenanceCenter=Dialog))
+    host.db = SimpleNamespace(path="db.sqlite")
+    dashboard_method("_open_maintenance_center", {"Path": Path})(host)
+    assert seen == [True, True]
+
+
+def test_close_event_cancels_recovery_before_checkpoint_and_panel_close():
+    events = []
+    timer = Timer(); timer.start(5000)
+    host = SimpleNamespace(
+        recovery_timer=timer, _recovery_active=True, _recovery_reason="dead",
+        _recovery_resume_state="running", _recovery_attempt_index=1,
+        _recovery_next_due=1.0, _recovery_last_error="offline",
+        manual_controller=None,
+        db=SimpleNamespace(checkpoint_wal=lambda *_: events.append("checkpoint")),
+        panel=SimpleNamespace(close=lambda: events.append("panel-close")),
+        _persist_crash_state=lambda **kw: events.append("persist"),
+    )
+    for name in ("manual_timer", "worker_timer", "panel_timer", "metrics_timer",
+                 "watchdog_timer", "manual_worker_timer", "manual_heartbeat_timer"):
+        setattr(host, name, Timer())
+    host._cancel_panel_recovery = dashboard_method("_cancel_panel_recovery").__get__(host)
+    event = SimpleNamespace(accept=lambda: events.append("accept"))
+    with pytest.raises(RuntimeError, match="__class__ cell"):
+        dashboard_method("closeEvent", {"QTimer": Timer})(host, event)
+    assert not timer.active and not host._recovery_active
+    assert events[:3] == ["checkpoint", "panel-close", "persist"]

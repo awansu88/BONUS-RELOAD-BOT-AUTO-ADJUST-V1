@@ -188,6 +188,44 @@ def panel_with(page):
     return panel
 
 
+def worker_dashboard(db, manager, *, panel=None, state="running", refresh=None):
+    """Minimal non-visual host for the actual shipped ``_worker_step`` body."""
+    label = lambda: SimpleNamespace(setText=lambda *_: None, setStyleSheet=lambda *_: None)
+    submits = []
+    if panel is None:
+        panel = SimpleNamespace(
+            is_alive=lambda: True,
+            submit_deposit=lambda **values: (
+                submits.append(values) or SimpleNamespace(ok=True, detail="")
+            ),
+        )
+    cache = MemoryCache()
+    finalised = []
+    dashboard = SimpleNamespace(
+        manual_state=SimpleNamespace(mode=object()), worker_timer=SimpleNamespace(stop=lambda: None),
+        queue=manager, panel=panel, db=db, cache=cache, validator=Validator(RULES),
+        logger=SimpleNamespace(info=lambda *_: None, error=lambda *_: None, warn=lambda *_: None),
+        state=state, stop_requested=False, config={"remark": "BONUS RELOAD AUTO"},
+        current_item=None, cur_user=label(), cur_deposit=label(), cur_bonus=label(), cur_status=label(),
+        _submit_duration_sum=0.0, _submit_duration_count=0, _processed_count=0,
+        _bonus_paid_total=0, _refresh_manual_list_now=refresh or (lambda: None),
+        _refresh_metrics=lambda: None, _refresh_stats=lambda: None,
+        _on_panel_lost=lambda: None,
+        _finalise_stop=lambda note="Worker stopped": finalised.append(note),
+        _enter_monitoring=lambda **_: setattr(dashboard, "state", "monitoring"),
+        _exit_monitoring=lambda: setattr(dashboard, "state", "running"),
+        _tick_monitoring=lambda: None, _save_screenshot=lambda *_: None,
+    )
+    return dashboard, submits, finalised
+
+
+def run_worker(dashboard):
+    mode = SimpleNamespace(MANUAL=object())
+    dashboard_method(
+        "_worker_step", {"OperatingMode": mode, "time": __import__("time")}
+    )(dashboard)
+
+
 def test_normal_auto_panel_sequence_and_frozen_defaults():
     page = Page()
     result = panel_with(page).submit_deposit("alice", 5_000, "BONUS RELOAD AUTO")
@@ -207,35 +245,114 @@ def test_normal_auto_panel_sequence_and_frozen_defaults():
 def test_auto_worker_success_persists_after_real_panel_call(tmp_path):
     db, manager = queue(tmp_path, [row("success", "alice", 50_000)])
     manager.refill()
-    submits = []
-    panel = SimpleNamespace(
-        is_alive=lambda: True,
-        submit_deposit=lambda **values: (
-            submits.append(values) or SimpleNamespace(ok=True, detail="")
-        ),
-    )
-    label = lambda: SimpleNamespace(setText=lambda *_: None, setStyleSheet=lambda *_: None)
-    mode = SimpleNamespace(MANUAL=object())
-    fake = SimpleNamespace(
-        manual_state=SimpleNamespace(mode=object()), worker_timer=SimpleNamespace(stop=lambda: None),
-        queue=manager, panel=panel, db=db, cache=MemoryCache(), validator=Validator(RULES),
-        logger=SimpleNamespace(info=lambda *_: None, error=lambda *_: None, warn=lambda *_: None),
-        state="running", stop_requested=False, config={"remark": "BONUS RELOAD AUTO"},
-        current_item=None, cur_user=label(), cur_deposit=label(), cur_bonus=label(), cur_status=label(),
-        _submit_duration_sum=0.0, _submit_duration_count=0, _processed_count=0,
-        _bonus_paid_total=0, _refresh_manual_list_now=lambda: None,
-        _refresh_metrics=lambda: None, _refresh_stats=lambda: None,
-        _on_panel_lost=lambda: None, _finalise_stop=lambda *_: None,
-        _enter_monitoring=lambda **_: None, _exit_monitoring=lambda: None,
-        _tick_monitoring=lambda: None, _save_screenshot=lambda *_: None,
-    )
-    worker_step = dashboard_method("_worker_step", {"OperatingMode": mode, "time": __import__("time")})
-    worker_step(fake)
+    fake, submits, _ = worker_dashboard(db, manager)
+    run_worker(fake)
     assert submits == [{"user_id": "alice", "bonus": 5_000, "remark": "BONUS RELOAD AUTO"}]
     assert db._conn.execute(
         "SELECT bonus, result FROM processed_transactions WHERE tx_id='success'"
     ).fetchone() == (5_000, "SUCCESS")
     assert fake._processed_count == 1 and manager.stats().processed == 1
+    db.close()
+
+
+def test_worker_enters_monitoring_when_running_queue_has_no_ready_item(tmp_path):
+    db, manager = queue(tmp_path, [])
+    manager.refill()
+    fake, submits, _ = worker_dashboard(db, manager)
+    run_worker(fake)
+    assert fake.state == "monitoring"
+    assert submits == []
+    db.close()
+
+
+def test_worker_already_monitoring_ticks_without_submitting(tmp_path):
+    db, manager = queue(tmp_path, [])
+    manager.refill()
+    fake, submits, _ = worker_dashboard(db, manager, state="monitoring")
+    ticks = []
+    fake._tick_monitoring = lambda: ticks.append("tick")
+    run_worker(fake)
+    assert ticks == ["tick"] and fake.state == "monitoring"
+    assert submits == []
+    db.close()
+
+
+def test_monitoring_refill_with_ready_exits_then_next_step_processes(tmp_path):
+    db, manager = queue(tmp_path, [])
+    manager.refill()
+    fake, submits, _ = worker_dashboard(db, manager, state="monitoring")
+    manager.sheet.rows = [row("arrived", "alice", 50_000)]
+    fake._next_refresh_ts = 0
+    fake._monitoring_interval = 10
+    fake._stamp_sync = lambda: None
+    fake._log_queue_summary = lambda *_: None
+    fake._update_countdown_label = lambda: None
+    tick = dashboard_method("_tick_monitoring", {"time": SimpleNamespace(monotonic=lambda: 100)})
+    fake._tick_monitoring = lambda: tick(fake)
+
+    run_worker(fake)
+    assert fake.state == "running" and manager.ready_count() == 1 and submits == []
+    run_worker(fake)
+    assert submits[0]["user_id"] == "alice"
+    assert db.has_tx("arrived")
+    db.close()
+
+
+def test_stop_requested_processes_one_boundary_then_finalises(tmp_path):
+    db, manager = queue(tmp_path, [row("TX-A", "alice", 50_000), row("TX-B", "bob", 50_000)])
+    manager.refill()
+    fake, submits, finalised = worker_dashboard(db, manager, state="stopping")
+    fake.stop_requested = True
+    run_worker(fake)
+    assert [call["user_id"] for call in submits] == ["alice"]
+    assert db.has_tx("TX-A") and not db.has_tx("TX-B")
+    assert manager.next_ready().tx_id == "TX-B"
+    assert finalised == ["Worker stopped"]
+    db.close()
+
+
+def test_actual_worker_fresh_manual_race_skips_before_submit(tmp_path):
+    db, manager = queue(tmp_path, [row("manual-race", "alice", 100_000)])
+    manager.refill()
+    refreshes = []
+    fake = None
+
+    def refresh():
+        refreshes.append("fresh")
+        fake.cache.set_manual({"alice"})
+
+    fake, submits, _ = worker_dashboard(db, manager, refresh=refresh)
+    run_worker(fake)
+    assert refreshes == ["fresh"] and submits == []
+    assert db._conn.execute(
+        "SELECT result, bonus FROM processed_transactions WHERE tx_id='manual-race'"
+    ).fetchone() == ("MANUAL BONUS", 0)
+    db.close()
+
+
+def test_actual_worker_duplicate_precedes_fresh_manual_refresh(tmp_path):
+    db, manager = queue(tmp_path, [row("duplicate", "alice", 100_000)])
+    manager.refill()
+    db.insert("duplicate", "alice", 100_000, 10_000, "SUCCESS", "MASTER", "2025-08-01")
+    refreshes = []
+    fake, submits, _ = worker_dashboard(db, manager, refresh=lambda: refreshes.append("fresh"))
+    run_worker(fake)
+    assert refreshes == [] and submits == []
+    assert manager.next_ready() is None
+    db.close()
+
+
+def test_actual_worker_revalidates_daily_quota_before_submit(tmp_path):
+    db, manager = queue(tmp_path, [row("pending", "alice", 100_000)])
+    manager.refill()
+    assert manager.next_ready().bonus == 10_000
+    db.insert("concurrent", "alice", 50_000, 5_000, "SUCCESS", "MASTER", "2025-08-01 09:00")
+    refreshes = []
+    fake, submits, _ = worker_dashboard(db, manager, refresh=lambda: refreshes.append("fresh"))
+    run_worker(fake)
+    assert refreshes == ["fresh"]
+    assert submits == [{"user_id": "alice", "bonus": 5_000, "remark": "BONUS RELOAD AUTO"}]
+    assert db.daily_bonus_for_transaction_date("alice", "2025-08-01") == 10_000
     db.close()
 
 

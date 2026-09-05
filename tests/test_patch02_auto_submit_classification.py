@@ -148,7 +148,12 @@ def test_journal_maps_all_three_outcomes_and_success_needs_click_proof(tmp_path)
                                           5_000, "MASTER", "2025-08-01")
     db.mark_auto_submitting("success", success["attempt_id"])
     with pytest.raises(Exception): db.finalize_auto_success("success", "SUCCESS")
-    assert not db.has_tx("success")
+    # PATCH-07 claims permanent identity at first financial reservation even
+    # when SUCCESS finalization later rejects missing click proof.
+    assert db.has_tx("success")
+    assert db._conn.execute(
+        "SELECT 1 FROM processed_transactions WHERE tx_id='success'"
+    ).fetchone() is None
     db.record_auto_attempt_phase("success", success["attempt_id"], "CLICK_RETURNED")
     db.finalize_auto_success("success", "SUCCESS")
     attempt = db.get_auto_attempts("success")[0]

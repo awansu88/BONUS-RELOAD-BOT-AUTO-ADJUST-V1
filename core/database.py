@@ -85,6 +85,13 @@ CREATE INDEX IF NOT EXISTS idx_auto_tx_unresolved
 CREATE INDEX IF NOT EXISTS idx_auto_attempt_tx ON auto_adjust_attempts(tx_id);
 """
 
+TX_DEDUP_LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tx_dedup_ledger (
+    tx_id TEXT PRIMARY KEY,
+    recorded_at TEXT NOT NULL
+)
+"""
+
 
 class DatabaseService:
     """Small SQLite wrapper. Single connection, WAL mode."""
@@ -112,6 +119,7 @@ class DatabaseService:
         self._conn.executescript(SCHEMA_INDEXES)
         self._conn.executescript(AUTO_JOURNAL_SCHEMA)
         self._migrate_journal_username_key()
+        self._migrate_tx_dedup_ledger()
         self.recover_auto_journal()
 
     # ---------------------------------------------------------------- migrations
@@ -188,6 +196,30 @@ class DatabaseService:
                 "UPDATE auto_adjust_transactions SET username_key=? WHERE tx_id=?", updates
             )
 
+    def _migrate_tx_dedup_ledger(self) -> None:
+        """Atomically create and backfill permanent transaction identities."""
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.execute(TX_DEDUP_LEDGER_SCHEMA)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO tx_dedup_ledger(tx_id,recorded_at) "
+                "SELECT tx_id,? FROM processed_transactions "
+                "WHERE tx_id IS NOT NULL AND tx_id<>''",
+                (now,),
+            )
+            self._conn.execute(
+                "INSERT OR IGNORE INTO tx_dedup_ledger(tx_id,recorded_at) "
+                "SELECT tx_id,? FROM auto_adjust_transactions "
+                "WHERE tx_id IS NOT NULL AND tx_id<>''",
+                (now,),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
     def _assert_known_success_dates(self, username_key: str) -> None:
         row = self._conn.execute(
             "SELECT tx_id FROM processed_transactions WHERE username_key=? "
@@ -213,7 +245,7 @@ class DatabaseService:
         if not tx_id:
             return False
         row = self._conn.execute(
-            "SELECT 1 FROM processed_transactions WHERE tx_id=? LIMIT 1", (tx_id,)
+            "SELECT 1 FROM tx_dedup_ledger WHERE tx_id=? LIMIT 1", (tx_id,)
         ).fetchone()
         return row is not None
 
@@ -228,24 +260,23 @@ class DatabaseService:
             chunk = ids[i : i + 500]
             placeholders = ",".join("?" * len(chunk))
             rows = self._conn.execute(
-                f"SELECT tx_id FROM processed_transactions WHERE tx_id IN ({placeholders})",
+                f"SELECT tx_id FROM tx_dedup_ledger WHERE tx_id IN ({placeholders})",
                 chunk,
             ).fetchall()
             already.update(r[0] for r in rows)
         return set(ids) - already
 
     def has_known_auto_tx(self, tx_id: str) -> bool:
-        """AUTO-only dedup across legacy outcomes and the safety journal."""
+        """Return whether the permanent ledger already owns this TX ID."""
         if not tx_id:
             return False
         return self._conn.execute(
-            "SELECT 1 FROM processed_transactions WHERE tx_id=? UNION ALL "
-            "SELECT 1 FROM auto_adjust_transactions WHERE tx_id=? LIMIT 1",
-            (str(tx_id), str(tx_id)),
+            "SELECT 1 FROM tx_dedup_ledger WHERE tx_id=? LIMIT 1",
+            (str(tx_id),),
         ).fetchone() is not None
 
     def filter_new_auto_tx_ids(self, tx_ids: Iterable[str]) -> Set[str]:
-        return {str(tx) for tx in tx_ids if tx and not self.has_known_auto_tx(str(tx))}
+        return self.filter_new_tx_ids(str(tx) for tx in tx_ids if tx)
 
     def is_auto_retry_eligible(self, tx_id: str) -> bool:
         """Return whether durable state proves one bounded retry is safe.
@@ -312,6 +343,8 @@ class DatabaseService:
         daily_limit: int = 10_000,
     ) -> Optional[Dict]:
         """Atomically reserve the remaining quota and claim attempt number one."""
+        if tx_id is None or str(tx_id) == "":
+            return None
         now = datetime.now().isoformat(timespec="seconds")
         key = canonical_username_key(username)
         require_iso_business_date(business_date)
@@ -320,14 +353,6 @@ class DatabaseService:
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             self._assert_known_success_dates(key)
-            known = self._conn.execute(
-                "SELECT 1 FROM processed_transactions WHERE tx_id=? UNION ALL "
-                "SELECT 1 FROM auto_adjust_transactions WHERE tx_id=? LIMIT 1",
-                (str(tx_id), str(tx_id)),
-            ).fetchone()
-            if known:
-                self._conn.execute("ROLLBACK")
-                return None
             success = self._conn.execute(
                 "SELECT COALESCE(SUM(bonus),0) FROM processed_transactions "
                 "WHERE username_key=? AND timestamp_date=? AND result='SUCCESS'",
@@ -341,6 +366,13 @@ class DatabaseService:
             ).fetchone()[0]
             bonus = min(int(requested_bonus), max(0, int(daily_limit)-int(success or 0)-int(reserved or 0)))
             if bonus <= 0:
+                self._conn.execute("ROLLBACK")
+                return None
+            claim = self._conn.execute(
+                "INSERT OR IGNORE INTO tx_dedup_ledger(tx_id,recorded_at) VALUES (?,?)",
+                (str(tx_id), now),
+            )
+            if claim.rowcount != 1:
                 self._conn.execute("ROLLBACK")
                 return None
             attempt_id = uuid.uuid4().hex
@@ -710,24 +742,44 @@ class DatabaseService:
         timestamp: str,
     ) -> None:
         ts_date = parse_transaction_date(timestamp)
-        self._conn.execute(
-            "INSERT OR IGNORE INTO processed_transactions "
-            "(tx_id, username, username_key, amount, bonus, result, processed_at, "
-            " sheet_name, timestamp, timestamp_date) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                str(tx_id),
-                str(username),
-                canonical_username_key(username),
-                int(amount or 0),
-                int(bonus or 0),
-                str(result),
-                datetime.now().isoformat(timespec="seconds"),
-                str(sheet_name or ""),
-                str(timestamp or ""),
-                ts_date.isoformat() if ts_date else None,
-            ),
-        )
+        tx_id = "" if tx_id is None else str(tx_id)
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            if not tx_id:
+                self._conn.execute("ROLLBACK")
+                return
+            claim = self._conn.execute(
+                "INSERT OR IGNORE INTO tx_dedup_ledger(tx_id,recorded_at) VALUES (?,?)",
+                (tx_id, now),
+            )
+            retry_terminal = self._conn.execute(
+                "SELECT 1 FROM auto_adjust_transactions t "
+                "JOIN auto_adjust_attempts a ON a.attempt_id=t.current_attempt_id "
+                "WHERE t.tx_id=? AND t.status='FAILED_NOT_SUBMITTED' "
+                "AND t.attempt_count=1 AND a.tx_id=t.tx_id AND a.attempt_no=1 "
+                "AND a.result='FAILED_NOT_SUBMITTED' AND a.click_crossed=0 "
+                "AND a.submit_clicked_at IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM processed_transactions p "
+                "WHERE p.tx_id=t.tx_id) LIMIT 1",
+                (tx_id,),
+            ).fetchone()
+            if claim.rowcount != 1 and retry_terminal is None:
+                self._conn.execute("ROLLBACK")
+                return
+            self._conn.execute(
+                "INSERT OR IGNORE INTO processed_transactions "
+                "(tx_id, username, username_key, amount, bonus, result, processed_at, "
+                " sheet_name, timestamp, timestamp_date) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (tx_id, str(username), canonical_username_key(username), int(amount or 0),
+                 int(bonus or 0), str(result), now, str(sheet_name or ""),
+                 str(timestamp or ""), ts_date.isoformat() if ts_date else None),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
 
     def bulk_insert(self, rows: List[Tuple]) -> int:
         """Rows: (tx_id, username, amount, bonus, result, sheet_name, timestamp)."""
@@ -740,7 +792,7 @@ class DatabaseService:
             ts_date = parse_transaction_date(ts_raw)
             payload.append(
                 (
-                    str(r[0]),
+                    "" if r[0] is None else str(r[0]),
                     str(r[1]),
                     canonical_username_key(r[1]),
                     int(r[2] or 0),
@@ -752,14 +804,42 @@ class DatabaseService:
                     ts_date.isoformat() if ts_date else None,
                 )
             )
-        self._conn.executemany(
-            "INSERT OR IGNORE INTO processed_transactions "
-            "(tx_id, username, username_key, amount, bonus, result, processed_at, "
-            " sheet_name, timestamp, timestamp_date) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            payload,
-        )
-        return len(payload)
+        inserted = 0
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            for item in payload:
+                if not item[0]:
+                    continue
+                claim = self._conn.execute(
+                    "INSERT OR IGNORE INTO tx_dedup_ledger(tx_id,recorded_at) VALUES (?,?)",
+                    (item[0], now),
+                )
+                retry_terminal = self._conn.execute(
+                    "SELECT 1 FROM auto_adjust_transactions t "
+                    "JOIN auto_adjust_attempts a ON a.attempt_id=t.current_attempt_id "
+                    "WHERE t.tx_id=? AND t.status='FAILED_NOT_SUBMITTED' "
+                    "AND t.attempt_count=1 AND a.tx_id=t.tx_id AND a.attempt_no=1 "
+                    "AND a.result='FAILED_NOT_SUBMITTED' AND a.click_crossed=0 "
+                    "AND a.submit_clicked_at IS NULL "
+                    "AND NOT EXISTS (SELECT 1 FROM processed_transactions p "
+                    "WHERE p.tx_id=t.tx_id) LIMIT 1",
+                    (item[0],),
+                ).fetchone()
+                if claim.rowcount != 1 and retry_terminal is None:
+                    continue
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO processed_transactions "
+                    "(tx_id, username, username_key, amount, bonus, result, processed_at, "
+                    " sheet_name, timestamp, timestamp_date) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    item,
+                )
+                inserted += 1
+            self._conn.execute("COMMIT")
+            return inserted
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
 
     # ---------------------------------------------------------------- reads
     def daily_bonus_map(self) -> Dict[str, int]:

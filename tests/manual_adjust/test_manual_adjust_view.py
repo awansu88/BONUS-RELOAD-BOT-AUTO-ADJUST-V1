@@ -61,7 +61,9 @@ def test_manual_remark_initialization_validation_and_state_locking(monkeypatch):
 
 
 def test_manual_status_uses_auto_dot_states():
-    view = _view()
+    # Unlike the shared helper, begin genuinely disconnected so this test
+    # characterizes both sides of the sheet-status transition.
+    view = ManualAdjustView()
     assert view.status_dots["GOOGLE SHEETS"].objectName() == "DotIdle"
     assert view.status_dots["PANEL"].objectName() == "DotIdle"
     view.set_sheet_connected(True)

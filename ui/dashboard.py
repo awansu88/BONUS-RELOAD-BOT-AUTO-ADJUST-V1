@@ -533,7 +533,12 @@ class Dashboard(QMainWindow):
         # v1.2 hardening plumbing (optional so existing tests that
         # construct Dashboard(config, selectors, config_path, db) keep
         # passing without changes).
-        self.app_dir: Path = Path(app_dir) if app_dir else Path.cwd()
+        # ``app_dir`` is retained as a compatibility name for the writable
+        # runtime root; PATCH-06 passes DATA_DIR.  The fallback is anchored to
+        # config_path rather than the process CWD.
+        self.app_dir: Path = (
+            Path(app_dir) if app_dir else Path(config_path).resolve().parent.parent
+        )
         self.resource_dir: Path = Path(resource_dir) if resource_dir else self.app_dir
         self.credentials_path: Path = (
             Path(credentials_path)

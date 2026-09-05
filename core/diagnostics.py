@@ -75,6 +75,12 @@ def run_diagnostics(
 ) -> DiagnosticsReport:
     r = DiagnosticsReport()
 
+    # ---- Persistent writable root ----
+    data_writable = _writable(app_dir)
+    r.checks.append(
+        CheckResult("DATA_DIR", data_writable, "" if data_writable else f"not writable at {app_dir}")
+    )
+
     # ---- Config ----
     r.checks.append(
         CheckResult(
@@ -107,8 +113,9 @@ def run_diagnostics(
     ok = False
     detail = ""
     try:
-        sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(sqlite_path))
+        # Never create a database from diagnostics.  Runtime migration and the
+        # no-silent-reset guard must have completed before this read-only probe.
+        conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
         conn.execute("SELECT 1").fetchone()
         conn.close()
         ok = True

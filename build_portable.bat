@@ -52,16 +52,8 @@ if errorlevel 1 (
 )
 
 echo.
-echo [5/5] Seeding writable folders next to the .exe ...
+echo [5/5] Finalizing application-only deployment folder ...
 set "OUT=dist\Bonus Reload Bot"
-if not exist "%OUT%\config"                  xcopy /E /I /Y config           "%OUT%\config"           >nul
-if not exist "%OUT%\credentials"             mkdir "%OUT%\credentials"
-if exist "credentials\service_account.json.example" (
-    copy /Y "credentials\service_account.json.example" "%OUT%\credentials\" >nul
-)
-if not exist "%OUT%\logs"                    mkdir "%OUT%\logs"
-if not exist "%OUT%\screenshots"             mkdir "%OUT%\screenshots"
-if not exist "%OUT%\browser_profile_bonus_reload" mkdir "%OUT%\browser_profile_bonus_reload"
 
 echo.
 echo ============================================================================
@@ -69,8 +61,13 @@ echo Portable build ready:  %OUT%\Bonus Reload Bot.exe
 echo ============================================================================
 echo Deploy checklist for a fresh Windows PC:
 echo   1. Copy the entire folder "%OUT%" to the target machine.
-echo   2. Drop the real service_account.json into  credentials\
-echo   3. Double-click  "Bonus Reload Bot.exe"
+echo   2. On first launch, runtime data is initialized under:
+echo      %%LOCALAPPDATA%%\BonusReloadBot
+echo   3. Drop the real service_account.json into:
+echo      %%LOCALAPPDATA%%\BonusReloadBot\credentials\
+echo   4. Double-click  "Bonus Reload Bot.exe"
 echo No Python / Playwright / Chromium install required on the target PC.
+echo The deployment folder contains application dependencies only; do not put
+echo processed.db, browser profiles, logs, or real credentials in it.
 echo.
 endlocal

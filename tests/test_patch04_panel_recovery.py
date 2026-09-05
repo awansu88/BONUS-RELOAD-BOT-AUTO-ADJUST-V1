@@ -124,6 +124,37 @@ def test_failed_readiness_reuses_one_live_context_without_leak(monkeypatch):
     assert len(contexts) == 1
 
 
+def test_recovery_navigation_failure_clears_previous_attachment(monkeypatch):
+    panel, contexts, _ = service(monkeypatch)
+    page = Page(goto_error=RuntimeError("navigation offline"))
+    context = Context([page])
+    panel._context, panel._page, panel._attached = context, page, True
+
+    with pytest.raises(RuntimeError, match="navigation offline"):
+        panel.recover_auto_panel()
+
+    assert panel._attached is False and panel.is_attached is False
+    assert panel._context is context and context.closed == 0 and contexts == []
+    assert page.events == [("goto", CONFIG["panel_url"])]
+
+
+def test_recovery_readiness_failure_never_leaves_panel_attached(monkeypatch):
+    panel, contexts, _ = service(monkeypatch)
+    page = Page(wait_error=RuntimeError("username form unavailable"))
+    context = Context([page])
+    panel._context, panel._page, panel._attached = context, page, True
+
+    with pytest.raises(RuntimeError, match="username form unavailable"):
+        panel.recover_auto_panel()
+
+    assert panel._attached is False and panel.is_attached is False
+    assert panel._context is context and context.closed == 0 and contexts == []
+    assert page.events == [
+        ("goto", CONFIG["panel_url"]),
+        ("wait", "#username", {"timeout": 17, "state": "visible"}),
+    ]
+
+
 class Timer:
     def __init__(self): self.delays = []; self.active = False
     def start(self, delay): self.delays.append(delay); self.active = True

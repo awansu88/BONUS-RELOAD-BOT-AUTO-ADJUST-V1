@@ -208,9 +208,13 @@ class PanelService:
         configured persistent profile.  Attaching and readiness probing are
         intentionally separate from every financial form helper.
         """
-        self.open_panel(self.panel_url)
-        self.attach()
+        # A previous attachment is not evidence that this recovery attempt is
+        # usable.  Invalidate it before navigation so failures in open/goto or
+        # attach cannot leave START enabled on stale readiness.
+        self._attached = False
         try:
+            self.open_panel(self.panel_url)
+            self.attach()
             self.probe_auto_panel_ready()
         except Exception:
             self._attached = False

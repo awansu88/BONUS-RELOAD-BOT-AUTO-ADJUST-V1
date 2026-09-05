@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import shutil
 import sqlite3
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -50,6 +51,32 @@ CREATE INDEX IF NOT EXISTS idx_result          ON processed_transactions(result)
 CREATE INDEX IF NOT EXISTS idx_username_txdate ON processed_transactions(username, timestamp_date);
 """
 
+AUTO_JOURNAL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS auto_adjust_transactions (
+    tx_id TEXT PRIMARY KEY, username TEXT NOT NULL, username_key TEXT NOT NULL,
+    business_date TEXT NOT NULL, deposit_amount INTEGER NOT NULL,
+    reserved_bonus INTEGER NOT NULL, status TEXT NOT NULL,
+    current_attempt_id TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
+    sheet_name TEXT, source_timestamp TEXT, created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL, resolved_at TEXT
+);
+CREATE TABLE IF NOT EXISTS auto_adjust_attempts (
+    attempt_id TEXT PRIMARY KEY, tx_id TEXT NOT NULL, attempt_no INTEGER NOT NULL,
+    claimed_at TEXT NOT NULL, submit_started_at TEXT, submit_clicked_at TEXT,
+    finished_at TEXT, result TEXT NOT NULL, click_crossed INTEGER NOT NULL DEFAULT 0,
+    submission_phase TEXT, error_detail TEXT, evidence_detail TEXT,
+    reconciled_outcome TEXT, reconciled_at TEXT, reconciled_by TEXT,
+    reconciliation_note TEXT, UNIQUE(tx_id, attempt_no),
+    FOREIGN KEY(tx_id) REFERENCES auto_adjust_transactions(tx_id)
+);
+CREATE INDEX IF NOT EXISTS idx_auto_tx_username_date
+    ON auto_adjust_transactions(username_key, business_date);
+CREATE INDEX IF NOT EXISTS idx_auto_tx_status ON auto_adjust_transactions(status);
+CREATE INDEX IF NOT EXISTS idx_auto_tx_unresolved
+    ON auto_adjust_transactions(username_key, business_date, status, reserved_bonus);
+CREATE INDEX IF NOT EXISTS idx_auto_attempt_tx ON auto_adjust_attempts(tx_id);
+"""
+
 
 class DatabaseService:
     """Small SQLite wrapper. Single connection, WAL mode."""
@@ -74,6 +101,8 @@ class DatabaseService:
             pass
         self._migrate_timestamp_date_column()
         self._conn.executescript(SCHEMA_INDEXES)
+        self._conn.executescript(AUTO_JOURNAL_SCHEMA)
+        self.recover_auto_journal()
 
     # ---------------------------------------------------------------- migrations
     def _migrate_timestamp_date_column(self) -> None:
@@ -141,6 +170,242 @@ class DatabaseService:
             ).fetchall()
             already.update(r[0] for r in rows)
         return set(ids) - already
+
+    def has_known_auto_tx(self, tx_id: str) -> bool:
+        """AUTO-only dedup across legacy outcomes and the safety journal."""
+        if not tx_id:
+            return False
+        return self._conn.execute(
+            "SELECT 1 FROM processed_transactions WHERE tx_id=? UNION ALL "
+            "SELECT 1 FROM auto_adjust_transactions WHERE tx_id=? LIMIT 1",
+            (str(tx_id), str(tx_id)),
+        ).fetchone() is not None
+
+    def filter_new_auto_tx_ids(self, tx_ids: Iterable[str]) -> Set[str]:
+        return {str(tx) for tx in tx_ids if tx and not self.has_known_auto_tx(str(tx))}
+
+    def get_auto_transaction(self, tx_id: str):
+        row = self._conn.execute(
+            "SELECT * FROM auto_adjust_transactions WHERE tx_id=?", (str(tx_id),)
+        ).fetchone()
+        if row is None:
+            return None
+        columns = [d[0] for d in self._conn.execute(
+            "SELECT * FROM auto_adjust_transactions LIMIT 0"
+        ).description]
+        return dict(zip(columns, row))
+
+    def get_auto_attempts(self, tx_id: str) -> List[Dict]:
+        cur = self._conn.execute(
+            "SELECT * FROM auto_adjust_attempts WHERE tx_id=? ORDER BY attempt_no",
+            (str(tx_id),),
+        )
+        columns = [d[0] for d in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+    def daily_bonus_exposure_for_transaction_date(
+        self, username: str, transaction_date_iso: str
+    ) -> int:
+        if not username or not transaction_date_iso:
+            return 0
+        key = str(username).strip()
+        committed = self.daily_bonus_for_transaction_date(key, transaction_date_iso)
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(reserved_bonus),0) FROM auto_adjust_transactions "
+            "WHERE username_key=? AND business_date=? "
+            "AND status IN ('PENDING','SUBMITTING','UNKNOWN')",
+            (key, str(transaction_date_iso)),
+        ).fetchone()
+        return committed + int(row[0] or 0)
+
+    def reserve_auto_transaction(
+        self, tx_id: str, username: str, business_date: str, deposit_amount: int,
+        requested_bonus: int, sheet_name: str = "", source_timestamp: str = "",
+        daily_limit: int = 10_000,
+    ) -> Optional[Dict]:
+        """Atomically reserve the remaining quota and claim attempt number one."""
+        now = datetime.now().isoformat(timespec="seconds")
+        key = str(username).strip()
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            known = self._conn.execute(
+                "SELECT 1 FROM processed_transactions WHERE tx_id=? UNION ALL "
+                "SELECT 1 FROM auto_adjust_transactions WHERE tx_id=? LIMIT 1",
+                (str(tx_id), str(tx_id)),
+            ).fetchone()
+            if known:
+                self._conn.execute("ROLLBACK")
+                return None
+            success = self._conn.execute(
+                "SELECT COALESCE(SUM(bonus),0) FROM processed_transactions "
+                "WHERE username=? AND timestamp_date=? AND result='SUCCESS'",
+                (key, str(business_date)),
+            ).fetchone()[0]
+            reserved = self._conn.execute(
+                "SELECT COALESCE(SUM(reserved_bonus),0) FROM auto_adjust_transactions "
+                "WHERE username_key=? AND business_date=? "
+                "AND status IN ('PENDING','SUBMITTING','UNKNOWN')",
+                (key, str(business_date)),
+            ).fetchone()[0]
+            bonus = min(int(requested_bonus), max(0, int(daily_limit)-int(success or 0)-int(reserved or 0)))
+            if bonus <= 0:
+                self._conn.execute("ROLLBACK")
+                return None
+            attempt_id = uuid.uuid4().hex
+            self._conn.execute(
+                "INSERT INTO auto_adjust_transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(tx_id), str(username), key, str(business_date), int(deposit_amount),
+                 bonus, "PENDING", attempt_id, 1, str(sheet_name or ""),
+                 str(source_timestamp or ""), now, now, None),
+            )
+            self._conn.execute(
+                "INSERT INTO auto_adjust_attempts "
+                "(attempt_id,tx_id,attempt_no,claimed_at,result,click_crossed,submission_phase) "
+                "VALUES (?,?,?,?, 'IN_PROGRESS',0,'RESERVED')",
+                (attempt_id, str(tx_id), 1, now),
+            )
+            self._conn.execute("COMMIT")
+            return {"tx_id": str(tx_id), "attempt_id": attempt_id, "reserved_bonus": bonus}
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def mark_auto_submitting(self, tx_id: str, attempt_id: str) -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            cur = self._conn.execute(
+                "UPDATE auto_adjust_transactions SET status='SUBMITTING',updated_at=? "
+                "WHERE tx_id=? AND current_attempt_id=? AND status='PENDING'",
+                (now, str(tx_id), str(attempt_id)),
+            )
+            if cur.rowcount != 1:
+                raise sqlite3.IntegrityError("AUTO transaction is not claimable")
+            self._conn.execute(
+                "UPDATE auto_adjust_attempts SET submit_started_at=?,submission_phase='REMOTE_CALL_STARTED' "
+                "WHERE attempt_id=? AND result='IN_PROGRESS'", (now, str(attempt_id))
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def finalize_auto_success(self, tx_id: str) -> None:
+        """Atomically create the legacy audit row and resolve journal + attempt."""
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            tx = self._conn.execute(
+                "SELECT username,deposit_amount,reserved_bonus,sheet_name,source_timestamp,"
+                "current_attempt_id,business_date FROM auto_adjust_transactions "
+                "WHERE tx_id=? AND status='SUBMITTING'", (str(tx_id),)
+            ).fetchone()
+            if tx is None:
+                raise sqlite3.IntegrityError("AUTO transaction is not SUBMITTING")
+            self._conn.execute(
+                "INSERT INTO processed_transactions (tx_id,username,amount,bonus,result,"
+                "processed_at,sheet_name,timestamp,timestamp_date) VALUES (?,?,?,?,?,?,?,?,?)",
+                (str(tx_id), tx[0], tx[1], tx[2], "SUCCESS", now, tx[3], tx[4], tx[6]),
+            )
+            self._conn.execute(
+                "UPDATE auto_adjust_attempts SET result='SUCCESS',finished_at=?,submission_phase='FINISHED' "
+                "WHERE attempt_id=?", (now, tx[5])
+            )
+            self._conn.execute(
+                "UPDATE auto_adjust_transactions SET status='SUCCESS',updated_at=?,resolved_at=? WHERE tx_id=?",
+                (now, now, str(tx_id)),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def mark_auto_unknown(self, tx_id: str, detail: str = "") -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            tx = self._conn.execute(
+                "SELECT current_attempt_id FROM auto_adjust_transactions "
+                "WHERE tx_id=? AND status='SUBMITTING'", (str(tx_id),)
+            ).fetchone()
+            if tx is None:
+                raise sqlite3.IntegrityError("AUTO transaction is not SUBMITTING")
+            self._conn.execute(
+                "UPDATE auto_adjust_attempts SET result='UNKNOWN',finished_at=?,error_detail=?,"
+                "submission_phase='FINISHED' WHERE attempt_id=?", (now, str(detail), tx[0])
+            )
+            self._conn.execute(
+                "UPDATE auto_adjust_transactions SET status='UNKNOWN',updated_at=?,resolved_at=? WHERE tx_id=?",
+                (now, now, str(tx_id)),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def mark_auto_failed_not_submitted(self, tx_id: str, detail: str = "") -> None:
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            tx = self._conn.execute(
+                "SELECT current_attempt_id FROM auto_adjust_transactions WHERE tx_id=? AND status='PENDING'",
+                (str(tx_id),),
+            ).fetchone()
+            if tx is None:
+                self._conn.execute("COMMIT")
+                return
+            self._conn.execute(
+                "UPDATE auto_adjust_attempts SET result='FAILED_NOT_SUBMITTED',finished_at=?,"
+                "error_detail=?,submission_phase='FINISHED' WHERE attempt_id=?",
+                (now, str(detail), tx[0]),
+            )
+            self._conn.execute(
+                "UPDATE auto_adjust_transactions SET status='FAILED_NOT_SUBMITTED',updated_at=?,"
+                "resolved_at=? WHERE tx_id=?", (now, now, str(tx_id)),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def recover_auto_journal(self) -> Dict[str, int]:
+        """Resolve process-local crash states in one idempotent transaction."""
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            pending = self._conn.execute(
+                "SELECT tx_id,current_attempt_id FROM auto_adjust_transactions WHERE status='PENDING'"
+            ).fetchall()
+            submitting = self._conn.execute(
+                "SELECT tx_id,current_attempt_id FROM auto_adjust_transactions WHERE status='SUBMITTING'"
+            ).fetchall()
+            for tx_id, attempt_id in pending:
+                self._conn.execute(
+                    "UPDATE auto_adjust_attempts SET result='FAILED_NOT_SUBMITTED',finished_at=?,"
+                    "error_detail='startup recovery before remote call',submission_phase='FINISHED' "
+                    "WHERE attempt_id=? AND result='IN_PROGRESS'", (now, attempt_id))
+                self._conn.execute(
+                    "UPDATE auto_adjust_transactions SET status='FAILED_NOT_SUBMITTED',updated_at=?,"
+                    "resolved_at=? WHERE tx_id=?", (now, now, tx_id))
+            for tx_id, attempt_id in submitting:
+                self._conn.execute(
+                    "UPDATE auto_adjust_attempts SET result='UNKNOWN',finished_at=?,"
+                    "error_detail='startup recovery after remote-call boundary',submission_phase='FINISHED' "
+                    "WHERE attempt_id=? AND result='IN_PROGRESS'", (now, attempt_id))
+                self._conn.execute(
+                    "UPDATE auto_adjust_transactions SET status='UNKNOWN',updated_at=?,resolved_at=? "
+                    "WHERE tx_id=?", (now, now, tx_id))
+            self._conn.execute("COMMIT")
+            return {"failed_not_submitted": len(pending), "unknown": len(submitting)}
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
 
     # ---------------------------------------------------------------- write
     def insert(

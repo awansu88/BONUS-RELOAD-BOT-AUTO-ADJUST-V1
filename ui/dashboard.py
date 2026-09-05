@@ -1900,7 +1900,7 @@ class Dashboard(QMainWindow):
         # ----------------------------------------------------------
 
         # (1) SQLite duplicate protection — belt-and-braces vs pre-filter.
-        if self.db.has_tx(item.tx_id):
+        if self.db.has_known_auto_tx(item.tx_id):
             self.queue.mark_processed(item, False)
             self.logger.info(f"{item.username}  tx {item.tx_id} already in DB - skipped")
             self._refresh_stats()
@@ -1947,7 +1947,7 @@ class Dashboard(QMainWindow):
             )
             tx_date = _date.today()
         tx_date_iso = tx_date.isoformat()
-        current = self.db.daily_bonus_for_transaction_date(
+        current = self.db.daily_bonus_exposure_for_transaction_date(
             item.username, tx_date_iso
         )
         revalidated = self.validator.validate(
@@ -1978,6 +1978,48 @@ class Dashboard(QMainWindow):
         item.bonus = revalidated.bonus
         item.status = "READY"
 
+        # PATCH-01 safety boundary: reserve quota and persist an attempt before
+        # the remote API is entered.  The atomic reservation performs its own
+        # exposure check and may clamp a stale preview to the remaining quota.
+        try:
+            reservation = self.db.reserve_auto_transaction(
+                tx_id=item.tx_id, username=item.username,
+                business_date=tx_date_iso, deposit_amount=item.amount,
+                requested_bonus=item.bonus, sheet_name=item.sheet_name,
+                source_timestamp=item.timestamp,
+            )
+        except Exception as exc:
+            self.logger.error(
+                f"{item.username}  AUTO safety reservation failed; worker halted: {exc}"
+            )
+            self.stop_requested = True
+            self._finalise_stop("Worker halted: AUTO reservation database failure")
+            return
+        if reservation is None:
+            # A concurrent committed/reserved award consumed the quota, or the
+            # TX became known.  In either case no remote call is safe.
+            self.queue.mark_processed(item, False)
+            self.logger.info(f"{item.username}  LIMIT/duplicate at atomic reservation - skipped")
+            self._refresh_stats()
+            return
+        item.bonus = int(reservation["reserved_bonus"])
+
+        try:
+            self.db.mark_auto_submitting(item.tx_id, reservation["attempt_id"])
+        except Exception as exc:
+            # The remote API has not been called. Best effort makes the durable
+            # PENDING explicitly non-submitted; startup recovery does the same.
+            try:
+                self.db.mark_auto_failed_not_submitted(item.tx_id, str(exc))
+            except Exception:
+                pass
+            self.logger.error(
+                f"{item.username}  AUTO SUBMITTING transition failed; worker halted: {exc}"
+            )
+            self.stop_requested = True
+            self._finalise_stop("Worker halted: AUTO journal database failure")
+            return
+
         # --- Process READY item ---
         self.current_item = item
         self.cur_user.setText(item.username or "—")
@@ -1990,11 +2032,29 @@ class Dashboard(QMainWindow):
         )
 
         submit_start = time.monotonic()
-        result = self.panel.submit_deposit(
-            user_id=item.username,
-            bonus=item.bonus,
-            remark=self.config.get("remark", "BONUS RELOAD AUTO"),
-        )
+        try:
+            result = self.panel.submit_deposit(
+                user_id=item.username,
+                bonus=item.bonus,
+                remark=self.config.get("remark", "BONUS RELOAD AUTO"),
+            )
+        except Exception as exc:
+            try:
+                self.db.mark_auto_unknown(item.tx_id, str(exc))
+            except Exception as db_exc:
+                self.logger.error(
+                    f"{item.username}  UNKNOWN finalization failed; worker halted: {db_exc}"
+                )
+                self.stop_requested = True
+                self._finalise_stop("Worker halted: AUTO accounting state lost")
+                return
+            self.queue.mark_processed(item, False)
+            self.cur_status.setText("UNKNOWN")
+            self.logger.error(f"{item.username}  UNKNOWN  {exc}")
+            self.current_item = None
+            self._refresh_metrics()
+            self._refresh_stats()
+            return
         submit_duration = time.monotonic() - submit_start
         self._submit_duration_sum += submit_duration
         self._submit_duration_count += 1
@@ -2003,12 +2063,7 @@ class Dashboard(QMainWindow):
             # SQLite is now the single source of truth. INSERT OR IGNORE
             # gives us a final duplicate barrier via the PRIMARY KEY.
             try:
-                self.db.insert(
-                    tx_id=item.tx_id, username=item.username,
-                    amount=item.amount, bonus=item.bonus,
-                    result="SUCCESS", sheet_name=item.sheet_name,
-                    timestamp=item.timestamp,
-                )
+                self.db.finalize_auto_success(item.tx_id)
                 self.cache.add_bonus(item.username, item.bonus)
                 self.queue.mark_processed(item, True)
                 self._processed_count += 1
@@ -2023,26 +2078,28 @@ class Dashboard(QMainWindow):
                     f"Bonus {item.bonus:,}  SUCCESS"
                 )
             except Exception as exc:
-                self.queue.mark_processed(item, False)
-                self.logger.error(f"{item.username}  DB insert failed: {exc}")
+                # Remote success may already have happened. Keep SUBMITTING as
+                # the durable reservation anchor and stop before another TX.
+                self.logger.error(f"{item.username}  SUCCESS finalization failed; worker halted: {exc}")
+                self.stop_requested = True
+                self._finalise_stop("Worker halted: AUTO accounting state lost")
+                return
         else:
             try:
-                self.db.insert(
-                    tx_id=item.tx_id, username=item.username,
-                    amount=item.amount, bonus=0,
-                    result="FAILED", sheet_name=item.sheet_name,
-                    timestamp=item.timestamp,
-                )
+                self.db.mark_auto_unknown(item.tx_id, result.detail)
             except Exception as exc:
-                self.logger.error(f"{item.username}  DB insert failed: {exc}")
+                self.logger.error(f"{item.username}  UNKNOWN finalization failed; worker halted: {exc}")
+                self.stop_requested = True
+                self._finalise_stop("Worker halted: AUTO accounting state lost")
+                return
             self.queue.mark_processed(item, False)
             self._save_screenshot(item.username)
-            self.cur_status.setText("FAILED")
+            self.cur_status.setText("UNKNOWN")
             self.cur_status.setStyleSheet(
                 "color:#EF4444; font-size:11px; font-weight:700; letter-spacing:2px; "
                 "padding:3px 10px; border:1px solid #EF444455; border-radius:4px;"
             )
-            self.logger.error(f"{item.username}  FAILED  {result.detail}")
+            self.logger.error(f"{item.username}  UNKNOWN  {result.detail}")
 
             if result.detail == "browser closed":
                 self._on_panel_lost()

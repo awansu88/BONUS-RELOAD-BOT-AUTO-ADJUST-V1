@@ -202,13 +202,13 @@ def test_bug012_dedup_takes_priority_over_manual(tmp_path):
 def test_bug012_worker_step_sequence_in_dashboard():
     """Statically verifies that `_worker_step` in the shipped dashboard
     code performs the fresh manual-list refresh + uses
-    `daily_bonus_for_transaction_date` — i.e. the code and this test
+    the AUTO daily exposure primitive — i.e. the code and this test
     file cannot silently diverge in production."""
     src = (ROOT / "ui" / "dashboard.py").read_text(encoding="utf-8")
     # dedup must come first, then fresh manual, then transaction-date DB call.
-    idx_has_tx = src.find("self.db.has_tx(item.tx_id)")
+    idx_has_tx = src.find("self.db.has_known_auto_tx(item.tx_id)")
     idx_fresh = src.find("_refresh_manual_list_now()")
-    idx_daily = src.find("daily_bonus_for_transaction_date")
+    idx_daily = src.find("daily_bonus_exposure_for_transaction_date")
     idx_submit = src.find("self.panel.submit_deposit(")
     assert 0 < idx_has_tx < idx_fresh < idx_daily < idx_submit, (
         "Validation sequence in _worker_step is not "

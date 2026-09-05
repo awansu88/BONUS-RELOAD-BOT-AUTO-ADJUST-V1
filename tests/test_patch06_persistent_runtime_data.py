@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path, PureWindowsPath
 
 import pytest
@@ -98,7 +99,7 @@ def test_sqlite_wal_snapshot_preserves_rows_and_source(tmp_path):
     before = source.read_bytes()
     target = p.data_dir / "processed.db"
     sqlite_snapshot(source, target)
-    with sqlite3.connect(target) as migrated:
+    with closing(sqlite3.connect(target)) as migrated:
         assert migrated.execute("SELECT * FROM state").fetchone() == ("TX1", "UNKNOWN", 75, 2)
         assert migrated.execute("PRAGMA integrity_check").fetchone() == ("ok",)
     assert source.exists() and source.read_bytes() == before
@@ -110,11 +111,13 @@ def test_sqlite_wal_snapshot_preserves_rows_and_source(tmp_path):
 def test_database_precedence_idempotence_and_no_silent_reset(tmp_path):
     p = paths(tmp_path); seed_bundle(p); prepare_config(p)
     legacy = p.app_dir / "processed.db"
-    with sqlite3.connect(legacy) as db:
+    with closing(sqlite3.connect(legacy)) as db:
         db.execute("CREATE TABLE t(value TEXT)"); db.execute("INSERT INTO t VALUES ('legacy')")
+        db.commit()
     r = prepare_runtime(p, {})
     prepare_runtime(p, {})
-    assert sqlite3.connect(r.database_path).execute("SELECT value FROM t").fetchone()[0] == "legacy"
+    with closing(sqlite3.connect(r.database_path)) as db:
+        assert db.execute("SELECT value FROM t").fetchone()[0] == "legacy"
     mark_initialized(p, r.database_path)
     r.database_path.unlink()
     with pytest.raises(RuntimeLayoutError, match="silent empty database reset"):
@@ -128,6 +131,93 @@ def test_snapshot_failure_is_atomic_and_leaves_legacy(tmp_path):
     with pytest.raises(RuntimeLayoutError, match="original data was left untouched"):
         sqlite_snapshot(source, target)
     assert source.read_text() == "not sqlite" and not target.exists()
+    assert not list(target.parent.glob("processed.db.tmp-*"))
+
+
+class _TrackedConnection:
+    def __init__(self, connection, *, fail_backup=False):
+        self.connection = connection
+        self.closed = False
+        self.fail_backup = fail_backup
+
+    def backup(self, target):
+        if self.fail_backup:
+            raise sqlite3.DatabaseError("simulated backup failure")
+        return self.connection.backup(target.connection)
+
+    def commit(self):
+        return self.connection.commit()
+
+    def execute(self, *args, **kwargs):
+        return self.connection.execute(*args, **kwargs)
+
+    def close(self):
+        self.connection.close()
+        self.closed = True
+
+
+def test_sqlite_snapshot_closes_all_connections_before_atomic_promotion(
+    tmp_path, monkeypatch,
+):
+    p = paths(tmp_path); source = p.app_dir / "processed.db"
+    with closing(sqlite3.connect(source)) as db:
+        db.execute("CREATE TABLE state(value TEXT)")
+        db.execute("INSERT INTO state VALUES ('committed')")
+        db.commit()
+    real_connect = sqlite3.connect
+    real_replace = runtime_paths_module.os.replace
+    tracked = []
+
+    def tracked_connect(*args, **kwargs):
+        wrapper = _TrackedConnection(real_connect(*args, **kwargs))
+        tracked.append(wrapper)
+        return wrapper
+
+    def checked_replace(source_path, target_path):
+        assert len(tracked) == 3
+        assert all(connection.closed for connection in tracked)
+        return real_replace(source_path, target_path)
+
+    monkeypatch.setattr(runtime_paths_module.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(runtime_paths_module.os, "replace", checked_replace)
+    target = p.data_dir / "processed.db"
+    sqlite_snapshot(source, target)
+
+    assert target.exists()
+    assert all(connection.closed for connection in tracked)
+    assert not list(target.parent.glob("processed.db.tmp-*"))
+
+
+def test_sqlite_snapshot_closes_connections_before_failure_cleanup(
+    tmp_path, monkeypatch,
+):
+    p = paths(tmp_path); source = p.app_dir / "processed.db"
+    with closing(sqlite3.connect(source)) as db:
+        db.execute("CREATE TABLE state(value TEXT)")
+    real_connect = sqlite3.connect
+    real_cleanup = runtime_paths_module._cleanup_sqlite_temp
+    tracked = []
+
+    def tracked_connect(*args, **kwargs):
+        wrapper = _TrackedConnection(
+            real_connect(*args, **kwargs), fail_backup=not tracked,
+        )
+        tracked.append(wrapper)
+        return wrapper
+
+    def checked_cleanup(temp):
+        assert len(tracked) == 2
+        assert all(connection.closed for connection in tracked)
+        real_cleanup(temp)
+
+    monkeypatch.setattr(runtime_paths_module.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(runtime_paths_module, "_cleanup_sqlite_temp", checked_cleanup)
+    target = p.data_dir / "processed.db"
+    with pytest.raises(RuntimeLayoutError, match="simulated backup failure"):
+        sqlite_snapshot(source, target)
+
+    assert source.exists() and not target.exists()
+    assert all(connection.closed for connection in tracked)
     assert not list(target.parent.glob("processed.db.tmp-*"))
 
 

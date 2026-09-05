@@ -12,6 +12,7 @@ import os
 import shutil
 import sqlite3
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePath, PureWindowsPath
@@ -204,6 +205,20 @@ def sqlite_readonly_uri(path: PurePath) -> str:
     return f"{Path(absolute).as_uri()}?mode=ro"
 
 
+def _cleanup_sqlite_temp(temp: Path) -> None:
+    """Best-effort cleanup after all SQLite handles have been closed.
+
+    Cleanup errors must never hide the primary backup/integrity/promotion
+    failure.  A subsequent startup uses a new UUID and can safely ignore an
+    orphaned, never-promoted temporary snapshot.
+    """
+    for artifact in (temp, Path(f"{temp}-wal"), Path(f"{temp}-shm")):
+        try:
+            artifact.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def sqlite_snapshot(source: Path, target: Path) -> None:
     """Create and integrity-check a WAL-aware SQLite backup, then promote it."""
     if target.exists() or not source.exists() or source.resolve() == target.resolve():
@@ -212,10 +227,14 @@ def sqlite_snapshot(source: Path, target: Path) -> None:
     temp = _temp_for(target)
     sidecars = (Path(f"{temp}-wal"), Path(f"{temp}-shm"))
     try:
-        with sqlite3.connect(sqlite_readonly_uri(source), uri=True) as src:
-            with sqlite3.connect(str(temp)) as dst:
+        # sqlite3.Connection.__exit__ commits/rolls back but does not close.
+        # closing() guarantees Windows releases every source/temp handle before
+        # sidecar deletion or atomic promotion is attempted.
+        with closing(sqlite3.connect(sqlite_readonly_uri(source), uri=True)) as src:
+            with closing(sqlite3.connect(str(temp))) as dst:
                 src.backup(dst)
-        with sqlite3.connect(sqlite_readonly_uri(temp), uri=True) as check:
+                dst.commit()
+        with closing(sqlite3.connect(sqlite_readonly_uri(temp), uri=True)) as check:
             result = check.execute("PRAGMA integrity_check").fetchone()
         if not result or str(result[0]).lower() != "ok":
             raise RuntimeLayoutError(f"SQLite integrity_check failed: {result!r}")
@@ -225,9 +244,9 @@ def sqlite_snapshot(source: Path, target: Path) -> None:
             sidecar.unlink(missing_ok=True)
         os.replace(temp, target)
     except Exception as exc:
-        temp.unlink(missing_ok=True)
-        for sidecar in sidecars:
-            sidecar.unlink(missing_ok=True)
+        # All closing() scopes have unwound before cleanup.  Preserve `exc` if
+        # cleanup encounters a secondary filesystem error.
+        _cleanup_sqlite_temp(temp)
         raise RuntimeLayoutError(
             f"Failed to migrate SQLite database to {target} from legacy source {source}; "
             f"original data was left untouched and no replacement database was created: {exc}"

@@ -57,6 +57,7 @@ def test_success_and_reservation_exposure_is_clamped_and_never_double_counted(tm
     db.mark_auto_submitting("tx", claim["attempt_id"])
     db.finalize_auto_success("tx")
     assert db.get_auto_transaction("tx")["status"] == "SUCCESS"
+    assert db.get_auto_transaction("tx")["resolved_at"] is not None
     assert db.get_auto_attempts("tx")[0]["result"] == "SUCCESS"
     assert db.daily_bonus_exposure_for_transaction_date("alice", "2025-08-01") == 10_000
     assert reserve(db, tx="blocked") is None
@@ -67,6 +68,7 @@ def test_unknown_reserves_by_username_and_business_date_and_queue_uses_it(tmp_pa
     claim = reserve(db, bonus=5_000)
     db.mark_auto_submitting("tx", claim["attempt_id"])
     db.mark_auto_unknown("tx", "binary failure")
+    assert db.get_auto_transaction("tx")["resolved_at"] is None
     manager = QueueManager(
         Sheet([row("new", "alice", 100_000), row("tomorrow", "alice", 100_000, "2025-08-02")]),
         MemoryCache(), Validator(RULES), db,
@@ -82,6 +84,7 @@ def test_unknown_full_reservation_makes_next_same_date_limit(tmp_path):
     claim = reserve(db)
     db.mark_auto_submitting("tx", claim["attempt_id"])
     db.mark_auto_unknown("tx")
+    assert db.get_auto_transaction("tx")["resolved_at"] is None
     manager = QueueManager(
         Sheet([row("new", "alice", 50_000)]), MemoryCache(), Validator(RULES), db
     )
@@ -93,6 +96,7 @@ def test_failed_not_submitted_releases_quota_but_remains_known(tmp_path):
     db = DatabaseService(str(tmp_path / "db"))
     claim = reserve(db)
     db.mark_auto_failed_not_submitted("tx", "local failure")
+    assert db.get_auto_transaction("tx")["resolved_at"] is not None
     assert db.daily_bonus_exposure_for_transaction_date("alice", "2025-08-01") == 0
     assert db.has_known_auto_tx("tx") and reserve(db) is None
 
@@ -107,9 +111,11 @@ def test_close_reopen_recovers_pending_and_submitting_idempotently(tmp_path):
     reopened = DatabaseService(str(path))
     assert reopened.get_auto_transaction("pending")["status"] == "FAILED_NOT_SUBMITTED"
     assert reopened.get_auto_transaction("submitting")["status"] == "UNKNOWN"
+    assert reopened.get_auto_transaction("submitting")["resolved_at"] is None
     assert reopened.daily_bonus_exposure_for_transaction_date("alice", "2025-08-01") == 0
     assert reopened.daily_bonus_exposure_for_transaction_date("bob", "2025-08-01") == 10_000
     assert reopened.recover_auto_journal() == {"failed_not_submitted": 0, "unknown": 0}
+    assert reopened.get_auto_transaction("submitting")["resolved_at"] is None
 
 
 @pytest.mark.parametrize("behavior", ["false", "raise"])
@@ -174,3 +180,52 @@ def test_worker_success_finalization_failure_halts_with_submitting_anchor(tmp_pa
     db.close()
     reopened = DatabaseService(str(tmp_path / "db"))
     assert reopened.get_auto_transaction("first")["status"] == "UNKNOWN"
+
+
+def test_stop_finalises_when_atomic_reservation_returns_none(tmp_path, monkeypatch):
+    db = DatabaseService(str(tmp_path / "db"))
+    manager = QueueManager(
+        Sheet([row("TX-A", "alice", 50_000), row("TX-B", "bob", 50_000)]),
+        MemoryCache(), Validator(RULES), db,
+    )
+    manager.refill()
+    monkeypatch.setattr(db, "reserve_auto_transaction", lambda *a, **k: None)
+    fake, submits, finalised = worker_dashboard(db, manager, state="stopping")
+    fake.stop_requested = True
+
+    run_worker(fake)
+
+    assert submits == []
+    assert finalised == ["Worker stopped"]
+    assert manager.next_ready().tx_id == "TX-B"
+    assert manager.next_ready().processed is False
+
+
+def test_stop_during_panel_exception_finalises_after_unknown_boundary(tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    manager = QueueManager(
+        Sheet([row("TX-A", "alice", 50_000), row("TX-B", "bob", 50_000)]),
+        MemoryCache(), Validator(RULES), db,
+    )
+    manager.refill()
+    calls = []
+    fake = None
+
+    def submit(**values):
+        calls.append(values)
+        fake.stop_requested = True
+        raise RuntimeError("response lost")
+
+    panel = SimpleNamespace(is_alive=lambda: True, submit_deposit=submit)
+    fake, _, finalised = worker_dashboard(db, manager, panel=panel)
+
+    run_worker(fake)
+
+    tx = db.get_auto_transaction("TX-A")
+    assert len(calls) == 1
+    assert tx["status"] == "UNKNOWN" and tx["resolved_at"] is None
+    assert db.daily_bonus_exposure_for_transaction_date("alice", "2025-08-01") == 5_000
+    assert finalised == ["Worker stopped"]
+    assert manager.next_ready().tx_id == "TX-B"
+    assert manager.next_ready().processed is False
+    assert len(calls) == 1

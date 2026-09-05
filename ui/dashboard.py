@@ -2001,6 +2001,8 @@ class Dashboard(QMainWindow):
             self.queue.mark_processed(item, False)
             self.logger.info(f"{item.username}  LIMIT/duplicate at atomic reservation - skipped")
             self._refresh_stats()
+            if self.stop_requested:
+                self._finalise_stop()
             return
         item.bonus = int(reservation["reserved_bonus"])
 
@@ -2054,6 +2056,8 @@ class Dashboard(QMainWindow):
             self.current_item = None
             self._refresh_metrics()
             self._refresh_stats()
+            if self.stop_requested:
+                self._finalise_stop()
             return
         submit_duration = time.monotonic() - submit_start
         self._submit_duration_sum += submit_duration

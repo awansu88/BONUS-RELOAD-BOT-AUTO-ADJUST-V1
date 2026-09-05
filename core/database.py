@@ -338,8 +338,9 @@ class DatabaseService:
                 "submission_phase='FINISHED' WHERE attempt_id=?", (now, str(detail), tx[0])
             )
             self._conn.execute(
-                "UPDATE auto_adjust_transactions SET status='UNKNOWN',updated_at=?,resolved_at=? WHERE tx_id=?",
-                (now, now, str(tx_id)),
+                "UPDATE auto_adjust_transactions SET status='UNKNOWN',updated_at=?,resolved_at=NULL "
+                "WHERE tx_id=?",
+                (now, str(tx_id)),
             )
             self._conn.execute("COMMIT")
         except Exception:
@@ -398,8 +399,8 @@ class DatabaseService:
                     "error_detail='startup recovery after remote-call boundary',submission_phase='FINISHED' "
                     "WHERE attempt_id=? AND result='IN_PROGRESS'", (now, attempt_id))
                 self._conn.execute(
-                    "UPDATE auto_adjust_transactions SET status='UNKNOWN',updated_at=?,resolved_at=? "
-                    "WHERE tx_id=?", (now, now, tx_id))
+                    "UPDATE auto_adjust_transactions SET status='UNKNOWN',updated_at=?,resolved_at=NULL "
+                    "WHERE tx_id=?", (now, tx_id))
             self._conn.execute("COMMIT")
             return {"failed_not_submitted": len(pending), "unknown": len(submitting)}
         except Exception:

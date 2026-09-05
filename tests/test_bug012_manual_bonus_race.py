@@ -209,7 +209,9 @@ def test_bug012_worker_step_sequence_in_dashboard():
     idx_has_tx = src.find("self.db.has_known_auto_tx(item.tx_id)")
     idx_fresh = src.find("_refresh_manual_list_now()")
     idx_daily = src.find("daily_bonus_exposure_for_transaction_date")
-    idx_submit = src.find("self.panel.submit_deposit(")
+    # PATCH-02 replaces only the binary panel call with the classified AUTO
+    # boundary; the BUG-012 validation ordering remains contractual.
+    idx_submit = src.find("self.panel.submit_deposit_classified(")
     assert 0 < idx_has_tx < idx_fresh < idx_daily < idx_submit, (
         "Validation sequence in _worker_step is not "
         "has_tx → manual-fresh → daily-bonus-by-tx-date → submit"

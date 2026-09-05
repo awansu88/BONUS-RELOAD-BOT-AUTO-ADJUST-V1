@@ -8,6 +8,7 @@ import pytest
 
 from core.database import DatabaseService
 from core.memory_cache import MemoryCache
+from core.panel_service import AutoSubmitOutcome, AutoSubmitResult
 from core.queue_manager import QueueManager
 from core.validator import Validator
 sys.path.insert(0, str(Path(__file__).parent))
@@ -55,7 +56,8 @@ def test_success_and_reservation_exposure_is_clamped_and_never_double_counted(tm
     assert claim["reserved_bonus"] == 5_000
     assert db.daily_bonus_exposure_for_transaction_date("alice", "2025-08-01") == 10_000
     db.mark_auto_submitting("tx", claim["attempt_id"])
-    db.finalize_auto_success("tx")
+    db.record_auto_attempt_phase("tx", claim["attempt_id"], "CLICK_RETURNED")
+    db.finalize_auto_success("tx", "SUCCESS")
     assert db.get_auto_transaction("tx")["status"] == "SUCCESS"
     assert db.get_auto_transaction("tx")["resolved_at"] is not None
     assert db.get_auto_attempts("tx")[0]["result"] == "SUCCESS"
@@ -110,26 +112,28 @@ def test_close_reopen_recovers_pending_and_submitting_idempotently(tmp_path):
     db.close()
     reopened = DatabaseService(str(path))
     assert reopened.get_auto_transaction("pending")["status"] == "FAILED_NOT_SUBMITTED"
-    assert reopened.get_auto_transaction("submitting")["status"] == "UNKNOWN"
-    assert reopened.get_auto_transaction("submitting")["resolved_at"] is None
+    assert reopened.get_auto_transaction("submitting")["status"] == "FAILED_NOT_SUBMITTED"
+    assert reopened.get_auto_transaction("submitting")["resolved_at"] is not None
     assert reopened.daily_bonus_exposure_for_transaction_date("alice", "2025-08-01") == 0
-    assert reopened.daily_bonus_exposure_for_transaction_date("bob", "2025-08-01") == 10_000
+    assert reopened.daily_bonus_exposure_for_transaction_date("bob", "2025-08-01") == 0
     assert reopened.recover_auto_journal() == {"failed_not_submitted": 0, "unknown": 0}
-    assert reopened.get_auto_transaction("submitting")["resolved_at"] is None
+    assert reopened.get_auto_transaction("submitting")["resolved_at"] is not None
 
 
-@pytest.mark.parametrize("behavior", ["false", "raise"])
-def test_worker_binary_non_success_is_unknown_without_legacy_failed(tmp_path, behavior):
+@pytest.mark.parametrize("behavior", ["result", "raise"])
+def test_worker_classified_unknown_is_unknown_without_legacy_failed(tmp_path, behavior):
     db = DatabaseService(str(tmp_path / "db"))
     manager = QueueManager(Sheet([row("ambiguous", "alice", 50_000)]), MemoryCache(), Validator(RULES), db)
     manager.refill()
     calls = []
-    def submit(**values):
+    def submit(phase_hook=None, **values):
         calls.append(values)
         if behavior == "raise":
             raise RuntimeError("lost response")
-        return SimpleNamespace(ok=False, detail="not confirmed")
-    panel = SimpleNamespace(is_alive=lambda: True, submit_deposit=submit)
+        phase_hook("SUBMIT_CLICK_BOUNDARY")
+        return AutoSubmitResult(AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, False,
+                                "CLICK_UNCERTAIN", "not confirmed")
+    panel = SimpleNamespace(is_alive=lambda: True, submit_deposit_classified=submit)
     fake, _, _ = worker_dashboard(db, manager, panel=panel)
     run_worker(fake)
     assert len(calls) == 1
@@ -211,12 +215,14 @@ def test_stop_during_panel_exception_finalises_after_unknown_boundary(tmp_path):
     calls = []
     fake = None
 
-    def submit(**values):
+    def submit(phase_hook=None, **values):
         calls.append(values)
         fake.stop_requested = True
-        raise RuntimeError("response lost")
+        phase_hook("SUBMIT_CLICK_BOUNDARY")
+        return AutoSubmitResult(AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, False,
+                                "CLICK_UNCERTAIN", "response lost")
 
-    panel = SimpleNamespace(is_alive=lambda: True, submit_deposit=submit)
+    panel = SimpleNamespace(is_alive=lambda: True, submit_deposit_classified=submit)
     fake, _, finalised = worker_dashboard(db, manager, panel=panel)
 
     run_worker(fake)

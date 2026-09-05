@@ -26,6 +26,7 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 from .timestamp_utils import parse_transaction_date
 from .source_integrity import (
     AccountingIntegrityError,
+    SourceIntegrityError,
     canonical_username_key,
     require_iso_business_date,
     require_source_date,
@@ -91,6 +92,8 @@ CREATE TABLE IF NOT EXISTS tx_dedup_ledger (
     recorded_at TEXT NOT NULL
 )
 """
+
+RETRY_TERMINAL_RESULTS = frozenset({"INVALID", "LIMIT", "MANUAL BONUS"})
 
 
 class DatabaseService:
@@ -731,6 +734,68 @@ class DatabaseService:
             raise
 
     # ---------------------------------------------------------------- write
+    def _prove_retry_terminal_closure(
+        self, tx_id: str, username_key: str, amount: int,
+        result: str, source_timestamp: str,
+    ) -> bool:
+        """Prove a ledger-known attempt-one retry may be terminally closed.
+
+        The caller holds ``BEGIN IMMEDIATE``.  This proof deliberately leaves
+        attempt #1 untouched and admits only validator terminal outcomes whose
+        source identity still matches the original AUTO journal reservation.
+        """
+        if result not in RETRY_TERMINAL_RESULTS:
+            return False
+        row = self._conn.execute(
+            "SELECT t.username_key,t.business_date,t.deposit_amount "
+            "FROM auto_adjust_transactions t "
+            "JOIN auto_adjust_attempts a ON a.attempt_id=t.current_attempt_id "
+            "WHERE t.tx_id=? AND t.status='FAILED_NOT_SUBMITTED' "
+            "AND t.attempt_count=1 AND a.tx_id=t.tx_id AND a.attempt_no=1 "
+            "AND a.result='FAILED_NOT_SUBMITTED' AND a.click_crossed=0 "
+            "AND a.submit_clicked_at IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM processed_transactions p "
+            "WHERE p.tx_id=t.tx_id) LIMIT 1",
+            (tx_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            require_source_date(source_timestamp, row[1], tx_id=tx_id)
+        except SourceIntegrityError:
+            return False
+        return username_key == row[0] and int(amount) == int(row[2])
+
+    def _persist_processed_with_dedup(self, payload: Tuple) -> bool:
+        """Persist one processed row while the caller owns a write transaction."""
+        tx_id, username_key, amount, result = payload[0], payload[2], payload[3], payload[5]
+        claim = self._conn.execute(
+            "INSERT OR IGNORE INTO tx_dedup_ledger(tx_id,recorded_at) VALUES (?,?)",
+            (tx_id, payload[6]),
+        )
+        closes_retry = False
+        if claim.rowcount != 1:
+            closes_retry = self._prove_retry_terminal_closure(
+                tx_id, username_key, amount, result, payload[8]
+            )
+            if not closes_retry:
+                return False
+        self._conn.execute(
+            "INSERT INTO processed_transactions "
+            "(tx_id, username, username_key, amount, bonus, result, processed_at, "
+            " sheet_name, timestamp, timestamp_date) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            payload,
+        )
+        if closes_retry:
+            cur = self._conn.execute(
+                "UPDATE auto_adjust_transactions SET status=?,updated_at=?,resolved_at=? "
+                "WHERE tx_id=? AND status='FAILED_NOT_SUBMITTED' AND attempt_count=1",
+                (result, payload[6], payload[6], tx_id),
+            )
+            if cur.rowcount != 1:
+                raise sqlite3.IntegrityError("AUTO retry terminal ownership changed")
+        return True
+
     def insert(
         self,
         tx_id: str,
@@ -740,7 +805,7 @@ class DatabaseService:
         result: str,
         sheet_name: str,
         timestamp: str,
-    ) -> None:
+    ) -> bool:
         ts_date = parse_transaction_date(timestamp)
         tx_id = "" if tx_id is None else str(tx_id)
         now = datetime.now().isoformat(timespec="seconds")
@@ -748,34 +813,14 @@ class DatabaseService:
             self._conn.execute("BEGIN IMMEDIATE")
             if not tx_id:
                 self._conn.execute("ROLLBACK")
-                return
-            claim = self._conn.execute(
-                "INSERT OR IGNORE INTO tx_dedup_ledger(tx_id,recorded_at) VALUES (?,?)",
-                (tx_id, now),
-            )
-            retry_terminal = self._conn.execute(
-                "SELECT 1 FROM auto_adjust_transactions t "
-                "JOIN auto_adjust_attempts a ON a.attempt_id=t.current_attempt_id "
-                "WHERE t.tx_id=? AND t.status='FAILED_NOT_SUBMITTED' "
-                "AND t.attempt_count=1 AND a.tx_id=t.tx_id AND a.attempt_no=1 "
-                "AND a.result='FAILED_NOT_SUBMITTED' AND a.click_crossed=0 "
-                "AND a.submit_clicked_at IS NULL "
-                "AND NOT EXISTS (SELECT 1 FROM processed_transactions p "
-                "WHERE p.tx_id=t.tx_id) LIMIT 1",
-                (tx_id,),
-            ).fetchone()
-            if claim.rowcount != 1 and retry_terminal is None:
-                self._conn.execute("ROLLBACK")
-                return
-            self._conn.execute(
-                "INSERT OR IGNORE INTO processed_transactions "
-                "(tx_id, username, username_key, amount, bonus, result, processed_at, "
-                " sheet_name, timestamp, timestamp_date) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                return False
+            inserted = self._persist_processed_with_dedup(
                 (tx_id, str(username), canonical_username_key(username), int(amount or 0),
                  int(bonus or 0), str(result), now, str(sheet_name or ""),
-                 str(timestamp or ""), ts_date.isoformat() if ts_date else None),
+                 str(timestamp or ""), ts_date.isoformat() if ts_date else None)
             )
             self._conn.execute("COMMIT")
+            return inserted
         except Exception:
             if self._conn.in_transaction:
                 self._conn.execute("ROLLBACK")
@@ -810,30 +855,8 @@ class DatabaseService:
             for item in payload:
                 if not item[0]:
                     continue
-                claim = self._conn.execute(
-                    "INSERT OR IGNORE INTO tx_dedup_ledger(tx_id,recorded_at) VALUES (?,?)",
-                    (item[0], now),
-                )
-                retry_terminal = self._conn.execute(
-                    "SELECT 1 FROM auto_adjust_transactions t "
-                    "JOIN auto_adjust_attempts a ON a.attempt_id=t.current_attempt_id "
-                    "WHERE t.tx_id=? AND t.status='FAILED_NOT_SUBMITTED' "
-                    "AND t.attempt_count=1 AND a.tx_id=t.tx_id AND a.attempt_no=1 "
-                    "AND a.result='FAILED_NOT_SUBMITTED' AND a.click_crossed=0 "
-                    "AND a.submit_clicked_at IS NULL "
-                    "AND NOT EXISTS (SELECT 1 FROM processed_transactions p "
-                    "WHERE p.tx_id=t.tx_id) LIMIT 1",
-                    (item[0],),
-                ).fetchone()
-                if claim.rowcount != 1 and retry_terminal is None:
-                    continue
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO processed_transactions "
-                    "(tx_id, username, username_key, amount, bonus, result, processed_at, "
-                    " sheet_name, timestamp, timestamp_date) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    item,
-                )
-                inserted += 1
+                if self._persist_processed_with_dedup(item):
+                    inserted += 1
             self._conn.execute("COMMIT")
             return inserted
         except Exception:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 import sqlite3
 import threading
 
@@ -10,6 +9,12 @@ import pytest
 
 from core import database as database_module
 from core.database import DatabaseService
+from tests.test_patch00_auto_baseline import (
+    queue as worker_queue,
+    row as worker_row,
+    run_worker,
+    worker_dashboard,
+)
 
 DAY = "2026-09-05"
 STAMP = "2026-09-05 12:00:00"
@@ -230,6 +235,170 @@ def test_safe_retry_uses_journal_proof_not_a_second_ledger_claim(tmp_path):
     assert not db.is_auto_retry_eligible("tx")
     assert db.reserve_auto_retry_transaction("tx", "Alice", DAY, 100_000, 10_000, source_timestamp=STAMP) is None
     assert len(db.get_auto_attempts("tx")) == 2
+
+
+@pytest.mark.parametrize("result", ["LIMIT", "INVALID", "MANUAL BONUS"])
+def test_retry_terminal_decision_cannot_resurrect_after_processed_retention(
+    tmp_path, result
+):
+    db = DatabaseService(str(tmp_path / "db"))
+    failed_once(db)
+    attempt_one = db.get_auto_attempts("tx")[0]
+    assert db.is_auto_retry_eligible("tx")
+
+    db.insert("tx", "Alice", 100_000, 0, result, "MASTER", STAMP)
+
+    transaction = db.get_auto_transaction("tx")
+    assert transaction["status"] == result
+    assert transaction["attempt_count"] == 1
+    assert transaction["resolved_at"] is not None
+    assert db.get_auto_attempts("tx") == [attempt_one]
+    assert ledger_rows(db) == [("tx",)]
+    assert not db.is_auto_retry_eligible("tx")
+
+    db._conn.execute(
+        "UPDATE processed_transactions SET processed_at='2000-01-01T00:00:00' "
+        "WHERE tx_id='tx'"
+    )
+    assert db.clear_older_than(30) == 1
+    assert db._conn.execute(
+        "SELECT 1 FROM processed_transactions WHERE tx_id='tx'"
+    ).fetchone() is None
+    assert db.has_tx("tx") and not db.is_auto_retry_eligible("tx")
+    assert db.reserve_auto_retry_transaction(
+        "tx", "Alice", DAY, 100_000, 10_000, source_timestamp=STAMP
+    ) is None
+    assert db.get_auto_attempts("tx") == [attempt_one]
+
+
+@pytest.mark.parametrize(
+    "result", ["SUCCESS", "FAILED", "UNKNOWN", "FAILED_NOT_SUBMITTED", "READY", "OTHER"]
+)
+def test_ledger_known_retry_rejects_non_validator_terminal_results(tmp_path, result):
+    db = DatabaseService(str(tmp_path / result.replace(" ", "_")))
+    failed_once(db)
+    db.insert("tx", "Alice", 100_000, 0, result, "MASTER", STAMP)
+    assert db._conn.execute(
+        "SELECT 1 FROM processed_transactions WHERE tx_id='tx'"
+    ).fetchone() is None
+    assert db.get_auto_transaction("tx")["status"] == "FAILED_NOT_SUBMITTED"
+    assert db.is_auto_retry_eligible("tx")
+
+
+@pytest.mark.parametrize(
+    "username,amount,timestamp",
+    [
+        ("Mallory", 100_000, STAMP),
+        ("Alice", 50_000, STAMP),
+        ("Alice", 100_000, "2026-09-06 12:00:00"),
+    ],
+)
+def test_retry_terminal_closure_requires_original_source_identity(
+    tmp_path, username, amount, timestamp
+):
+    db = DatabaseService(str(tmp_path / "db"))
+    failed_once(db)
+    db.insert("tx", username, amount, 0, "LIMIT", "MASTER", timestamp)
+    assert db._conn.execute(
+        "SELECT 1 FROM processed_transactions WHERE tx_id='tx'"
+    ).fetchone() is None
+    assert db.get_auto_transaction("tx")["status"] == "FAILED_NOT_SUBMITTED"
+    assert db.is_auto_retry_eligible("tx")
+
+
+def test_bulk_insert_closes_retry_atomically_without_rewriting_attempt(tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    failed_once(db)
+    attempt_one = db.get_auto_attempts("tx")[0]
+    assert db.bulk_insert(
+        [("tx", "Alice", 100_000, 0, "INVALID", "MASTER", STAMP)]
+    ) == 1
+    assert db.get_auto_transaction("tx")["status"] == "INVALID"
+    assert db.get_auto_attempts("tx") == [attempt_one]
+    assert not db.is_auto_retry_eligible("tx")
+
+
+def test_retry_terminal_closure_failure_rolls_back_audit_and_journal(tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    failed_once(db)
+    db._conn.executescript(
+        "CREATE TRIGGER reject_retry_close BEFORE UPDATE ON auto_adjust_transactions "
+        "WHEN NEW.status='LIMIT' BEGIN SELECT RAISE(ABORT,'close'); END;"
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        db.insert("tx", "Alice", 100_000, 0, "LIMIT", "MASTER", STAMP)
+    assert db._conn.execute(
+        "SELECT 1 FROM processed_transactions WHERE tx_id='tx'"
+    ).fetchone() is None
+    assert db.get_auto_transaction("tx")["status"] == "FAILED_NOT_SUBMITTED"
+    assert db.is_auto_retry_eligible("tx")
+
+
+def test_worker_manual_terminal_write_failure_halts_before_following_tx(
+    tmp_path, monkeypatch
+):
+    db, manager = worker_queue(
+        tmp_path,
+        [worker_row("manual", "alice", 100_000), worker_row("next", "bob", 50_000)],
+    )
+    manager.refill()
+    fake = None
+
+    def refresh():
+        fake.cache.set_manual({"alice"})
+
+    fake, submissions, finalised = worker_dashboard(db, manager, refresh=refresh)
+    monkeypatch.setattr(db, "insert", lambda *args, **kwargs: (_ for _ in ()).throw(
+        sqlite3.OperationalError("ledger write failed")
+    ))
+    run_worker(fake)
+    assert submissions == [] and fake.stop_requested
+    assert finalised == ["Worker halted: durable TX terminal persistence failure"]
+    assert not db.has_tx("manual") and not db.has_tx("next")
+    assert manager.next_ready().tx_id == "manual"
+
+
+def test_worker_limit_terminal_write_failure_halts_before_following_tx(
+    tmp_path, monkeypatch
+):
+    db, manager = worker_queue(
+        tmp_path,
+        [worker_row("limit", "alice", 100_000), worker_row("next", "bob", 50_000)],
+    )
+    manager.refill()
+    db.insert(
+        "quota", "alice", 100_000, 10_000, "SUCCESS", "MASTER",
+        "2025-08-01 09:00:00",
+    )
+    fake, submissions, finalised = worker_dashboard(db, manager)
+    monkeypatch.setattr(db, "insert", lambda *args, **kwargs: (_ for _ in ()).throw(
+        sqlite3.OperationalError("ledger write failed")
+    ))
+    run_worker(fake)
+    assert submissions == [] and fake.stop_requested
+    assert finalised == ["Worker halted: durable TX terminal persistence failure"]
+    assert not db.has_tx("limit") and not db.has_tx("next")
+    assert manager.next_ready().tx_id == "limit"
+
+
+def test_worker_ledger_select_failure_halts_before_reservation_or_next_tx(
+    tmp_path, monkeypatch
+):
+    db, manager = worker_queue(
+        tmp_path,
+        [worker_row("first", "alice", 100_000), worker_row("next", "bob", 50_000)],
+    )
+    manager.refill()
+    fake, submissions, finalised = worker_dashboard(db, manager)
+    monkeypatch.setattr(db, "has_known_auto_tx", lambda *_: (_ for _ in ()).throw(
+        sqlite3.OperationalError("ledger select failed")
+    ))
+    run_worker(fake)
+    assert submissions == [] and fake.stop_requested
+    assert finalised == ["Worker halted: AUTO dedup database failure"]
+    assert db.get_auto_transaction("first") is None
+    assert db.get_auto_transaction("next") is None
+    assert manager.next_ready().tx_id == "first"
 
 
 def test_unknown_and_success_remain_known_without_processed_history(tmp_path):

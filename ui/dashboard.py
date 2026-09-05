@@ -1966,13 +1966,23 @@ class Dashboard(QMainWindow):
                     self._finalise_stop()
                 return
             self.logger.info(f"{item.username}  SAFE RETRY attempt 2")
-        elif self.db.has_known_auto_tx(item.tx_id):
-            self.queue.mark_processed(item, False)
-            self.logger.info(f"{item.username}  tx {item.tx_id} already in DB - skipped")
-            self._refresh_stats()
-            if self.stop_requested:
-                self._finalise_stop()
-            return
+        else:
+            try:
+                already_known = self.db.has_known_auto_tx(item.tx_id)
+            except Exception as exc:
+                self.logger.error(
+                    f"{item.username}  AUTO dedup database failure; worker halted: {exc}"
+                )
+                self.stop_requested = True
+                self._finalise_stop("Worker halted: AUTO dedup database failure")
+                return
+            if already_known:
+                self.queue.mark_processed(item, False)
+                self.logger.info(f"{item.username}  tx {item.tx_id} already in DB - skipped")
+                self._refresh_stats()
+                if self.stop_requested:
+                    self._finalise_stop()
+                return
 
         # (2) Latest Manual Bonus validation — BUG-012.
         # The operator may have added this user to MANUAL BONUS RELOAD
@@ -1983,14 +1993,24 @@ class Dashboard(QMainWindow):
         from core.source_integrity import canonical_username_key
         if item.username and canonical_username_key(item.username) in manual_set:
             try:
-                self.db.insert(
+                persisted = self.db.insert(
                     tx_id=item.tx_id, username=item.username,
                     amount=item.amount, bonus=0,
                     result="MANUAL BONUS", sheet_name=item.sheet_name,
                     timestamp=item.timestamp,
                 )
+                if persisted is False:
+                    raise RuntimeError("terminal TX state was not accepted")
             except Exception as exc:
-                self.logger.error(f"{item.username}  DB insert failed: {exc}")
+                self.logger.error(
+                    f"{item.username}  durable TX terminal persistence failed; "
+                    f"worker halted: {exc}"
+                )
+                self.stop_requested = True
+                self._finalise_stop(
+                    "Worker halted: durable TX terminal persistence failure"
+                )
+                return
             self.queue.mark_processed(item, False)
             self.logger.info(
                 f"{item.username}  MANUAL BONUS (fresh-check) - skipped"
@@ -2025,14 +2045,24 @@ class Dashboard(QMainWindow):
         if revalidated.status != "READY":
             # Downgraded (usually to LIMIT) — record and skip.
             try:
-                self.db.insert(
+                persisted = self.db.insert(
                     tx_id=item.tx_id, username=item.username,
                     amount=item.amount, bonus=0,
                     result=revalidated.status, sheet_name=item.sheet_name,
                     timestamp=item.timestamp,
                 )
+                if persisted is False:
+                    raise RuntimeError("terminal TX state was not accepted")
             except Exception as exc:
-                self.logger.error(f"{item.username}  DB insert failed: {exc}")
+                self.logger.error(
+                    f"{item.username}  durable TX terminal persistence failed; "
+                    f"worker halted: {exc}"
+                )
+                self.stop_requested = True
+                self._finalise_stop(
+                    "Worker halted: durable TX terminal persistence failure"
+                )
+                return
             self.queue.mark_processed(item, False)
             self.logger.info(f"{item.username}  {revalidated.status} (revalidated) - skipped")
             self._refresh_stats()

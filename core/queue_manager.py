@@ -86,7 +86,7 @@ class QueueManager:
         tx_ids = [r.tx_id for r in rows]
         if tx_ids:
             # `filter_new_tx_ids` returns the NEW ones; invert to get 'already'.
-            new_set = self.db.filter_new_tx_ids(tx_ids)
+            new_set = self.db.filter_new_auto_tx_ids(tx_ids)
             already = {t for t in tx_ids if t not in new_set}
         pending = [r for r in rows if r.tx_id not in already]
         batch = pending[: self.batch_size]
@@ -104,7 +104,7 @@ class QueueManager:
         def db_daily_bonus(uid: str, ts_iso: str) -> int:
             key = (uid, ts_iso)
             if key not in db_cache:
-                db_cache[key] = self.db.daily_bonus_for_transaction_date(uid, ts_iso)
+                db_cache[key] = self.db.daily_bonus_exposure_for_transaction_date(uid, ts_iso)
             return db_cache[key]
 
         def current(uid: str, ts_iso: str) -> int:

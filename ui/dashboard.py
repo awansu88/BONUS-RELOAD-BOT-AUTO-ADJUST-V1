@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
 from core.database import DatabaseService
 from core.logger import AppLogger
 from core.memory_cache import MemoryCache
-from core.panel_service import PanelService
+from core.panel_service import AutoSubmitOutcome, PanelService
 from core.queue_manager import QueueItem, QueueManager
 from core.sheet_service import SheetService
 from core.validator import Validator
@@ -2035,10 +2035,13 @@ class Dashboard(QMainWindow):
 
         submit_start = time.monotonic()
         try:
-            result = self.panel.submit_deposit(
+            result = self.panel.submit_deposit_classified(
                 user_id=item.username,
                 bonus=item.bonus,
                 remark=self.config.get("remark", "BONUS RELOAD AUTO"),
+                phase_hook=lambda phase: self.db.record_auto_attempt_phase(
+                    item.tx_id, reservation["attempt_id"], phase
+                ),
             )
         except Exception as exc:
             try:
@@ -2063,11 +2066,12 @@ class Dashboard(QMainWindow):
         self._submit_duration_sum += submit_duration
         self._submit_duration_count += 1
 
-        if result.ok:
+        outcome = result.outcome.value if hasattr(result.outcome, "value") else str(result.outcome)
+        if outcome == "SUCCESS":
             # SQLite is now the single source of truth. INSERT OR IGNORE
             # gives us a final duplicate barrier via the PRIMARY KEY.
             try:
-                self.db.finalize_auto_success(item.tx_id)
+                self.db.finalize_auto_success(item.tx_id, outcome)
                 self.cache.add_bonus(item.username, item.bonus)
                 self.queue.mark_processed(item, True)
                 self._processed_count += 1
@@ -2088,9 +2092,30 @@ class Dashboard(QMainWindow):
                 self.stop_requested = True
                 self._finalise_stop("Worker halted: AUTO accounting state lost")
                 return
+        elif outcome == "FAILED_NOT_SUBMITTED":
+            try:
+                self.db.finalize_auto_failed_not_submitted(
+                    item.tx_id, reservation["attempt_id"], outcome,
+                    result.detail, result.phase, result.evidence,
+                )
+            except Exception as exc:
+                self.logger.error(f"{item.username}  FAILED_NOT_SUBMITTED finalization failed; worker halted: {exc}")
+                self.stop_requested = True
+                self._finalise_stop("Worker halted: AUTO accounting state lost")
+                return
+            self.queue.mark_processed(item, False)
+            self.cur_status.setText("FAILED_NOT_SUBMITTED")
+            self.logger.error(f"{item.username}  FAILED_NOT_SUBMITTED  {result.detail}")
+            if result.accounting_error:
+                self.stop_requested = True
+            if result.detail == "browser closed":
+                self._on_panel_lost()
+                self.stop_requested = True
         else:
             try:
-                self.db.mark_auto_unknown(item.tx_id, result.detail)
+                self.db.mark_auto_unknown(
+                    item.tx_id, result.detail, result.phase, result.evidence
+                )
             except Exception as exc:
                 self.logger.error(f"{item.username}  UNKNOWN finalization failed; worker halted: {exc}")
                 self.stop_requested = True
@@ -2104,6 +2129,9 @@ class Dashboard(QMainWindow):
                 "padding:3px 10px; border:1px solid #EF444455; border-radius:4px;"
             )
             self.logger.error(f"{item.username}  UNKNOWN  {result.detail}")
+
+            if result.accounting_error:
+                self.stop_requested = True
 
             if result.detail == "browser closed":
                 self._on_panel_lost()

@@ -16,7 +16,7 @@ import pytest
 
 from core.database import DatabaseService
 from core.memory_cache import MemoryCache
-from core.panel_service import PanelService
+from core.panel_service import AutoSubmitOutcome, AutoSubmitResult, PanelService
 from core.queue_manager import QueueManager
 from core.sheet_service import MasterRow
 from core.validator import Validator
@@ -195,8 +195,10 @@ def worker_dashboard(db, manager, *, panel=None, state="running", refresh=None):
     if panel is None:
         panel = SimpleNamespace(
             is_alive=lambda: True,
-            submit_deposit=lambda **values: (
-                submits.append(values) or SimpleNamespace(ok=True, detail="")
+            submit_deposit_classified=lambda phase_hook=None, **values: (
+                submits.append(values) or phase_hook("CLICK_RETURNED") or
+                AutoSubmitResult(AutoSubmitOutcome.SUCCESS, True,
+                                 "SUCCESS_OBSERVED")
             ),
         )
     cache = MemoryCache()

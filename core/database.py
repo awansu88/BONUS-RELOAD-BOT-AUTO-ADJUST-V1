@@ -292,8 +292,47 @@ class DatabaseService:
                 self._conn.execute("ROLLBACK")
             raise
 
-    def finalize_auto_success(self, tx_id: str) -> None:
+    def record_auto_attempt_phase(
+        self, tx_id: str, attempt_id: str, phase: str, evidence: str = ""
+    ) -> None:
+        """Persist one phase for the owned in-progress AUTO attempt.
+
+        ``CLICK_RETURNED`` is the sole operation which records positive click
+        crossing and its timestamp.  A zero value therefore means "not
+        positively proven", not necessarily "the remote click did not happen".
+        """
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            tx = self._conn.execute(
+                "SELECT current_attempt_id FROM auto_adjust_transactions "
+                "WHERE tx_id=? AND status='SUBMITTING'", (str(tx_id),)
+            ).fetchone()
+            if tx is None or tx[0] != str(attempt_id):
+                raise sqlite3.IntegrityError("AUTO attempt ownership mismatch")
+            if str(phase) == "CLICK_RETURNED":
+                cur = self._conn.execute(
+                    "UPDATE auto_adjust_attempts SET submission_phase=?,evidence_detail=?,"
+                    "click_crossed=1,submit_clicked_at=? WHERE attempt_id=? AND tx_id=? "
+                    "AND result='IN_PROGRESS'", (str(phase), str(evidence), now,
+                                                  str(attempt_id), str(tx_id)))
+            else:
+                cur = self._conn.execute(
+                    "UPDATE auto_adjust_attempts SET submission_phase=?,evidence_detail=? "
+                    "WHERE attempt_id=? AND tx_id=? AND result='IN_PROGRESS'",
+                    (str(phase), str(evidence), str(attempt_id), str(tx_id)))
+            if cur.rowcount != 1:
+                raise sqlite3.IntegrityError("AUTO attempt is not in progress")
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
+    def finalize_auto_success(self, tx_id: str, classified_outcome: str) -> None:
         """Atomically create the legacy audit row and resolve journal + attempt."""
+        if str(classified_outcome) != "SUCCESS":
+            raise sqlite3.IntegrityError("classified AUTO outcome is not SUCCESS")
         now = datetime.now().isoformat(timespec="seconds")
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -304,6 +343,13 @@ class DatabaseService:
             ).fetchone()
             if tx is None:
                 raise sqlite3.IntegrityError("AUTO transaction is not SUBMITTING")
+            proof = self._conn.execute(
+                "SELECT 1 FROM auto_adjust_attempts WHERE attempt_id=? AND tx_id=? "
+                "AND result='IN_PROGRESS' AND click_crossed=1 AND submit_clicked_at IS NOT NULL",
+                (tx[5], str(tx_id)),
+            ).fetchone()
+            if proof is None:
+                raise sqlite3.IntegrityError("AUTO SUCCESS lacks durable click evidence")
             self._conn.execute(
                 "INSERT INTO processed_transactions (tx_id,username,amount,bonus,result,"
                 "processed_at,sheet_name,timestamp,timestamp_date) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -323,7 +369,8 @@ class DatabaseService:
                 self._conn.execute("ROLLBACK")
             raise
 
-    def mark_auto_unknown(self, tx_id: str, detail: str = "") -> None:
+    def mark_auto_unknown(self, tx_id: str, detail: str = "", phase: str = "AMBIGUOUS_RESPONSE",
+                          evidence: str = "") -> None:
         now = datetime.now().isoformat(timespec="seconds")
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -333,10 +380,13 @@ class DatabaseService:
             ).fetchone()
             if tx is None:
                 raise sqlite3.IntegrityError("AUTO transaction is not SUBMITTING")
-            self._conn.execute(
+            cur = self._conn.execute(
                 "UPDATE auto_adjust_attempts SET result='UNKNOWN',finished_at=?,error_detail=?,"
-                "submission_phase='FINISHED' WHERE attempt_id=?", (now, str(detail), tx[0])
+                "evidence_detail=?,submission_phase=? WHERE attempt_id=? AND result='IN_PROGRESS'",
+                (now, str(detail), str(evidence), str(phase), tx[0])
             )
+            if cur.rowcount != 1:
+                raise sqlite3.IntegrityError("AUTO attempt is not in progress")
             self._conn.execute(
                 "UPDATE auto_adjust_transactions SET status='UNKNOWN',updated_at=?,resolved_at=NULL "
                 "WHERE tx_id=?",
@@ -374,6 +424,39 @@ class DatabaseService:
                 self._conn.execute("ROLLBACK")
             raise
 
+    def finalize_auto_failed_not_submitted(
+        self, tx_id: str, attempt_id: str, classified_outcome: str,
+        detail: str = "", phase: str = "FAILED_PRE_CLICK", evidence: str = "",
+    ) -> None:
+        """Resolve SUBMITTING only with explicit, guarded pre-click proof."""
+        if str(classified_outcome) != "FAILED_NOT_SUBMITTED":
+            raise sqlite3.IntegrityError("classification does not prove pre-click failure")
+        now = datetime.now().isoformat(timespec="seconds")
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            tx = self._conn.execute(
+                "SELECT current_attempt_id FROM auto_adjust_transactions "
+                "WHERE tx_id=? AND status='SUBMITTING'", (str(tx_id),)
+            ).fetchone()
+            if tx is None or tx[0] != str(attempt_id):
+                raise sqlite3.IntegrityError("AUTO attempt ownership mismatch")
+            cur = self._conn.execute(
+                "UPDATE auto_adjust_attempts SET result='FAILED_NOT_SUBMITTED',finished_at=?,"
+                "error_detail=?,evidence_detail=?,submission_phase=? WHERE attempt_id=? "
+                "AND tx_id=? AND result='IN_PROGRESS' AND click_crossed<>1 "
+                "AND submit_clicked_at IS NULL",
+                (now, str(detail), str(evidence), str(phase), str(attempt_id), str(tx_id)))
+            if cur.rowcount != 1:
+                raise sqlite3.IntegrityError("AUTO attempt has possible click evidence")
+            self._conn.execute(
+                "UPDATE auto_adjust_transactions SET status='FAILED_NOT_SUBMITTED',updated_at=?,"
+                "resolved_at=? WHERE tx_id=?", (now, now, str(tx_id)))
+            self._conn.execute("COMMIT")
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            raise
+
     def recover_auto_journal(self) -> Dict[str, int]:
         """Resolve process-local crash states in one idempotent transaction."""
         now = datetime.now().isoformat(timespec="seconds")
@@ -383,7 +466,9 @@ class DatabaseService:
                 "SELECT tx_id,current_attempt_id FROM auto_adjust_transactions WHERE status='PENDING'"
             ).fetchall()
             submitting = self._conn.execute(
-                "SELECT tx_id,current_attempt_id FROM auto_adjust_transactions WHERE status='SUBMITTING'"
+                "SELECT t.tx_id,t.current_attempt_id,a.submission_phase,a.click_crossed,"
+                "a.submit_clicked_at FROM auto_adjust_transactions t JOIN auto_adjust_attempts a "
+                "ON a.attempt_id=t.current_attempt_id WHERE t.status='SUBMITTING'"
             ).fetchall()
             for tx_id, attempt_id in pending:
                 self._conn.execute(
@@ -393,16 +478,33 @@ class DatabaseService:
                 self._conn.execute(
                     "UPDATE auto_adjust_transactions SET status='FAILED_NOT_SUBMITTED',updated_at=?,"
                     "resolved_at=? WHERE tx_id=?", (now, now, tx_id))
-            for tx_id, attempt_id in submitting:
-                self._conn.execute(
-                    "UPDATE auto_adjust_attempts SET result='UNKNOWN',finished_at=?,"
-                    "error_detail='startup recovery after remote-call boundary',submission_phase='FINISHED' "
-                    "WHERE attempt_id=? AND result='IN_PROGRESS'", (now, attempt_id))
-                self._conn.execute(
-                    "UPDATE auto_adjust_transactions SET status='UNKNOWN',updated_at=?,resolved_at=NULL "
-                    "WHERE tx_id=?", (now, tx_id))
+            pre_click = {"REMOTE_CALL_STARTED", "FORM_STARTED", "USERNAME_FILLED",
+                         "AMOUNT_FILLED", "REMARK_FILLED", "READY_TO_CLICK"}
+            recovered_pre = 0
+            recovered_unknown = 0
+            for tx_id, attempt_id, phase, crossed, clicked_at in submitting:
+                safe = phase in pre_click and int(crossed or 0) == 0 and clicked_at is None
+                if safe:
+                    recovered_pre += 1
+                    self._conn.execute(
+                        "UPDATE auto_adjust_attempts SET result='FAILED_NOT_SUBMITTED',finished_at=?,"
+                        "error_detail='startup recovery in proven pre-click phase' "
+                        "WHERE attempt_id=? AND result='IN_PROGRESS'", (now, attempt_id))
+                    self._conn.execute(
+                        "UPDATE auto_adjust_transactions SET status='FAILED_NOT_SUBMITTED',updated_at=?,"
+                        "resolved_at=? WHERE tx_id=?", (now, now, tx_id))
+                else:
+                    recovered_unknown += 1
+                    self._conn.execute(
+                        "UPDATE auto_adjust_attempts SET result='UNKNOWN',finished_at=?,"
+                        "error_detail='startup recovery at ambiguous click boundary' "
+                        "WHERE attempt_id=? AND result='IN_PROGRESS'", (now, attempt_id))
+                    self._conn.execute(
+                        "UPDATE auto_adjust_transactions SET status='UNKNOWN',updated_at=?,resolved_at=NULL "
+                        "WHERE tx_id=?", (now, tx_id))
             self._conn.execute("COMMIT")
-            return {"failed_not_submitted": len(pending), "unknown": len(submitting)}
+            return {"failed_not_submitted": len(pending) + recovered_pre,
+                    "unknown": recovered_unknown}
         except Exception:
             if self._conn.in_transaction:
                 self._conn.execute("ROLLBACK")

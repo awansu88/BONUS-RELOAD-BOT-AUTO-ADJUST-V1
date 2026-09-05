@@ -1,6 +1,7 @@
 """PATCH-05 source/accounting integrity acceptance coverage."""
 
 import sqlite3
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +16,7 @@ from core.source_integrity import (
     canonical_username_key,
 )
 from core.validator import Validator
-from tests.test_patch00_auto_baseline import run_worker, worker_dashboard
+from tests.test_patch00_auto_baseline import dashboard_method, run_worker, worker_dashboard
 
 
 RULES = {"daily_limit": 10_000, "tiers": [
@@ -234,3 +235,229 @@ def test_batch_case_variants_share_quota_and_dates_remain_separate(tmp_path):
         (5000, "READY"), (5000, "READY"), (0, "LIMIT")]
     q2 = queue(db, [row("d", "alice", timestamp="2025-08-02", index=5)])
     assert q2.refill().ready == 1
+
+
+def test_failed_refill_does_not_partially_mutate_cache_or_queue(tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    cache = MemoryCache()
+    feed = Feed([row("old", "old", timestamp=DAY)])
+    q = QueueManager(feed, cache, Validator(RULES), db)
+    old_stats = q.refill()
+    old_preview, old_ready = q.preview_items(), q.next_ready()
+    before = cache.get_daily_bonus("Alice")
+    today = date.today().isoformat()
+    feed.rows = [row("good", "Alice", timestamp=today),
+                 row("bad", "Bob", timestamp="garbage", index=3)]
+    with pytest.raises(SourceIntegrityError):
+        q.refill()
+    assert cache.get_daily_bonus("Alice") == before
+    assert q.preview_items() == old_preview and q.next_ready() is old_ready
+    assert q.stats() is old_stats and db.total_count() == 0
+    assert db.get_auto_transaction("good") is None
+
+
+def test_accounting_integrity_refill_is_atomic_for_cache_and_queue(tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    db.insert("ambiguous", "Alice", 50_000, 5_000, "SUCCESS", "MASTER", "bad")
+    cache = MemoryCache()
+    feed = Feed([])
+    q = QueueManager(feed, cache, Validator(RULES), db)
+    old_stats = q.refill()
+    today = date.today().isoformat()
+    feed.rows = [row("good", "Bob", timestamp=today),
+                 row("blocked", "alice", timestamp=today, index=3)]
+    with pytest.raises(AccountingIntegrityError):
+        q.refill()
+    assert cache.get_daily_bonus("Bob") == 0
+    assert q.preview_items() == [] and q.next_ready() is None and q.stats() is old_stats
+
+
+def test_bulk_insert_failure_does_not_publish_cache_or_queue(monkeypatch, tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    cache = MemoryCache()
+    feed = Feed([])
+    q = QueueManager(feed, cache, Validator(RULES), db)
+    old_stats = q.refill()
+    today = date.today().isoformat()
+    feed.rows = [row("good", "Alice", timestamp=today),
+                 row("skip", "Bob", amount=1, timestamp=today, index=3)]
+    monkeypatch.setattr(db, "bulk_insert", lambda _: (_ for _ in ()).throw(OSError("disk")))
+    with pytest.raises(OSError, match="disk"):
+        q.refill()
+    assert cache.get_daily_bonus("Alice") == 0
+    assert q.preview_items() == [] and q.next_ready() is None and q.stats() is old_stats
+
+
+def sheet_config():
+    return {"columns": {"user_id": 2, "sheet_data": 4, "time_stamp": 5,
+                        "true_amount": 6, "tx_id": 9},
+            "required_headers": {"user_id": "USER ID", "sheet_data": "SHEET DATA",
+                                 "time_stamp": "TIME STAMP", "true_amount": "TRUE AMOUNT",
+                                 "tx_id": "TX_ID"},
+            "sheet_names": {"master": "MASTER", "manual_bonus_reload": "MANUAL"}}
+
+
+class FakeWorksheet:
+    def __init__(self, title, headers=()): self.title, self.headers = title, list(headers)
+    def row_values(self, _): return list(self.headers)
+    def get_all_values(self): return [self.headers]
+
+
+class FakeSpreadsheet:
+    title = "SOURCE"
+    def __init__(self, tabs, headers):
+        self._tabs = {name: FakeWorksheet(name, headers if name == "MASTER" else [])
+                      for name in tabs}
+    def worksheets(self): return list(self._tabs.values())
+    def worksheet(self, name): return self._tabs[name]
+
+
+def connect_fake(monkeypatch, tabs=("MASTER", "MANUAL"), headers=None):
+    headers = headers or ["", "USER ID", "", "SHEET DATA", "TIME STAMP",
+                          "TRUE AMOUNT", "", "", "TX_ID"]
+    service = SheetService("unused", sheet_config())
+    book = FakeSpreadsheet(tabs, headers)
+    monkeypatch.setattr(service, "_authorize",
+                        lambda: SimpleNamespace(open_by_key=lambda _: book))
+    return service, service.connect("x" * 20)
+
+
+@pytest.mark.parametrize("position,value", [(1, "WRONG"), (4, "WRONG"),
+                                              (5, "BALANCE"), (8, "WRONG"),
+                                              (5, "")])
+def test_wrong_or_blank_required_header_matrix(position, value):
+    service = SheetService("unused", sheet_config())
+    headers = ["", "USER ID", "", "SHEET DATA", "TIME STAMP",
+               "TRUE AMOUNT", "", "", "TX_ID"]
+    headers[position] = value
+    service._master = FakeWorksheet("MASTER", headers)
+    assert service._validate_headers()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "nonnumeric", "zero", "negative", "duplicate"])
+def test_invalid_required_column_matrix(mutation):
+    service = SheetService("unused", sheet_config())
+    service._master = FakeWorksheet("MASTER", ["", "USER ID", "", "SHEET DATA",
+                                                     "TIME STAMP", "TRUE AMOUNT", "", "", "TX_ID"])
+    if mutation == "missing": service.cols.pop("tx_id")
+    elif mutation == "nonnumeric": service.cols["tx_id"] = "nine"
+    elif mutation == "zero": service.cols["tx_id"] = 0
+    elif mutation == "negative": service.cols["tx_id"] = -1
+    else: service.cols["tx_id"] = service.cols["true_amount"]
+    assert service._validate_headers()
+
+
+def test_failed_header_contract_leaves_sheet_service_disconnected(monkeypatch):
+    headers = ["", "WRONG", "", "SHEET DATA", "TIME STAMP", "TRUE AMOUNT", "", "", "TX_ID"]
+    service, info = connect_fake(monkeypatch, headers=headers)
+    assert not info.ok and not service.is_connected
+    assert service.master_name == "" and service.spreadsheet_id == ""
+    with pytest.raises(RuntimeError, match="Not connected"): service.read_master_rows()
+    with pytest.raises(RuntimeError, match="Not connected"): service.read_manual_set()
+
+
+@pytest.mark.parametrize("tabs", [("MANUAL",), ("MASTER",)])
+def test_missing_required_tab_leaves_service_disconnected(monkeypatch, tabs):
+    service, info = connect_fake(monkeypatch, tabs=tabs)
+    assert not info.ok and not service.is_connected
+    assert service.master_name == "" and service.spreadsheet_id == ""
+
+
+def failed_once(db, tx="retry", user="Alice"):
+    db.reserve_auto_transaction(tx, user, DAY, 100_000, 10_000,
+                                source_timestamp=f"{DAY} 10:00")
+    db.mark_auto_failed_not_submitted(tx, "safe")
+
+
+def test_retry_source_timestamp_mismatch_cannot_create_attempt_two(tmp_path):
+    db = DatabaseService(str(tmp_path / "db")); failed_once(db)
+    with pytest.raises(SourceIntegrityError):
+        db.reserve_auto_retry_transaction("retry", "alice", DAY, 100_000, 10_000,
+                                          source_timestamp="2025-08-02 10:00")
+    assert len(db.get_auto_attempts("retry")) == 1
+
+
+def test_unknown_date_success_blocks_atomic_retry_claim(tmp_path):
+    db = DatabaseService(str(tmp_path / "db")); failed_once(db)
+    db.insert("old", "ALICE", 50_000, 5_000, "SUCCESS", "MASTER", "bad")
+    with pytest.raises(AccountingIntegrityError):
+        db.reserve_auto_retry_transaction("retry", "alice", DAY, 100_000, 10_000,
+                                          source_timestamp=f"{DAY} 10:00")
+    assert len(db.get_auto_attempts("retry")) == 1
+
+
+@pytest.mark.parametrize("second", [
+    row("dup", "Alice2", index=9), row("dup", "Alice", 100_000, index=9),
+    row("dup", "Alice", timestamp=f"{DAY} 11:00", index=9),
+])
+def test_duplicate_candidate_conflict_matrix(second, tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    with pytest.raises(SourceIntegrityError, match="rows 2 and 9"):
+        queue(db, [row("dup"), second]).refill()
+
+
+def test_safe_retry_conflicting_duplicate_cannot_create_attempt_two(tmp_path):
+    db = DatabaseService(str(tmp_path / "db")); failed_once(db)
+    q = queue(db, [row("retry", "Alice"), row("retry", "Alice2", index=3)])
+    with pytest.raises(SourceIntegrityError): q.refill()
+    assert db.get_auto_transaction("retry")["attempt_count"] == 1
+    assert len(db.get_auto_attempts("retry")) == 1
+
+
+def test_known_terminal_conflicting_duplicates_remain_ineligible(tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    db.insert("done", "Alice", 50_000, 0, "LIMIT", "MASTER", DAY)
+    q = queue(db, [row("done", "Alice"), row("done", "Bob", index=3)])
+    assert q.refill().ready == 0 and q.preview_items() == []
+
+
+def test_unparseable_legacy_success_migration_never_guesses_date(tmp_path):
+    path = tmp_path / "legacy"
+    conn = sqlite3.connect(path)
+    conn.executescript("""CREATE TABLE processed_transactions(
+      tx_id TEXT PRIMARY KEY,username TEXT NOT NULL,amount INTEGER,bonus INTEGER,
+      result TEXT NOT NULL,processed_at TEXT NOT NULL,sheet_name TEXT,timestamp TEXT);""")
+    conn.execute("INSERT INTO processed_transactions VALUES(?,?,?,?,?,?,?,?)",
+                 ("old", "Alice", 50000, 5000, "SUCCESS", DAY, "MASTER", "bad"))
+    conn.commit(); conn.close()
+    db = DatabaseService(str(path))
+    assert db._conn.execute("SELECT timestamp_date FROM processed_transactions").fetchone() == (None,)
+    with pytest.raises(AccountingIntegrityError):
+        db.daily_bonus_exposure_for_transaction_date("alice", DAY)
+
+
+@pytest.mark.parametrize("alive", [True, False])
+def test_worker_accounting_failure_preempts_panel_and_recovery(alive, tmp_path):
+    db = DatabaseService(str(tmp_path / "db"))
+    q = queue(db, [row("candidate")]); q.refill()
+    db.insert("old", "ALICE", 50000, 5000, "SUCCESS", "MASTER", "bad")
+    panel = SimpleNamespace(is_alive=lambda: alive,
+                            submit_deposit_classified=lambda **_: pytest.fail("remote submit"))
+    dashboard, submissions, finalised = worker_dashboard(db, q, panel=panel)
+    recoveries = []
+    dashboard._handle_active_panel_loss = lambda reason: recoveries.append(reason)
+    run_worker(dashboard)
+    assert dashboard.stop_requested and len(finalised) == 1
+    assert recoveries == [] and submissions == []
+    assert db.get_auto_transaction("candidate") is None
+
+
+def test_monitoring_accounting_integrity_error_hard_stops():
+    finalised, recoveries = [], []
+    host = SimpleNamespace(
+        _next_refresh_ts=0, _monitoring_interval=10,
+        queue=SimpleNamespace(refill=lambda: (_ for _ in ()).throw(
+            AccountingIntegrityError("ambiguous"))),
+        logger=SimpleNamespace(error=lambda *_: None), stop_requested=False,
+        _stamp_sync=lambda: None, _log_queue_summary=lambda _: None,
+        _exit_monitoring=lambda: None, _update_countdown_label=lambda: None,
+        _finalise_stop=lambda note: finalised.append(note),
+        _handle_active_panel_loss=lambda reason: recoveries.append(reason),
+    )
+    tick = dashboard_method("_tick_monitoring", {
+        "time": SimpleNamespace(monotonic=lambda: 1),
+        "AccountingIntegrityError": AccountingIntegrityError,
+    })
+    tick(host)
+    assert host.stop_requested and len(finalised) == 1 and recoveries == []
+    assert host._next_refresh_ts == 0

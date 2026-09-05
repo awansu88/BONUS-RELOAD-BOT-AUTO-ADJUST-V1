@@ -93,8 +93,16 @@ class SheetService:
         )
         return gspread.authorize(creds)
 
+    def _clear_connection_state(self) -> None:
+        """Remove every handle that can make a rejected source look usable."""
+        self._spreadsheet = None
+        self._master = None
+        self._manual = None
+        self._spreadsheet_id = ""
+
     # ---------------------------------------------------------------- connect
     def connect(self, url_or_id: str) -> ConnectionInfo:
+        self._clear_connection_state()
         sid = self.extract_spreadsheet_id(url_or_id)
         if not sid:
             return ConnectionInfo(False, error="Invalid spreadsheet URL")
@@ -107,12 +115,14 @@ class SheetService:
             tabs = [ws.title for ws in self._spreadsheet.worksheets()]
 
             if self.sheet_names["master"] not in tabs:
+                self._clear_connection_state()
                 return ConnectionInfo(
                     False,
                     error=f"Missing worksheet: {self.sheet_names['master']}",
                     tabs=tabs,
                 )
             if self.sheet_names["manual_bonus_reload"] not in tabs:
+                self._clear_connection_state()
                 return ConnectionInfo(
                     False,
                     error=f"Missing worksheet: {self.sheet_names['manual_bonus_reload']}",
@@ -129,13 +139,12 @@ class SheetService:
             if missing:
                 # Do not leave a usable source handle behind after a failed
                 # contract check; callers must correct and reconnect.
-                self._master = None
-                self._manual = None
+                title = self._spreadsheet.title
+                self._clear_connection_state()
                 return ConnectionInfo(
                     False,
                     error="MASTER is missing required columns: " + ", ".join(missing),
-                    title=self._spreadsheet.title,
-                    spreadsheet_id=sid,
+                    title=title,
                     tabs=tabs,
                     missing_columns=missing,
                 )
@@ -147,12 +156,15 @@ class SheetService:
                 tabs=tabs,
             )
         except APIError as exc:
+            self._clear_connection_state()
             return ConnectionInfo(False, error=f"Google API error: {exc}")
         except FileNotFoundError:
+            self._clear_connection_state()
             return ConnectionInfo(
                 False, error=f"Credentials file not found: {self.credentials_path}"
             )
         except Exception as exc:  # pragma: no cover - defensive
+            self._clear_connection_state()
             return ConnectionInfo(False, error=str(exc))
 
     def _validate_headers(self) -> List[str]:

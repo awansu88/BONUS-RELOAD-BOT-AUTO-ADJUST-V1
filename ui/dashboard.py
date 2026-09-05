@@ -59,6 +59,7 @@ from core.memory_cache import MemoryCache
 from core.panel_service import AutoSubmitOutcome, PanelService
 from core.queue_manager import QueueItem, QueueManager
 from core.sheet_service import SheetService
+from core.source_integrity import AccountingIntegrityError
 from core.validator import Validator
 from core.recovery import DEFAULT_LADDER, RetryExhausted, retry_with_ladder, safe_run
 from core.health import HealthMonitor, LeakThresholds
@@ -1867,6 +1868,7 @@ class Dashboard(QMainWindow):
         # unavailable, and can never start PATCH-04's recovery ladder.
         if item is not None:
             from core.timestamp_utils import parse_transaction_date
+            from core.source_integrity import AccountingIntegrityError
             tx_date = parse_transaction_date(item.timestamp)
             if tx_date is None:
                 self.logger.error(
@@ -1875,6 +1877,16 @@ class Dashboard(QMainWindow):
                 )
                 self.stop_requested = True
                 self._finalise_stop("Worker halted: AUTO source integrity failure")
+                return
+            try:
+                self.db.assert_auto_accounting_integrity(item.username)
+            except AccountingIntegrityError as exc:
+                self.logger.error(
+                    f"{item.username}  AUTO accounting integrity preflight "
+                    f"failed; worker halted: {exc}"
+                )
+                self.stop_requested = True
+                self._finalise_stop("Worker halted: AUTO accounting integrity failure")
                 return
 
         # If the operator closed the browser mid-run, bail cleanly.
@@ -2254,6 +2266,11 @@ class Dashboard(QMainWindow):
                 # Reset countdown silently.
                 self._next_refresh_ts = time.monotonic() + self._monitoring_interval
                 self._update_countdown_label()
+        except AccountingIntegrityError as exc:
+            self.logger.error(f"Monitoring accounting integrity failure: {exc}")
+            self.stop_requested = True
+            self._finalise_stop("Worker halted: AUTO accounting integrity failure")
+            return
         except Exception as exc:
             self.logger.error(f"Monitoring refresh failed: {exc}")
             # Keep monitoring; retry after the normal interval.

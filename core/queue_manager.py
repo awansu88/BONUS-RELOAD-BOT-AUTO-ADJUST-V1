@@ -141,6 +141,7 @@ class QueueManager:
         preview: List[QueueItem] = []
         ready: List[QueueItem] = []
         skip_rows: List[tuple] = []
+        cache_bonus_deltas: Dict[str, int] = {}
         stats = QueueStats(total=len(batch), already_in_db=len(already))
 
         for r in batch:
@@ -181,7 +182,9 @@ class QueueManager:
                 # Also keep the in-RAM cache in sync for the "today's bonus"
                 # UI KPI when the tx date is today.
                 if ts_iso == today_iso:
-                    self.cache.add_bonus(uid, int(result.bonus))
+                    cache_bonus_deltas[uid] = (
+                        cache_bonus_deltas.get(uid, 0) + int(result.bonus)
+                    )
             else:
                 if result.status == "LIMIT":
                     stats.limit += 1
@@ -200,7 +203,10 @@ class QueueManager:
             self.db.bulk_insert(skip_rows)
             stats.skipped = len(skip_rows)
 
-        # Commit only after DB write succeeds.
+        # Publish all externally visible in-memory state only after the whole
+        # candidate batch and its required DB persistence have succeeded.
+        for uid, bonus in cache_bonus_deltas.items():
+            self.cache.add_bonus(uid, bonus)
         self._ready = ready
         self._last_preview = preview
         self._stats = stats

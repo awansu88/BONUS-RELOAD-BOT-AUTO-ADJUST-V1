@@ -200,6 +200,14 @@ class DatabaseService:
                 f"{row[0]!r} has no provable transaction date"
             )
 
+    def assert_auto_accounting_integrity(self, username: str) -> None:
+        """Fail closed if AUTO quota history is ambiguous for ``username``.
+
+        This mutation-free preflight is intentionally not a quota decision;
+        preview exposure and the atomic reservation remain authoritative.
+        """
+        self._assert_known_success_dates(canonical_username_key(username))
+
     # ---------------------------------------------------------------- dedup
     def has_tx(self, tx_id: str) -> bool:
         if not tx_id:

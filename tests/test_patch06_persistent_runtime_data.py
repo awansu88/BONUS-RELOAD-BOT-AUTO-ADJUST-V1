@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from pathlib import Path
+import sys
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
 from core.runtime_paths import (
     RuntimeLayoutError, mark_initialized, prepare_config, prepare_runtime,
-    remap_runtime_path, resolve_runtime_paths, sqlite_snapshot,
+    read_layout_state, remap_runtime_path, resolve_runtime_paths,
+    sqlite_readonly_uri, sqlite_snapshot,
 )
+import core.runtime_paths as runtime_paths_module
 
 
 def paths(tmp_path: Path, *, frozen: bool = True, env=None):
@@ -158,3 +161,177 @@ def test_credential_profile_crash_and_history_migration(tmp_path):
                         "browser": {"user_data_dir": "profile"}})
     assert runtime.credentials_path.read_text() == "NEW"
     assert (runtime.browser_profile_path / "cookie").read_text() == "new"
+
+
+def test_initialized_layout_same_database_is_idempotent(tmp_path):
+    p = paths(tmp_path); seed_bundle(p); prepare_config(p)
+    runtime = prepare_runtime(p, {})
+    sqlite3.connect(runtime.database_path).close()
+    mark_initialized(p, runtime.database_path)
+    original = p.layout_state_path.read_bytes()
+    first = read_layout_state(p)
+
+    selected = prepare_runtime(p, {"sqlite_path": str(runtime.database_path)})
+    mark_initialized(p, selected.database_path)
+
+    assert selected.database_path == runtime.database_path
+    assert p.layout_state_path.read_bytes() == original
+    assert read_layout_state(p).initialized_at == first.initialized_at
+
+
+def test_initialized_layout_rejects_existing_alternate_database(tmp_path):
+    p = paths(tmp_path); seed_bundle(p); prepare_config(p)
+    authoritative = p.data_dir / "processed.db"
+    alternate = p.data_dir / "alternate.db"
+    sqlite3.connect(authoritative).close()
+    with sqlite3.connect(alternate) as db:
+        db.execute("CREATE TABLE sentinel(value TEXT)")
+        db.execute("INSERT INTO sentinel VALUES ('untouched')")
+    mark_initialized(p, authoritative)
+    marker = p.layout_state_path.read_bytes()
+
+    with pytest.raises(RuntimeLayoutError, match="does not match") as error:
+        prepare_runtime(p, {"sqlite_path": "alternate.db"})
+
+    assert str(authoritative.resolve()) in str(error.value)
+    assert str(alternate.resolve()) in str(error.value)
+    assert p.layout_state_path.read_bytes() == marker
+    with sqlite3.connect(alternate) as db:
+        assert db.execute("SELECT value FROM sentinel").fetchone() == ("untouched",)
+
+
+@pytest.mark.parametrize("database_path", [None, "", "relative.db", 42])
+def test_initialized_marker_rejects_invalid_authoritative_database_path(
+    tmp_path, database_path,
+):
+    p = paths(tmp_path); p.data_dir.mkdir(parents=True)
+    p.layout_state_path.write_text(json.dumps({
+        "layout_version": 1, "initialized": True, "database_path": database_path,
+    }))
+    with pytest.raises(RuntimeLayoutError, match="database_path"):
+        read_layout_state(p)
+    assert not (p.data_dir / "processed.db").exists()
+
+
+def test_mark_initialized_rejects_different_database_without_rewrite(tmp_path):
+    p = paths(tmp_path)
+    original, alternate = p.data_dir / "original.db", p.data_dir / "alternate.db"
+    original.parent.mkdir(parents=True); original.touch(); alternate.touch()
+    mark_initialized(p, original)
+    marker = p.layout_state_path.read_bytes()
+    with pytest.raises(RuntimeLayoutError, match="Refusing to replace"):
+        mark_initialized(p, alternate)
+    assert p.layout_state_path.read_bytes() == marker
+
+
+def test_initialized_layout_never_reimports_stale_legacy_runtime_state(tmp_path):
+    p = paths(tmp_path); seed_bundle(p); prepare_config(p)
+    (p.app_dir / "credentials").mkdir()
+    (p.app_dir / "credentials/key.json").write_text("stale-secret")
+    (p.app_dir / "profile").mkdir(); (p.app_dir / "profile/cookie").write_text("stale")
+    (p.app_dir / "runtime_state.json").write_text('{"clean_exit":false}')
+    (p.app_dir / "logs").mkdir(); (p.app_dir / "logs/legacy.log").write_text("stale")
+    (p.app_dir / "screenshots").mkdir()
+    (p.app_dir / "screenshots/legacy.png").write_bytes(b"stale")
+    config = {"google_credentials": "credentials/key.json",
+              "browser": {"user_data_dir": "profile"}}
+    runtime = prepare_runtime(p, config)
+    sqlite3.connect(runtime.database_path).close(); mark_initialized(p, runtime.database_path)
+
+    runtime.credentials_path.unlink()
+    for child in runtime.browser_profile_path.iterdir(): child.unlink()
+    runtime.browser_profile_path.rmdir()
+    p.crash_state_path.unlink()
+    for directory in (p.logs_dir, p.screenshots_dir):
+        for child in directory.iterdir(): child.unlink()
+        directory.rmdir()
+
+    selected = prepare_runtime(p, {"google_credentials": "credentials/key.json",
+                                   "browser": {"user_data_dir": "profile"}})
+    assert not selected.credentials_path.exists()
+    assert selected.browser_profile_path.is_dir()
+    assert not (selected.browser_profile_path / "cookie").exists()
+    assert not p.crash_state_path.exists()
+    assert p.logs_dir.is_dir() and not (p.logs_dir / "legacy.log").exists()
+    assert p.screenshots_dir.is_dir() and not (p.screenshots_dir / "legacy.png").exists()
+
+
+def test_marker_write_failure_is_atomic_and_database_survives(tmp_path, monkeypatch):
+    p = paths(tmp_path); p.data_dir.mkdir(parents=True)
+    database = p.data_dir / "processed.db"
+    with sqlite3.connect(database) as db:
+        db.execute("CREATE TABLE sentinel(value TEXT)")
+        db.execute("INSERT INTO sentinel VALUES ('safe')")
+
+    def fail_replace(source, target):
+        raise PermissionError("simulated marker promotion denial")
+
+    monkeypatch.setattr(runtime_paths_module.os, "replace", fail_replace)
+    with pytest.raises(RuntimeLayoutError, match="database was left intact"):
+        mark_initialized(p, database)
+    assert not p.layout_state_path.exists()
+    assert not list(p.data_dir.glob("runtime_layout.json.tmp-*"))
+    with sqlite3.connect(database) as db:
+        assert db.execute("SELECT value FROM sentinel").fetchone() == ("safe",)
+
+    existing = b'{"layout_version": 0, "initialized": false}\n'
+    p.layout_state_path.write_bytes(existing)
+    with pytest.raises(RuntimeLayoutError, match="database was left intact"):
+        mark_initialized(p, database)
+    assert p.layout_state_path.read_bytes() == existing
+    assert not list(p.data_dir.glob("runtime_layout.json.tmp-*"))
+
+
+def test_sqlite_readonly_uri_escapes_windows_path():
+    uri = sqlite_readonly_uri(PureWindowsPath(r"C:\Program Files\Bonus #1\data?.db"))
+    assert uri.startswith("file:///C:/Program%20Files/")
+    assert "%23" in uri and "%3F" in uri and uri.endswith("?mode=ro")
+
+
+def test_external_credentials_and_profile_are_preserved(tmp_path):
+    p = paths(tmp_path); seed_bundle(p); prepare_config(p)
+    external_credentials = tmp_path / "external" / "key.json"
+    external_profile = tmp_path / "external-profile"
+    external_credentials.parent.mkdir(); external_credentials.write_text("external")
+    external_profile.mkdir(); (external_profile / "cookie").write_text("external")
+    runtime = prepare_runtime(p, {
+        "google_credentials": str(external_credentials),
+        "browser": {"user_data_dir": str(external_profile)},
+    })
+    assert runtime.credentials_path == external_credentials.resolve()
+    assert runtime.browser_profile_path == external_profile.resolve()
+    assert not (p.credentials_dir / "key.json").exists()
+    assert not (p.data_dir / "external-profile").exists()
+
+
+@pytest.mark.parametrize("environment", [
+    {},
+    {"BONUS_RELOAD_DATA_DIR": "relative-data"},
+])
+def test_invalid_frozen_runtime_environment_is_deferred_to_startup_boundary(
+    tmp_path, monkeypatch, environment,
+):
+    resource, app = tmp_path / "resource", tmp_path / "app"
+    resource.mkdir(); app.mkdir()
+    fake_exe = app / "Bonus Reload Bot.exe"; fake_exe.touch()
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", str(resource), raising=False)
+    monkeypatch.setattr(sys, "executable", str(fake_exe))
+    source = Path("main.py").resolve().read_text(encoding="utf-8")
+    boot = source[:source.index("# Now the app can import Playwright/Qt safely.")]
+    namespace = {"__name__": "main_invalid_runtime_test"}
+
+    # Import-safe bootstrap does not resolve DATA_DIR or write runtime state.
+    exec(compile(boot, str(Path("main.py").resolve()), "exec"), namespace)
+    with pytest.raises(RuntimeLayoutError):
+        namespace["_prepare_startup"](environment)
+    assert not (app / "processed.db").exists()
+    assert not (app / "config").exists()
+
+
+def test_valid_frozen_runtime_environment_reaches_persistent_preparation(tmp_path):
+    p = paths(tmp_path); seed_bundle(p)
+    prepare_config(p)
+    runtime = prepare_runtime(p, {})
+    assert runtime.database_path.parent == p.data_dir
+    assert runtime.browser_profile_path.parent == p.data_dir

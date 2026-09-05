@@ -71,9 +71,10 @@ def test_frozen_layout_seeds_folders(frozen_bundle):
     assert Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"]) == resource / "pw-browsers"
     assert os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] == "1"
 
-    ns["prepare_config"](ns["RUNTIME_PATHS"])
-    config = json.loads(ns["RUNTIME_PATHS"].config_path.read_text())
-    ns["prepare_runtime"](ns["RUNTIME_PATHS"], config)
+    runtime_paths = ns["_resolve_startup_paths"]()
+    ns["prepare_config"](runtime_paths)
+    config = json.loads(runtime_paths.config_path.read_text())
+    ns["prepare_runtime"](runtime_paths, config)
     for sub in ("logs", "screenshots", "credentials", "browser_profile_bonus_reload"):
         assert (data / sub).is_dir()
         assert not (app / sub).exists()
@@ -105,8 +106,9 @@ def test_frozen_layout_seeds_folders_without_pyside(frozen_bundle, monkeypatch):
     # it never writes production state beside the executable.
     assert Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"]) == resource / "pw-browsers"
     assert os.environ["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] == "1"
-    ns["prepare_config"](ns["RUNTIME_PATHS"])
-    ns["prepare_runtime"](ns["RUNTIME_PATHS"], {"browser": {}})
+    runtime_paths = ns["_resolve_startup_paths"]()
+    ns["prepare_config"](runtime_paths)
+    ns["prepare_runtime"](runtime_paths, {"browser": {}})
     assert data.is_dir()
     assert not (app / "config").exists()
 

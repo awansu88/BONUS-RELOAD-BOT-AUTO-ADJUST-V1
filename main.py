@@ -52,11 +52,30 @@ from core.runtime_paths import (  # noqa: E402
     resolve_runtime_paths,
 )
 
-RUNTIME_PATHS = resolve_runtime_paths(
-    app_dir=APP_DIR, resource_dir=RESOURCE_DIR, frozen=_is_frozen()
-)
-DATA_DIR = RUNTIME_PATHS.data_dir
 
+def _resolve_startup_paths(environ=None):  # type: ignore[no-untyped-def]
+    """Resolve writable paths only inside the controlled startup boundary."""
+    return resolve_runtime_paths(
+        app_dir=APP_DIR, resource_dir=RESOURCE_DIR, frozen=_is_frozen(),
+        environ=environ,
+    )
+
+
+def _load_json(path: Path) -> dict:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing config file: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _prepare_startup(environ=None):  # type: ignore[no-untyped-def]
+    """Prepare persistent state; callers provide the UI error boundary."""
+    runtime_paths = _resolve_startup_paths(environ)
+    prepare_config(runtime_paths)
+    config = _load_json(runtime_paths.config_path)
+    selectors = _load_json(runtime_paths.selectors_path)
+    runtime = prepare_runtime(runtime_paths, config)
+    return runtime_paths, config, selectors, runtime
 
 def _prime_playwright_env() -> None:
     """Point Playwright at the bundled Chromium."""
@@ -83,11 +102,6 @@ from core.crash_state import CrashState, CrashStateStore     # noqa: E402
 from core.recovery import safe_run                           # noqa: E402
 from core.maintenance import MaintenanceService              # noqa: E402
 from ui.dashboard import Dashboard                           # noqa: E402
-
-
-CONFIG_PATH = RUNTIME_PATHS.config_path
-SELECTORS_PATH = RUNTIME_PATHS.selectors_path
-CRASH_STATE_PATH = RUNTIME_PATHS.crash_state_path
 
 
 def _install_uncaught_exception_handler(logger: AppLogger) -> None:
@@ -118,39 +132,32 @@ def _install_uncaught_exception_handler(logger: AppLogger) -> None:
     sys.excepthook = _hook
 
 
-def _load_json(path: Path) -> dict:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing config file: {path}")
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Bonus Reload Automation")
 
     try:
-        prepare_config(RUNTIME_PATHS)
-        config = _load_json(CONFIG_PATH)
-        selectors = _load_json(SELECTORS_PATH)
-        runtime = prepare_runtime(RUNTIME_PATHS, config)
+        runtime_paths, config, selectors, runtime = _prepare_startup()
     except Exception as exc:
         QMessageBox.critical(
             None, "Persistent runtime startup error",
-            f"Persistent runtime preparation failed.\nDATA_DIR: {DATA_DIR}\n\n{exc}",
+            f"Persistent runtime preparation failed.\n\n{exc}",
         )
         return 1
 
+    data_dir = runtime_paths.data_dir
+    config_path = runtime_paths.config_path
+    crash_state_path = runtime_paths.crash_state_path
     cred_path = runtime.credentials_path
     db_path = runtime.database_path
     profile_path = runtime.browser_profile_path
 
-    AppLogger.get(log_dir=str(RUNTIME_PATHS.logs_dir))
+    AppLogger.get(log_dir=str(runtime_paths.logs_dir))
     logger = AppLogger.get()
     logger.info(f"Application started ({config.get('version', 'v1.0.0')})")
     logger.info(
         f"Portable mode: {'frozen' if _is_frozen() else 'source'} "
-        f"| app={APP_DIR} | res={RESOURCE_DIR} | data={DATA_DIR}"
+        f"| app={APP_DIR} | res={RESOURCE_DIR} | data={data_dir}"
     )
 
     # v1.2 B-6: capture every uncaught exception before Python's default
@@ -159,7 +166,7 @@ def main() -> int:
 
     # v1.2 B-7 / B-8: crash-state store — marks the process as running,
     # remembers the URL / window geometry across restarts.
-    crash_store = CrashStateStore(CRASH_STATE_PATH)
+    crash_store = CrashStateStore(crash_state_path)
     previous_state = crash_store.load()
     crash_store.mark_dirty(version=str(config.get("version", "")))
     if not previous_state.clean_exit and previous_state.saved_at:
@@ -175,7 +182,7 @@ def main() -> int:
         return 2
 
     try:
-        mark_initialized(RUNTIME_PATHS, db_path)
+        mark_initialized(runtime_paths, db_path)
     except RuntimeLayoutError as exc:
         db.close()
         QMessageBox.critical(None, "Runtime layout error", str(exc))
@@ -185,11 +192,11 @@ def main() -> int:
     # safely selected/opened the authoritative database.
     try:
         diag = run_diagnostics(
-            app_dir=DATA_DIR, resource_dir=RESOURCE_DIR,
-            config_path=CONFIG_PATH, selectors_path=SELECTORS_PATH,
+            app_dir=data_dir, resource_dir=RESOURCE_DIR,
+            config_path=config_path, selectors_path=runtime_paths.selectors_path,
             credentials_path=cred_path, sqlite_path=db_path,
-            logs_dir=RUNTIME_PATHS.logs_dir,
-            screenshots_dir=RUNTIME_PATHS.screenshots_dir,
+            logs_dir=runtime_paths.logs_dir,
+            screenshots_dir=runtime_paths.screenshots_dir,
             browser_profile_dir=profile_path,
             logger_file_handler_ok=logger.file_handler_ok,
             logger_file_handler_error=logger.file_handler_error,
@@ -206,8 +213,8 @@ def main() -> int:
     if bool(config.get("hardening", {}).get("auto_startup_maintenance", True)):
         maintenance_startup = MaintenanceService(
             db=db,
-            logs_dir=RUNTIME_PATHS.logs_dir,
-            screenshots_dir=RUNTIME_PATHS.screenshots_dir,
+            logs_dir=runtime_paths.logs_dir,
+            screenshots_dir=runtime_paths.screenshots_dir,
         )
         report = safe_run(
             maintenance_startup.startup_maintenance,
@@ -221,8 +228,8 @@ def main() -> int:
 
     window = Dashboard(
         config=config, selectors=selectors,
-        config_path=CONFIG_PATH, db=db,
-        app_dir=DATA_DIR, resource_dir=RESOURCE_DIR,
+        config_path=config_path, db=db,
+        app_dir=data_dir, resource_dir=RESOURCE_DIR,
         credentials_path=cred_path,
         crash_store=crash_store, previous_state=previous_state,
     )

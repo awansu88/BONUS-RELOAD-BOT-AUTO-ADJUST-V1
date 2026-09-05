@@ -14,8 +14,9 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import Callable, Mapping, Optional
+from urllib.parse import quote
 
 
 LAYOUT_VERSION = 1
@@ -39,6 +40,14 @@ class RuntimePaths:
     screenshots_dir: Path
     crash_state_path: Path
     layout_state_path: Path
+
+
+@dataclass(frozen=True)
+class RuntimeLayoutState:
+    initialized: bool = False
+    layout_version: int = 0
+    database_path: Optional[Path] = None
+    initialized_at: Optional[str] = None
 
 
 def resolve_runtime_paths(
@@ -75,12 +84,31 @@ def resolve_runtime_paths(
     )
 
 
-def _initialized(paths: RuntimePaths) -> bool:
+def read_layout_state(paths: RuntimePaths) -> RuntimeLayoutState:
+    """Read and validate the marker, failing closed for initialized layouts."""
     if not paths.layout_state_path.exists():
-        return False
+        return RuntimeLayoutState()
     try:
         state = json.loads(paths.layout_state_path.read_text(encoding="utf-8"))
-        return state.get("initialized") is True and int(state.get("layout_version", 0)) >= 1
+        initialized = state.get("initialized") is True
+        version = int(state.get("layout_version", 0))
+        raw_database = state.get("database_path")
+        database_path = None
+        if initialized:
+            if version < 1:
+                raise ValueError("initialized marker has an invalid layout_version")
+            if not isinstance(raw_database, str) or not raw_database.strip():
+                raise ValueError("initialized marker has no authoritative database_path")
+            candidate = Path(raw_database)
+            if not candidate.is_absolute():
+                raise ValueError("authoritative database_path must be absolute")
+            database_path = candidate.resolve()
+        return RuntimeLayoutState(
+            initialized=initialized,
+            layout_version=version,
+            database_path=database_path,
+            initialized_at=state.get("initialized_at"),
+        )
     except Exception as exc:
         raise RuntimeLayoutError(
             f"Runtime layout marker is unreadable at {paths.layout_state_path}: {exc}"
@@ -125,8 +153,8 @@ def _copy_dir_atomic(source: Path, target: Path, component: str) -> None:
 
 def prepare_config(paths: RuntimePaths) -> None:
     """Migrate legacy config, or seed bundled templates on first install."""
-    initialized = _initialized(paths)
-    if initialized:
+    layout = read_layout_state(paths)
+    if layout.initialized:
         missing = [p for p in (paths.config_path, paths.selectors_path) if not p.is_file()]
         if missing:
             raise RuntimeLayoutError(
@@ -166,6 +194,16 @@ def remap_runtime_path(value: str | Path, paths: RuntimePaths) -> tuple[Path, Op
     return (paths.data_dir / suffix).resolve(), resolved
 
 
+def sqlite_readonly_uri(path: PurePath) -> str:
+    """Return a properly escaped, platform-native SQLite read-only file URI."""
+    if isinstance(path, PureWindowsPath):
+        if not path.is_absolute():
+            raise ValueError("Windows SQLite path must be absolute")
+        return f"file:///{quote(path.as_posix(), safe='/:')}?mode=ro"
+    absolute = path if path.is_absolute() else Path(path).resolve()
+    return f"{Path(absolute).as_uri()}?mode=ro"
+
+
 def sqlite_snapshot(source: Path, target: Path) -> None:
     """Create and integrity-check a WAL-aware SQLite backup, then promote it."""
     if target.exists() or not source.exists() or source.resolve() == target.resolve():
@@ -174,10 +212,10 @@ def sqlite_snapshot(source: Path, target: Path) -> None:
     temp = _temp_for(target)
     sidecars = (Path(f"{temp}-wal"), Path(f"{temp}-shm"))
     try:
-        with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as src:
+        with sqlite3.connect(sqlite_readonly_uri(source), uri=True) as src:
             with sqlite3.connect(str(temp)) as dst:
                 src.backup(dst)
-        with sqlite3.connect(f"file:{temp}?mode=ro", uri=True) as check:
+        with sqlite3.connect(sqlite_readonly_uri(temp), uri=True) as check:
             result = check.execute("PRAGMA integrity_check").fetchone()
         if not result or str(result[0]).lower() != "ok":
             raise RuntimeLayoutError(f"SQLite integrity_check failed: {result!r}")
@@ -208,7 +246,8 @@ def prepare_runtime(
     *, sqlite_migrator: Callable[[Path, Path], None] = sqlite_snapshot,
 ) -> ResolvedRuntime:
     """Resolve configured paths, migrate legacy state, and enforce reset guards."""
-    initialized = _initialized(paths)
+    layout = read_layout_state(paths)
+    initialized = layout.initialized
     sqlite_value = config.get("sqlite_path", "processed.db")
     credentials_value = config.get("google_credentials", "credentials/service_account.json")
     browser = config.setdefault("browser", {})
@@ -224,6 +263,13 @@ def prepare_runtime(
     browser["user_data_dir"] = str(profile)
 
     if initialized:
+        assert layout.database_path is not None  # validated by read_layout_state
+        if db.resolve() != layout.database_path.resolve():
+            raise RuntimeLayoutError(
+                "Configured database does not match the initialized authoritative database. "
+                f"Recorded: {layout.database_path}; requested: {db.resolve()}; "
+                f"DATA_DIR={paths.data_dir}. Startup stopped without changing the marker."
+            )
         if not db.is_file():
             raise RuntimeLayoutError(
                 f"Initialized runtime database is missing at {db}; DATA_DIR={paths.data_dir}. "
@@ -235,15 +281,16 @@ def prepare_runtime(
     # database, and only after the initialized-layout guard above permits it.
     db.parent.mkdir(parents=True, exist_ok=True)
 
-    if legacy_credentials and legacy_credentials.resolve() != credentials.resolve():
-        _copy_file_atomic(legacy_credentials, credentials, "credentials")
-    if legacy_profile and legacy_profile.resolve() != profile.resolve():
-        _copy_dir_atomic(legacy_profile, profile, "browser profile")
-    _copy_file_atomic(paths.app_dir / "runtime_state.json", paths.crash_state_path, "crash state")
-    for name, target in (("logs", paths.logs_dir), ("screenshots", paths.screenshots_dir)):
-        legacy = paths.app_dir / name
-        if legacy.resolve() != target.resolve():
-            _copy_dir_atomic(legacy, target, name)
+    if not initialized:
+        if legacy_credentials and legacy_credentials.resolve() != credentials.resolve():
+            _copy_file_atomic(legacy_credentials, credentials, "credentials")
+        if legacy_profile and legacy_profile.resolve() != profile.resolve():
+            _copy_dir_atomic(legacy_profile, profile, "browser profile")
+        _copy_file_atomic(paths.app_dir / "runtime_state.json", paths.crash_state_path, "crash state")
+        for name, target in (("logs", paths.logs_dir), ("screenshots", paths.screenshots_dir)):
+            legacy = paths.app_dir / name
+            if legacy.resolve() != target.resolve():
+                _copy_dir_atomic(legacy, target, name)
 
     for directory in (paths.credentials_dir, paths.logs_dir, paths.screenshots_dir, profile):
         directory.mkdir(parents=True, exist_ok=True)
@@ -276,16 +323,39 @@ def prepare_runtime(
 
 def mark_initialized(paths: RuntimePaths, database_path: Path) -> None:
     """Atomically record successful DB initialization."""
-    paths.data_dir.mkdir(parents=True, exist_ok=True)
-    temp = _temp_for(paths.layout_state_path)
-    payload = {
-        "layout_version": LAYOUT_VERSION,
-        "initialized": True,
-        "initialized_at": datetime.now(timezone.utc).isoformat(),
-        "database_path": str(Path(database_path).resolve()),
-    }
+    authoritative = Path(database_path).resolve()
+    existing = read_layout_state(paths)
+    if existing.initialized:
+        assert existing.database_path is not None
+        if existing.database_path.resolve() != authoritative:
+            raise RuntimeLayoutError(
+                "Refusing to replace the initialized authoritative database marker. "
+                f"Recorded: {existing.database_path}; requested: {authoritative}; "
+                f"DATA_DIR={paths.data_dir}."
+            )
+        return
+    temp: Optional[Path] = None
     try:
+        paths.data_dir.mkdir(parents=True, exist_ok=True)
+        temp = _temp_for(paths.layout_state_path)
+        payload = {
+            "layout_version": LAYOUT_VERSION,
+            "initialized": True,
+            "initialized_at": datetime.now(timezone.utc).isoformat(),
+            "database_path": str(authoritative),
+        }
         temp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         os.replace(temp, paths.layout_state_path)
+    except Exception as exc:
+        raise RuntimeLayoutError(
+            f"Failed to write runtime layout marker at {paths.layout_state_path}; "
+            f"database was left intact at {authoritative}: {exc}"
+        ) from exc
     finally:
-        temp.unlink(missing_ok=True)
+        if temp is not None:
+            try:
+                temp.unlink(missing_ok=True)
+            except Exception:
+                # Preserve the normalized startup-blocking error above even if
+                # the filesystem also refuses best-effort temp cleanup.
+                pass

@@ -16,7 +16,10 @@ STOP finishes the current transaction (already logged) and returns to Idle.
 from __future__ import annotations
 
 import csv
+import copy
 import json
+import os
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -60,6 +63,10 @@ from core.memory_cache import MemoryCache
 from core.panel_service import AutoSubmitOutcome, PanelService
 from core.queue_manager import QueueItem, QueueManager
 from core.sheet_service import SheetService
+from core.credentials import (
+    CredentialValidationError, install_service_account_file,
+    validate_service_account_file,
+)
 from core.source_integrity import AccountingIntegrityError
 from core.validator import Validator
 from core.recovery import DEFAULT_LADDER, RetryExhausted, retry_with_ladder, safe_run
@@ -272,12 +279,18 @@ class HeaderModeSelector(QComboBox):
 # Settings dialog
 # =========================================================================
 class SettingsDialog(QDialog):
-    def __init__(self, config: dict, config_path: Path, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, config: dict, config_path: Path,
+                 parent: Optional[QWidget] = None,
+                 credentials_path: Optional[Path] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setMinimumWidth(520)
         self.config = config
         self.config_path = config_path
+        self.credentials_path = Path(
+            credentials_path or config.get("google_credentials", "credentials/service_account.json")
+        )
+        self._selected_credentials: Optional[Path] = None
 
         form = QFormLayout()
 
@@ -314,8 +327,19 @@ class SettingsDialog(QDialog):
         self.remark = QLineEdit(config.get("remark", "BONUS RELOAD AUTO"))
         form.addRow("AUTO REMARK", self.remark)
 
-        self.creds = QLineEdit(config.get("google_credentials", "credentials/service_account.json"))
-        form.addRow("Google Credentials", self.creds)
+        self.creds = QLineEdit(str(self.credentials_path))
+        self.creds.setReadOnly(True)
+        self.creds.setObjectName("google-credentials-path")
+        browse = QPushButton("Browse...")
+        browse.setObjectName("google-credentials-browse")
+        browse.clicked.connect(self._browse_credentials)
+        credential_row = QHBoxLayout()
+        credential_row.addWidget(self.creds)
+        credential_row.addWidget(browse)
+        form.addRow("Google Credentials", credential_row)
+        self.credential_status = QLabel()
+        self._refresh_credential_status()
+        form.addRow("", self.credential_status)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._save)
@@ -325,17 +349,76 @@ class SettingsDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(buttons)
 
-    def _save(self) -> None:
-        self.config["panel_url"] = self.panel_edit.text().strip()
-        self.config["bonus_rules"]["daily_limit"] = int(self.daily_limit.value())
-        self.config["batch_size"] = int(self.batch.value())
-        self.config["manual_reload_interval_sec"] = int(self.reload_iv.value())
-        self.config["polling_delay_sec"] = int(self.polling.value())
-        self.config["monitoring_interval_sec"] = int(self.monitoring_iv.value())
-        self.config["remark"] = self.remark.text().strip() or "BONUS RELOAD AUTO"
-        self.config["google_credentials"] = self.creds.text().strip()
+    def _refresh_credential_status(self) -> None:
+        try:
+            validate_service_account_file(self._selected_credentials or self.credentials_path)
+            self.credential_status.setText("✓ Credential ready")
+        except CredentialValidationError as exc:
+            status = "Missing" if "missing" in str(exc).lower() else "Invalid"
+            self.credential_status.setText(status)
 
-        self.config_path.write_text(json.dumps(self.config, indent=4), encoding="utf-8")
+    def _browse_credentials(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self, "Select Google service-account credentials", "", "JSON Files (*.json)"
+        )
+        if not selected:
+            return
+        try:
+            validate_service_account_file(selected)
+        except CredentialValidationError:
+            QMessageBox.warning(
+                self, "Invalid Google Credentials",
+                "The selected file is not a valid Google service-account JSON.\n\n"
+                "Please select the service_account.json downloaded from Google Cloud.",
+            )
+            return
+        self._selected_credentials = Path(selected)
+        self.creds.setText(f"{self.credentials_path} (selected: {Path(selected).name})")
+        self._refresh_credential_status()
+
+    def _write_config_atomic(self, config: dict) -> None:
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_name: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", prefix=f".{self.config_path.name}.",
+                suffix=".tmp", dir=self.config_path.parent, delete=False,
+            ) as stream:
+                temp_name = stream.name
+                json.dump(config, stream, indent=4)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_name, self.config_path)
+            temp_name = None
+        finally:
+            if temp_name:
+                Path(temp_name).unlink(missing_ok=True)
+
+    def _save(self) -> None:
+        candidate = copy.deepcopy(self.config)
+        candidate["panel_url"] = self.panel_edit.text().strip()
+        candidate["bonus_rules"]["daily_limit"] = int(self.daily_limit.value())
+        candidate["batch_size"] = int(self.batch.value())
+        candidate["manual_reload_interval_sec"] = int(self.reload_iv.value())
+        candidate["polling_delay_sec"] = int(self.polling.value())
+        candidate["monitoring_interval_sec"] = int(self.monitoring_iv.value())
+        candidate["remark"] = self.remark.text().strip() or "BONUS RELOAD AUTO"
+        try:
+            source = self._selected_credentials or self.credentials_path
+            install_service_account_file(source, self.credentials_path)
+            candidate["google_credentials"] = str(self.credentials_path)
+            self._write_config_atomic(candidate)
+        except (CredentialValidationError, OSError) as exc:
+            QMessageBox.warning(
+                self, "Google Credentials Not Saved",
+                f"Settings were not saved. {exc}\n\nChoose a valid service-account JSON with Browse...",
+            )
+            return
+        self.config.clear()
+        self.config.update(candidate)
+        # Preserve the established independent AUTO remark assignment contract.
+        self.config["remark"] = self.remark.text().strip() or "BONUS RELOAD AUTO"
         self.accept()
 
 
@@ -560,7 +643,7 @@ class Dashboard(QMainWindow):
         # Core services
         self.db = db
         self.cache = MemoryCache()
-        self.sheet = SheetService(config["google_credentials"], config)
+        self.sheet = SheetService(str(self.credentials_path), config)
         self.validator = Validator(config["bonus_rules"])
         self.queue: Optional[QueueManager] = None
         self.panel = PanelService(config, selectors)
@@ -1609,6 +1692,22 @@ class Dashboard(QMainWindow):
             QMessageBox.warning(self, "Missing URL", "Paste the Google Spreadsheet URL first.")
             return
 
+        try:
+            self.sheet.validate_credentials()
+        except CredentialValidationError as exc:
+            self._set_dot(self.dot_sheet, "err")
+            self.txt_sheet.setText("Credentials missing/invalid")
+            self.logger.error(f"Google credential preflight failed: {exc}")
+            QMessageBox.warning(
+                self, "Google Credentials Required",
+                f"{exc}\n\nOpen Settings → Google Credentials → Browse...",
+            )
+            self.btn_start.setEnabled(False)
+            self.btn_refresh.setEnabled(False)
+            self.btn_preview.setEnabled(False)
+            self.queue = None
+            return
+
         # v1.2 B-1: wrap the initial connect in the retry ladder so a
         # transient Google outage no longer forces the operator to click
         # CONNECT SHEET again. Each retry emits a WARN with the delay.
@@ -2496,12 +2595,24 @@ class Dashboard(QMainWindow):
     # EXPORT + SETTINGS
     # =============================================================
     def _open_settings(self) -> None:
-        dlg = SettingsDialog(self.config, self.config_path, self)
+        dlg = SettingsDialog(
+            self.config, self.config_path, self,
+            credentials_path=self.credentials_path,
+        )
         if dlg.exec() == QDialog.Accepted:
+            self.sheet.set_credentials_path(str(self.credentials_path))
+            self._set_dot(self.dot_sheet, "idle")
+            self.txt_sheet.setText("Disconnected")
+            self.btn_start.setEnabled(False)
+            self.btn_refresh.setEnabled(False)
+            self.btn_preview.setEnabled(False)
+            self.queue = None
             self.panel.panel_url = self.config.get("panel_url", "")
             self.validator = Validator(self.config["bonus_rules"])
             self._monitoring_interval = int(self.config.get("monitoring_interval_sec", 10))
-            self.logger.info("Settings updated")
+            self.logger.info(
+                "Settings and Google credentials updated; reconnect Google Sheet to use them"
+            )
 
     def _open_database(self) -> None:
         running = self.state in ("running", "monitoring", "recovering", "stopping")

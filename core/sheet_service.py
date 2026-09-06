@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Set
 from .manual_adjust_models import RawManualAdjustRow
 from .source_integrity import normalize_header
 from .performance_telemetry import timed
+from .credentials import validate_service_account_file
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -93,6 +94,16 @@ class SheetService:
             self.credentials_path, scopes=SCOPES
         )
         return gspread.authorize(creds)
+
+    def validate_credentials(self) -> None:
+        """Perform the deterministic, network-free credential preflight."""
+        validate_service_account_file(self.credentials_path)
+
+    def set_credentials_path(self, path: str) -> None:
+        """Switch credentials and discard every old authenticated handle."""
+        self.credentials_path = str(path)
+        self._client = None
+        self._clear_connection_state()
 
     def _clear_connection_state(self) -> None:
         """Remove every handle that can make a rejected source look usable."""

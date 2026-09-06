@@ -206,6 +206,18 @@ def test_panel_result_remains_authoritative_when_telemetry_record_fails(monkeypa
     assert result.outcome is AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT
 
 
+def test_old_success_alert_has_no_field_wait_penalty_or_manual_reload():
+    page = FakePage(stale_visible=True)
+    result = service(page).submit_deposit_classified(
+        "alice", 5000, "BONUS RELOAD AUTO")
+    assert result.outcome is AutoSubmitOutcome.SUCCESS
+    assert page.events.index(("navigation", "armed")) < page.events.index(
+        ("submit", "#submit"))
+    assert not any(event[0] == "locator-wait" and event[-1] == "hidden"
+                   for event in page.events)
+    assert page.reloads == 0 and page.gotos == 0
+
+
 def test_auto_worker_telemetry_preserves_success_state(tmp_path):
     configure({"performance_telemetry_enabled": True,
                "performance_slow_threshold_ms": 9999})

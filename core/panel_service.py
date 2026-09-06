@@ -333,17 +333,6 @@ class PanelService:
             telemetry.record_since("panel.form_fill", phase_started)
             current = "READY_TO_CLICK"; phase(current)
 
-            # Establish a clean pre-click baseline.  A visible old alert must
-            # disappear; otherwise it could be mistaken for this attempt.
-            alert = page.locator(panel["success_alert"]).first
-            if alert.count() and alert.is_visible():
-                try:
-                    alert.wait_for(state="hidden", timeout=field_wait)
-                except Exception as exc:
-                    current = "FAILED_PRE_CLICK"
-                    return result(AutoSubmitOutcome.FAILED_NOT_SUBMITTED, current,
-                                  exc, "STALE_SUCCESS_NOT_CLEARED")
-
             current = "SUBMIT_CLICK_BOUNDARY"; phase(current)
         except Exception as exc:
             # No call to page.click has been entered.
@@ -356,9 +345,36 @@ class PanelService:
                           accounting_error=isinstance(exc, _AutoPhasePersistenceError))
 
         phase_started = time.perf_counter()
+        result_deadline = phase_started + (success_wait / 1000.0)
+        click_returned = False
         try:
-            page.click(panel["submit"])
+            # Playwright 1.55's expect_navigation waiter is installed when the
+            # context manager is entered, before the click can trigger a fast
+            # same-URL document reload.  Page navigation is main-frame only;
+            # iframe navigations do not satisfy this expectation.
+            navigation = page.expect_navigation(
+                wait_until="domcontentloaded", timeout=success_wait
+            )
+            with navigation:
+                page.click(panel["submit"])
+                click_returned = True
+                telemetry.record_since("panel.submit_click", phase_started)
+                current = "CLICK_RETURNED"; phase(current)
+                current = "WAITING_NAVIGATION"; phase(current)
+            # Playwright also reports same-document History API/hash changes as
+            # navigation with a null response.  Require a main-resource
+            # response as proof that a new main-frame document was committed;
+            # its HTTP status is deliberately irrelevant to classification.
+            if navigation.value is None:
+                raise RuntimeError("same-document navigation is not a fresh document")
         except Exception as exc:
+            if click_returned:
+                return result(
+                    AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, current, exc,
+                    "click returned but fresh submit navigation was not proven",
+                    crossed=True,
+                    accounting_error=isinstance(exc, _AutoPhasePersistenceError),
+                )
             accounting_error = False
             try:
                 phase("CLICK_UNCERTAIN")
@@ -370,23 +386,24 @@ class PanelService:
                           "click call did not return; dispatch may have occurred",
                           accounting_error=accounting_error)
 
-        telemetry.record_since("panel.submit_click", phase_started)
         phase_started = time.perf_counter()
         try:
-            current = "CLICK_RETURNED"; phase(current)
+            current = "NAVIGATION_OBSERVED"; phase(current)
         except Exception as exc:
             return result(AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, current, exc,
-                          "click returned but durable click evidence failed",
+                          "fresh navigation observed but durable phase evidence failed",
                           crossed=True, accounting_error=True)
 
         try:
-            current = "WAITING_RESULT"; phase(current)
+            current = "WAITING_FRESH_RESULT"; phase(current)
             selector = panel["success_alert"]
-            page.wait_for_selector(selector, timeout=success_wait, state="visible")
-            evidence = "fresh success alert observed"
+            remaining_ms = max(1, int((result_deadline - time.perf_counter()) * 1000))
+            page.wait_for_selector(selector, timeout=remaining_ms, state="visible")
+            evidence = "fresh navigation observed; success alert visible"
             if success_text:
-                text = page.locator(selector).first.inner_text(timeout=1000)
-                evidence = str(text or "")
+                remaining_ms = max(1, int((result_deadline - time.perf_counter()) * 1000))
+                text = page.locator(selector).first.inner_text(timeout=min(1000, remaining_ms))
+                evidence = f"fresh navigation observed; success alert: {text or ''}"
                 if success_text.lower() not in evidence.lower():
                     current = "AMBIGUOUS_RESPONSE"
                     phase(current)

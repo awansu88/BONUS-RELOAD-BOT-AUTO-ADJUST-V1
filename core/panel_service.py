@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from playwright.sync_api import (
     Browser,
@@ -32,7 +33,119 @@ from playwright.sync_api import (
     TimeoutError as PWTimeout,
     sync_playwright,
 )
+from .logger import AppLogger
 from .performance_telemetry import get_telemetry, timed
+
+
+def _sanitize_url(value: object) -> str:
+    """Return only a URL's scheme, authority, and path for diagnostics."""
+    try:
+        parts = urlsplit(str(value or ""))
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        try:
+            authority = f"{host}:{parts.port}" if parts.port is not None else host
+        except ValueError:
+            authority = host
+        return urlunsplit((parts.scheme, authority, parts.path, "", ""))
+    except Exception:
+        return "<unavailable>"
+
+
+def _evidence_value(value: object) -> str:
+    """Keep evidence single-line and compact without exposing object reprs."""
+    if isinstance(value, bool):
+        return str(value).lower()
+    if value is None:
+        return "unavailable"
+    return str(value).replace("\r", " ").replace("\n", " ")[:200]
+
+
+def _emit_auto_evidence(fields: Dict[str, object], *, warning: bool = False) -> None:
+    """Best-effort persistent-only output; logging can never affect a submit."""
+    try:
+        message = "[AUTO_EVIDENCE] " + " ".join(
+            f"{key}={_evidence_value(value)}" for key, value in fields.items()
+        )
+        logger = AppLogger.get()
+        method = logger.diagnostic_warn if warning else logger.diagnostic
+        method(message)
+    except Exception:
+        pass
+
+
+def _page_evidence(page: Page) -> Dict[str, object]:
+    fields: Dict[str, object] = {}
+    try:
+        fields["page_url"] = _sanitize_url(page.url)
+    except Exception as exc:
+        fields["page_url_error"] = type(exc).__name__
+    try:
+        fields["page_closed"] = bool(page.is_closed())
+    except Exception as exc:
+        fields["page_closed_error"] = type(exc).__name__
+    try:
+        fields["ready_state"] = page.evaluate("document.readyState")
+    except Exception as exc:
+        fields["ready_state_error"] = type(exc).__name__
+    try:
+        fields["title"] = page.title()[:200]
+    except Exception as exc:
+        fields["title_error"] = type(exc).__name__
+    return fields
+
+
+def _collect_navigation_evidence(response, success_text: str) -> Dict[str, object]:
+    """Collect non-sensitive main-resource metadata, entirely fail-open."""
+    fields: Dict[str, object] = {}
+    for name in ("status", "ok"):
+        try:
+            fields[name] = getattr(response, name)
+        except Exception as exc:
+            fields[f"{name}_error"] = type(exc).__name__
+    try:
+        fields["final_url"] = _sanitize_url(response.url)
+    except Exception as exc:
+        fields["final_url_error"] = type(exc).__name__
+
+    request = None
+    try:
+        request = response.request
+        fields["method"] = request.method
+        fields["resource_type"] = request.resource_type
+    except Exception as exc:
+        fields["request_error"] = type(exc).__name__
+
+    redirects = 0
+    original = request
+    try:
+        while original is not None and original.redirected_from is not None:
+            redirects += 1
+            original = original.redirected_from
+        fields["redirects"] = redirects
+        if original is not None:
+            fields["original_url"] = _sanitize_url(original.url)
+    except Exception as exc:
+        fields["redirect_error"] = type(exc).__name__
+
+    try:
+        fields["content_type"] = response.header_value("content-type")
+    except Exception as exc:
+        fields["content_type_error"] = type(exc).__name__
+
+    body_started = time.perf_counter()
+    try:
+        body = response.body()
+        fields["body_available"] = True
+        fields["body_len"] = len(body)
+        needle = success_text.encode("utf-8").lower()
+        fields["success_text_present"] = bool(needle and needle in body.lower())
+    except Exception as exc:
+        fields["body_available"] = False
+        fields["body_error"] = type(exc).__name__
+    fields["body_read_ms"] = round((time.perf_counter() - body_started) * 1000, 1)
+    return fields
 
 
 @dataclass
@@ -287,6 +400,8 @@ class PanelService:
         hook failure after it returns is an accounting error with an ambiguous
         remote outcome.
         """
+        method_started = time.perf_counter()
+
         def result(outcome, phase, detail="", evidence="", *, crossed=False,
                    accounting_error=False):
             return AutoSubmitResult(outcome, crossed, phase, str(detail),
@@ -346,6 +461,8 @@ class PanelService:
 
         phase_started = time.perf_counter()
         result_deadline = phase_started + (success_wait / 1000.0)
+        submit_started = phase_started
+        click_returned_at: Optional[float] = None
         click_returned = False
         try:
             # Playwright 1.55's expect_navigation waiter is installed when the
@@ -357,15 +474,28 @@ class PanelService:
             ) as navigation_info:
                 page.click(panel["submit"])
                 click_returned = True
+                click_returned_at = time.perf_counter()
                 telemetry.record_since("panel.submit_click", phase_started)
                 current = "CLICK_RETURNED"; phase(current)
                 current = "WAITING_NAVIGATION"; phase(current)
+            navigation_completed_at = time.perf_counter()
             # Playwright also reports same-document History API/hash changes as
             # navigation with a null response.  Require a main-resource
             # response as proof that a new main-frame document was committed;
             # its HTTP status is deliberately irrelevant to classification.
             navigation_response = navigation_info.value
             if navigation_response is None:
+                _emit_auto_evidence({
+                    "user": user_id, "phase": "NAVIGATION",
+                    "response": "NONE",
+                    "click_entered_ms": round(
+                        (submit_started - method_started) * 1000, 1),
+                    "click_returned_ms": round(
+                        ((click_returned_at or submit_started) - method_started) * 1000, 1),
+                    "navigation_completed_ms": round(
+                        (navigation_completed_at - method_started) * 1000, 1),
+                    **_page_evidence(page),
+                }, warning=True)
                 raise RuntimeError("same-document navigation is not a fresh document")
         except Exception as exc:
             if click_returned:
@@ -394,11 +524,49 @@ class PanelService:
                           "fresh navigation observed but durable phase evidence failed",
                           crossed=True, accounting_error=True)
 
+        navigation_fields = _collect_navigation_evidence(navigation_response, success_text)
+        navigation_fields.update({
+            "user": user_id, "phase": "NAVIGATION",
+            "click_entered_ms": round((submit_started - method_started) * 1000, 1),
+            "click_returned_ms": round(
+                ((click_returned_at or submit_started) - method_started) * 1000, 1),
+            "navigation_completed_ms": round(
+                (navigation_completed_at - method_started) * 1000, 1),
+            **_page_evidence(page),
+        })
+        # Put identity/stage first in the persistent record while retaining
+        # collection order for the remaining compact evidence fields.
+        navigation_fields = {
+            "user": navigation_fields.pop("user"),
+            "phase": navigation_fields.pop("phase"),
+            **navigation_fields,
+        }
+        _emit_auto_evidence(navigation_fields)
+
+        phase_started = time.perf_counter()
         try:
             current = "WAITING_FRESH_RESULT"; phase(current)
             selector = panel["success_alert"]
+            pre_count: object = "unavailable"
+            pre_visible: object = "unavailable"
+            try:
+                success_locator = page.locator(selector)
+                pre_count = success_locator.count()
+                pre_visible = bool(pre_count and success_locator.first.is_visible())
+            except Exception as exc:
+                pre_count = f"error:{type(exc).__name__}"
             remaining_ms = max(1, int((result_deadline - time.perf_counter()) * 1000))
+            selector_started = time.perf_counter()
             page.wait_for_selector(selector, timeout=remaining_ms, state="visible")
+            selector_wait_ms = round((time.perf_counter() - selector_started) * 1000, 1)
+            _emit_auto_evidence({
+                "user": user_id, "phase": "RESULT_WAIT", "selector": selector,
+                "pre_count": pre_count, "pre_visible": pre_visible,
+                "wait_timeout_ms": remaining_ms, "result": "VISIBLE",
+                "selector_wait_ms": selector_wait_ms,
+                "total_submit_ms": round((time.perf_counter() - method_started) * 1000, 1),
+                **_page_evidence(page),
+            })
             evidence = "fresh navigation observed; success alert visible"
             if success_text:
                 remaining_ms = max(1, int((result_deadline - time.perf_counter()) * 1000))
@@ -415,6 +583,19 @@ class PanelService:
             return result(AutoSubmitOutcome.SUCCESS, current, evidence=evidence,
                           crossed=True)
         except Exception as exc:
+            _emit_auto_evidence({
+                "user": user_id, "phase": "RESULT_WAIT",
+                "selector": panel["success_alert"],
+                "pre_count": locals().get("pre_count", "unavailable"),
+                "pre_visible": locals().get("pre_visible", "unavailable"),
+                "wait_timeout_ms": locals().get("remaining_ms", "unavailable"),
+                "result": ("TIMEOUT" if "Timeout" in type(exc).__name__ else "ERROR"),
+                "error": type(exc).__name__,
+                "selector_wait_ms": round(
+                    (time.perf_counter() - locals().get("selector_started", time.perf_counter())) * 1000, 1),
+                "total_submit_ms": round((time.perf_counter() - method_started) * 1000, 1),
+                **_page_evidence(page),
+            }, warning=True)
             # Once page.click returned, every inability to prove fresh success
             # remains quota-bearing UNKNOWN.
             final_phase = current if current == "AMBIGUOUS_RESPONSE" else "AMBIGUOUS_RESPONSE"

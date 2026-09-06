@@ -51,6 +51,9 @@ from core.runtime_paths import (  # noqa: E402
     RuntimeLayoutError, mark_initialized, prepare_config, prepare_runtime,
     resolve_runtime_paths,
 )
+from core.single_instance import (  # noqa: E402
+    InstanceAlreadyRunning, SingleInstanceError, SingleInstanceGuard,
+)
 
 
 def _resolve_startup_paths(environ=None):  # type: ignore[no-untyped-def]
@@ -132,10 +135,8 @@ def _install_uncaught_exception_handler(logger: AppLogger) -> None:
     sys.excepthook = _hook
 
 
-def main() -> int:
-    app = QApplication(sys.argv)
-    app.setApplicationName("Bonus Reload Automation")
-
+def _run_owned(app: QApplication) -> int:
+    """Run startup and the UI while the caller retains process ownership."""
     try:
         runtime_paths, config, selectors, runtime = _prepare_startup()
     except Exception as exc:
@@ -244,6 +245,44 @@ def main() -> int:
     except Exception:
         pass
     return exit_code
+
+
+DUPLICATE_INSTANCE_EXIT_CODE = 4
+SINGLE_INSTANCE_FAILURE_EXIT_CODE = 5
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("Bonus Reload Automation")
+
+    # This product-wide lock intentionally precedes _prepare_startup: a rejected
+    # process must not migrate runtime data, dirty crash state, or open SQLite.
+    try:
+        guard = SingleInstanceGuard.acquire()
+    except InstanceAlreadyRunning:
+        QMessageBox.critical(
+            None,
+            "Bonus Reload Automation",
+            "Bonus Reload Automation is already running.\n\n"
+            "Close the existing instance before starting another.",
+        )
+        return DUPLICATE_INSTANCE_EXIT_CODE
+    except SingleInstanceError as exc:
+        QMessageBox.critical(
+            None,
+            "Bonus Reload Automation",
+            "Could not establish single-instance ownership.\n"
+            "Startup stopped for safety.\n\n"
+            f"{exc}",
+        )
+        return SINGLE_INSTANCE_FAILURE_EXIT_CODE
+
+    try:
+        return _run_owned(app)
+    finally:
+        # _run_owned closes the database and marks the crash state clean before
+        # returning.  All early returns and Python exception unwinding land here.
+        guard.release()
 
 
 if __name__ == "__main__":

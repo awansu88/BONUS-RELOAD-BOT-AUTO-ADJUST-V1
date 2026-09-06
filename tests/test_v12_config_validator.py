@@ -25,7 +25,7 @@ VALID_CFG = {
         "true_amount": 6, "tx_id": 9,
     },
     "required_headers": {
-        "user_id": "USER ID", "sheet_data": "SHEET DATA",
+        "user_id": "USER ID", "sheet_data": "KEY_ID",
         "time_stamp": "TIME STAMP", "true_amount": "TRUE AMOUNT", "tx_id": "TX_ID",
     },
     "bonus_rules": {

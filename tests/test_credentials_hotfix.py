@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,6 +38,68 @@ def config():
         "columns": {}, "required_headers": {},
         "sheet_names": {"master": "MASTER", "manual_bonus_reload": "MANUAL"},
     }
+
+
+def production_sheet_config():
+    return {
+        "columns": {"user_id": 2, "sheet_data": 4, "time_stamp": 5,
+                    "true_amount": 6, "tx_id": 9},
+        "required_headers": {"user_id": "USER ID", "sheet_data": "KEY_ID",
+                             "time_stamp": "TIME STAMP", "true_amount": "TRUE AMOUNT",
+                             "tx_id": "TX_ID"},
+        "sheet_names": {"master": "MASTER", "manual_bonus_reload": "MANUAL"},
+    }
+
+
+class Worksheet:
+    def __init__(self, title, headers=()): self.title, self.headers = title, list(headers)
+    def row_values(self, _): return list(self.headers)
+
+
+class Spreadsheet:
+    title = "PRODUCTION"
+    def __init__(self, tabs, headers):
+        self.tabs = {name: Worksheet(name, headers if name == "MASTER" else ())
+                     for name in tabs}
+    def worksheets(self): return list(self.tabs.values())
+    def worksheet(self, name): return self.tabs[name]
+
+
+def connect_result(monkeypatch, *, tabs=("MASTER", "MANUAL"), column_d="KEY_ID"):
+    headers = ["", "USER ID", "", column_d, "TIME STAMP",
+               "TRUE AMOUNT", "", "", "TX_ID"]
+    service = SheetService("unused", production_sheet_config())
+    book = Spreadsheet(tabs, headers)
+    monkeypatch.setattr(
+        service, "_authorize", lambda: SimpleNamespace(open_by_key=lambda _: book)
+    )
+    return service.connect("x" * 20)
+
+
+def test_default_config_uses_production_key_id_contract():
+    default = json.loads(Path("config/config.json").read_text(encoding="utf-8"))
+    assert default["columns"]["sheet_data"] == 4
+    assert default["required_headers"]["sheet_data"] == "KEY_ID"
+
+
+def test_production_contract_connects_and_source_contract_errors_are_not_retryable(monkeypatch):
+    assert connect_result(monkeypatch).ok
+    assert connect_result(monkeypatch, column_d="SHEET DATA").retryable is False
+    assert connect_result(monkeypatch, column_d="WRONG").retryable is False
+    assert connect_result(monkeypatch, column_d="").retryable is False
+    assert connect_result(monkeypatch, tabs=("MANUAL",)).retryable is False
+    assert connect_result(monkeypatch, tabs=("MASTER",)).retryable is False
+    assert SheetService("unused", production_sheet_config()).connect("bad-url").retryable is False
+
+
+def test_unclassified_remote_failure_remains_retryable(monkeypatch):
+    service = SheetService("unused", production_sheet_config())
+    monkeypatch.setattr(
+        service, "_authorize",
+        lambda: (_ for _ in ()).throw(ConnectionError("temporary network outage")),
+    )
+    info = service.connect("x" * 20)
+    assert not info.ok and info.retryable
 
 
 def test_valid_service_account_passes(tmp_path):
@@ -164,6 +227,8 @@ def test_connect_preflight_precedes_retry_and_transient_ladder_is_preserved():
     assert handler.index("self.sheet.validate_credentials()") < handler.index("retry_with_ladder(")
     assert "except CredentialValidationError" in handler
     assert "info = self.sheet.connect(url)" in handler
+    assert "if not info.ok and info.retryable:" in handler
+    assert handler.index("if not info.ok:") > handler.index("retry_with_ladder(")
 
 
 def test_old_config_without_hotfix_key_remains_supported(tmp_path):

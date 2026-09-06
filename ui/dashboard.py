@@ -1738,7 +1738,7 @@ class Dashboard(QMainWindow):
         # CONNECT SHEET again. Each retry emits a WARN with the delay.
         def _do_connect():
             info = self.sheet.connect(url)
-            if not info.ok:
+            if not info.ok and info.retryable:
                 # Raise so the ladder retries. `RuntimeError` is caught
                 # by the ladder's default `retry_on=(Exception,)`.
                 raise RuntimeError(info.error or "Connection failed")
@@ -1760,6 +1760,26 @@ class Dashboard(QMainWindow):
             self.txt_sheet.setText("Error")
             self.logger.error(f"Connect failed after retry ladder: {exc.last_error}")
             QMessageBox.critical(self, "Connection failed", str(exc.last_error))
+            self.btn_start.setEnabled(False)
+            self.btn_refresh.setEnabled(False)
+            self.btn_preview.setEnabled(False)
+            self.queue = None
+            return
+
+        if not info.ok:
+            self._set_dot(self.dot_sheet, "err")
+            self.txt_sheet.setText("Connection rejected")
+            self.logger.error(f"Google Sheet connection rejected: {info.error}")
+            message = info.error
+            if info.missing_columns:
+                message = (
+                    "Google Sheet structure does not match the required MASTER format.\n\n"
+                    f"{info.error}\n\n"
+                    "Check that the correct production spreadsheet is selected."
+                )
+            QMessageBox.critical(
+                self, "Google Sheet Connection Error", message,
+            )
             self.btn_start.setEnabled(False)
             self.btn_refresh.setEnabled(False)
             self.btn_preview.setEnabled(False)

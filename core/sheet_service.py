@@ -9,7 +9,7 @@ Responsibilities:
     * Parse spreadsheet ID out of a full URL (never hardcoded).
     * Validate connectivity, worksheet presence, and REQUIRED columns:
         B = USER ID
-        D = SHEET DATA
+        D = KEY_ID
         E = TIME STAMP
         F = TRUE AMOUNT
         I = TX_ID
@@ -58,6 +58,7 @@ class ConnectionInfo:
     spreadsheet_id: str = ""
     tabs: List[str] = field(default_factory=list)
     missing_columns: List[str] = field(default_factory=list)
+    retryable: bool = True
 
 
 class SheetService:
@@ -117,7 +118,7 @@ class SheetService:
         self._clear_connection_state()
         sid = self.extract_spreadsheet_id(url_or_id)
         if not sid:
-            return ConnectionInfo(False, error="Invalid spreadsheet URL")
+            return ConnectionInfo(False, retryable=False, error="Invalid spreadsheet URL")
 
         try:
             self._client = self._authorize()
@@ -130,6 +131,7 @@ class SheetService:
                 self._clear_connection_state()
                 return ConnectionInfo(
                     False,
+                    retryable=False,
                     error=f"Missing worksheet: {self.sheet_names['master']}",
                     tabs=tabs,
                 )
@@ -137,6 +139,7 @@ class SheetService:
                 self._clear_connection_state()
                 return ConnectionInfo(
                     False,
+                    retryable=False,
                     error=f"Missing worksheet: {self.sheet_names['manual_bonus_reload']}",
                     tabs=tabs,
                 )
@@ -155,6 +158,7 @@ class SheetService:
                 self._clear_connection_state()
                 return ConnectionInfo(
                     False,
+                    retryable=False,
                     error="MASTER is missing required columns: " + ", ".join(missing),
                     title=title,
                     tabs=tabs,
@@ -173,7 +177,8 @@ class SheetService:
         except FileNotFoundError:
             self._clear_connection_state()
             return ConnectionInfo(
-                False, error=f"Credentials file not found: {self.credentials_path}"
+                False, retryable=False,
+                error=f"Credentials file not found: {self.credentials_path}"
             )
         except Exception as exc:  # pragma: no cover - defensive
             self._clear_connection_state()

@@ -64,9 +64,9 @@ def test_corrupt_or_exhausted_failed_state_is_not_retryable(tmp_path, mutation):
 @pytest.mark.parametrize("legacy_result", ["FAILED", "SUCCESS", "LIMIT", "INVALID", "MANUAL BONUS"])
 def test_any_legacy_outcome_permanently_blocks_retry(tmp_path, legacy_result):
     db = DatabaseService(str(tmp_path / "db"))
-    if legacy_result == "SUCCESS":
-        # Construct the legacy row first because SUCCESS finalization is not
-        # part of this corruption/legacy compatibility test.
+    if legacy_result in {"SUCCESS", "FAILED"}:
+        # Construct legacy outcomes first: PATCH-07 intentionally prevents
+        # generic FAILED/SUCCESS from bypassing an already-owned AUTO TX.
         db.insert("tx", "alice", 100_000, 10_000, legacy_result, "MASTER", DAY)
         assert db.reserve_auto_transaction("tx", "alice", DAY, 100_000, 10_000) is None
     else:
@@ -248,14 +248,16 @@ def test_retry_fresh_invalid_blocks_remote_and_future_retry(tmp_path):
     # The worker validates its current MASTER-derived QueueItem again.  An
     # amount below the frozen 50k tier is deterministically INVALID.
     q.next_ready().amount = 49_999
-    worker, calls, _ = worker_dashboard(db, q)
+    worker, calls, finalised = worker_dashboard(db, q)
     run_worker(worker)
     assert calls == []
     assert db.get_auto_attempts("tx") == [first_before]
     assert db._conn.execute(
         "SELECT result FROM processed_transactions WHERE tx_id='tx'"
-    ).fetchone() == ("INVALID",)
-    assert not db.is_auto_retry_eligible("tx")
+    ).fetchone() is None
+    assert db.is_auto_retry_eligible("tx")
+    assert worker.stop_requested
+    assert finalised == ["Worker halted: durable TX terminal persistence failure"]
 
 
 def test_worker_retry_source_mismatch_never_reaches_panel(tmp_path):

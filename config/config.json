@@ -32,6 +32,10 @@
     "manual_reload_interval_sec": 90,
     "polling_delay_sec": 2,
     "monitoring_interval_sec": 10,
+    "performance_telemetry_enabled": true,
+    "performance_summary_interval_seconds": 60,
+    "performance_slow_threshold_ms": 1000,
+    "performance_ui_stall_threshold_ms": 1000,
     "remark": "BONUS RELOAD AUTO",
     "manual_adjust": {
         "execution_enabled": true,

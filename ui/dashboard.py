@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import json
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -68,6 +69,9 @@ from core.crash_state import CrashState, CrashStateStore
 from core.manual_adjust_loader import ManualAdjustLoader
 from core.manual_adjust_repository import ManualAdjustRepository
 from core.manual_adjust_controller import ManualAdjustController
+from core.performance_telemetry import (
+    EventLoopStallDetector, configure as configure_performance,
+)
 from ui.manual_adjust_state import (ManualPreviewState, OperatingMode,
                                     manual_execution_blocks_auto,
                                     persist_manual_remark)
@@ -551,6 +555,7 @@ class Dashboard(QMainWindow):
         self.logger = AppLogger.get()
         self.logger.add_listener(lambda line: self.log_line.emit(line))
         self.log_line.connect(self._append_log)
+        self.performance = configure_performance(config, self.logger)
 
         # Core services
         self.db = db
@@ -580,6 +585,23 @@ class Dashboard(QMainWindow):
         self.manual_worker_timer.timeout.connect(self._manual_worker_step)
         self.manual_heartbeat_timer = QTimer(self)
         self.manual_heartbeat_timer.timeout.connect(self._manual_heartbeat)
+
+        # Passive UI-thread heartbeat. Lateness is elapsed callback time minus
+        # this 500 ms interval; it never triggers recovery or changes state.
+        self.performance_stall_detector = EventLoopStallDetector(
+            self.performance, interval_ms=500,
+            threshold_ms=config.get("performance_ui_stall_threshold_ms", 1000))
+        self.performance_heartbeat_timer = QTimer(self)
+        self.performance_heartbeat_timer.setInterval(500)
+        self.performance_heartbeat_timer.timeout.connect(
+            self.performance_stall_detector.tick)
+        self.performance_heartbeat_timer.start()
+        self.performance_summary_timer = QTimer(self)
+        summary_seconds = max(1, int(config.get(
+            "performance_summary_interval_seconds", 60)))
+        self.performance_summary_timer.setInterval(summary_seconds * 1000)
+        self.performance_summary_timer.timeout.connect(self._performance_summary)
+        self.performance_summary_timer.start()
 
         # Periodic panel-alive poll: detects operator closing the browser
         # window (X) so Panel Status can auto-return to "Closed".
@@ -678,6 +700,18 @@ class Dashboard(QMainWindow):
             1 for name in dir(self)
             if isinstance(getattr(self, name, None), QTimer)
         )
+
+    def _performance_summary(self) -> None:
+        """Emit bounded cumulative summaries and cheap resource context."""
+        try:
+            self.performance.summarize(
+                int(self.config.get("performance_summary_interval_seconds", 60)),
+                queue_size=self.queue.ready_count() if self.queue else 0,
+                active_metrics=self.performance.active_metric_count,
+                thread_count=threading.active_count(),
+            )
+        except Exception:
+            pass
 
     def _watchdog_tick(self) -> None:
         """Category B watchdog step (B-3, B-5). Never raises, logs warnings
@@ -1669,6 +1703,8 @@ class Dashboard(QMainWindow):
     # in the worst case, but usually amortised by the TTL below.
     _MANUAL_FRESH_TTL_SEC = 2.0
 
+    @__import__("core.performance_telemetry", fromlist=["timed"]).timed(
+        "auto.manual_preflight")
     def _refresh_manual_list_now(self) -> None:
         """Force a fresh MANUAL BONUS RELOAD read if the last one is older
         than `_MANUAL_FRESH_TTL_SEC` seconds. Silent on transient failures
@@ -1857,6 +1893,10 @@ class Dashboard(QMainWindow):
     # =============================================================
     # WORKER STEP
     # =============================================================
+    @__import__("core.performance_telemetry", fromlist=["timed"]).timed(
+        "auto.transaction.total", context=lambda self: (
+        {"tx_id": self.queue.next_ready().tx_id}
+        if self.queue is not None and self.queue.next_ready() is not None else None))
     def _worker_step(self) -> None:
         if self.manual_state.mode is OperatingMode.MANUAL:
             self.worker_timer.stop()
@@ -2298,7 +2338,9 @@ class Dashboard(QMainWindow):
 
         # Countdown hit zero -> refresh the queue.
         try:
-            stats = self.queue.refill()
+            with __import__("core.performance_telemetry", fromlist=["get_telemetry"]).get_telemetry().measure(
+                    "monitoring.refill.total"):
+                stats = self.queue.refill()
             self._stamp_sync()
             if stats.ready > 0:
                 self._log_queue_summary(stats)
@@ -2526,6 +2568,7 @@ class Dashboard(QMainWindow):
             "manual_timer", "worker_timer", "recovery_timer", "panel_timer",
             "metrics_timer", "watchdog_timer",
             "manual_worker_timer", "manual_heartbeat_timer",
+            "performance_heartbeat_timer", "performance_summary_timer",
         ):
             t = getattr(self, name, None)
             if isinstance(t, QTimer):
@@ -2533,6 +2576,11 @@ class Dashboard(QMainWindow):
                     t.stop()
                 except Exception:
                     pass
+        try:
+            self.performance_stall_detector.shutdown()
+            self.performance.shutdown()
+        except Exception:
+            pass
 
         # Persist Manual's cooperative stop before closing the shared panel.
         # A current SUBMITTING transaction is deliberately left untouched so

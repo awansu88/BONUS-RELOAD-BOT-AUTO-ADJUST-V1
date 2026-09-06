@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Set
 
 from .manual_adjust_models import RawManualAdjustRow
 from .source_integrity import normalize_header
+from .performance_telemetry import timed
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -207,6 +208,7 @@ class SheetService:
         return missing
 
     # ---------------------------------------------------------------- reads
+    @timed("sheet.master_read")
     def read_master_rows(self) -> List[MasterRow]:
         """Read MASTER once and return small MasterRow objects.
 
@@ -241,6 +243,7 @@ class SheetService:
             )
         return rows
 
+    @timed("sheet.manual_bonus_read")
     def read_manual_set(self) -> Set[str]:
         """Manual bonus list — USER IDs live in Column B only."""
         if not self._manual:

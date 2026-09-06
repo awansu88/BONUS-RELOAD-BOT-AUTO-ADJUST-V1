@@ -11,7 +11,8 @@ from pathlib import Path, PureWindowsPath
 import pytest
 
 from core.runtime_paths import (
-    RuntimeLayoutError, mark_initialized, prepare_config, prepare_runtime,
+    RuntimeLayoutError, mark_initialized, migrate_legacy_master_header,
+    prepare_config, prepare_runtime,
     read_layout_state, remap_runtime_path, resolve_runtime_paths,
     sqlite_readonly_uri, sqlite_snapshot,
 )
@@ -88,6 +89,64 @@ def test_config_upgrade_precedence_and_missing_guard(tmp_path):
     with pytest.raises(RuntimeLayoutError, match="incomplete"):
         prepare_config(p)
     assert not p.selectors_path.exists()
+
+
+def test_initialized_persistent_config_migrates_only_stale_master_header(tmp_path):
+    p = paths(tmp_path); seed_bundle(p); prepare_config(p)
+    preserved = {
+        "panel_url": "https://operator.example",
+        "spreadsheet_url": "production-sheet",
+        "google_credentials": "credentials/service_account.json",
+        "bonus_rules": {"daily_limit": 12345},
+        "browser": {"headless": True},
+        "required_headers": {"sheet_data": "SHEET DATA", "tx_id": "TX_ID"},
+    }
+    p.config_path.write_text(json.dumps(preserved), encoding="utf-8")
+    sqlite3.connect(p.data_dir / "processed.db").close()
+    mark_initialized(p, p.data_dir / "processed.db")
+
+    prepare_config(p)
+    migrated = json.loads(p.config_path.read_text(encoding="utf-8"))
+    assert migrated == {
+        **preserved,
+        "required_headers": {"sheet_data": "KEY_ID", "tx_id": "TX_ID"},
+    }
+
+
+@pytest.mark.parametrize("value", ["KEY_ID", "CUSTOM_ID", None])
+def test_master_header_migration_preserves_correct_custom_and_missing_values(
+        tmp_path, monkeypatch, value):
+    path = tmp_path / "config.json"
+    config = {"panel_url": "preserve", "required_headers": {}}
+    if value is not None:
+        config["required_headers"]["sheet_data"] = value
+    path.write_text(json.dumps(config), encoding="utf-8")
+    replaces = []
+    monkeypatch.setattr(runtime_paths_module.os, "replace", lambda *args: replaces.append(args))
+    assert migrate_legacy_master_header(path) is False
+    assert replaces == []
+    assert json.loads(path.read_text()) == config
+
+
+def test_master_header_migration_is_idempotent_and_atomic_on_write_failure(
+        tmp_path, monkeypatch):
+    path = tmp_path / "config.json"
+    legacy = {"keep": {"all": [1, 2]},
+              "required_headers": {"sheet_data": "SHEET DATA"}}
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    assert migrate_legacy_master_header(path) is True
+    first = path.read_bytes()
+    assert migrate_legacy_master_header(path) is False
+    assert path.read_bytes() == first
+
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+    monkeypatch.setattr(
+        runtime_paths_module.os, "replace",
+        lambda *_: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    with pytest.raises(RuntimeLayoutError, match="left untouched"):
+        migrate_legacy_master_header(path)
+    assert json.loads(path.read_text()) == legacy
 
 
 def test_sqlite_wal_snapshot_preserves_rows_and_source(tmp_path):

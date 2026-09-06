@@ -160,13 +160,19 @@ class EventLoopStallDetector:
         self.interval_ms = float(interval_ms)
         self.threshold_ms = float(threshold_ms)
         self.clock = clock or time.perf_counter
-        self._last = self.clock()
+        # Construction can happen well before Qt starts dispatching events.
+        # The first callback therefore establishes the runtime baseline rather
+        # than comparing event-loop startup time with the heartbeat interval.
+        self._last = None
         self._closed = False
 
     def tick(self) -> float:
         if self._closed:
             return 0.0
         now = self.clock()
+        if self._last is None:
+            self._last = now
+            return 0.0
         stall = max(0.0, (now - self._last) * 1000.0 - self.interval_ms)
         self._last = now
         if stall >= self.threshold_ms:

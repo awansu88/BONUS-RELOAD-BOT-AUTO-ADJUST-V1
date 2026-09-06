@@ -163,6 +163,7 @@ def prepare_config(paths: RuntimePaths) -> None:
                 f"{paths.data_dir}; missing: {', '.join(map(str, missing))}. "
                 "Bundled defaults were not restored."
             )
+        migrate_legacy_master_header(paths.config_path)
         return
     if not paths.config_dir.exists():
         legacy = paths.app_dir / "config"
@@ -180,6 +181,32 @@ def prepare_config(paths: RuntimePaths) -> None:
     missing = [p for p in (paths.config_path, paths.selectors_path) if not p.is_file()]
     if missing:
         raise RuntimeLayoutError(f"Required persistent configuration missing: {missing}")
+    migrate_legacy_master_header(paths.config_path)
+
+
+def migrate_legacy_master_header(config_path: Path) -> bool:
+    """Correct only the known stale Column-D contract in persistent config."""
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeLayoutError(
+            f"Persistent configuration is unreadable at {config_path}: {exc}"
+        ) from exc
+    headers = config.get("required_headers")
+    if not isinstance(headers, dict) or headers.get("sheet_data") != "SHEET DATA":
+        return False
+    headers["sheet_data"] = "KEY_ID"
+    temp = _temp_for(config_path)
+    try:
+        temp.write_text(json.dumps(config, indent=4) + "\n", encoding="utf-8")
+        os.replace(temp, config_path)
+    except Exception as exc:
+        temp.unlink(missing_ok=True)
+        raise RuntimeLayoutError(
+            "Failed to migrate legacy MASTER column D header contract; "
+            f"the original config at {config_path} was left untouched: {exc}"
+        ) from exc
+    return True
 
 
 def remap_runtime_path(value: str | Path, paths: RuntimePaths) -> tuple[Path, Optional[Path]]:

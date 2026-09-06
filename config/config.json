@@ -16,7 +16,7 @@
     },
     "required_headers": {
         "user_id":     "USER ID",
-        "sheet_data":  "SHEET DATA",
+        "sheet_data":  "KEY_ID",
         "time_stamp":  "TIME STAMP",
         "true_amount": "TRUE AMOUNT",
         "tx_id":       "TX_ID"

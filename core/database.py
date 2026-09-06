@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from .performance_telemetry import timed
 from .timestamp_utils import parse_transaction_date
 from .source_integrity import (
     AccountingIntegrityError,
@@ -278,6 +279,7 @@ class DatabaseService:
             (str(tx_id),),
         ).fetchone() is not None
 
+    @timed("db.filter_new_tx_ids")
     def filter_new_auto_tx_ids(self, tx_ids: Iterable[str]) -> Set[str]:
         return self.filter_new_tx_ids(str(tx) for tx in tx_ids if tx)
 
@@ -323,6 +325,7 @@ class DatabaseService:
         columns = [d[0] for d in cur.description]
         return [dict(zip(columns, row)) for row in cur.fetchall()]
 
+    @timed("db.daily_bonus_lookup")
     def daily_bonus_exposure_for_transaction_date(
         self, username: str, transaction_date_iso: str
     ) -> int:
@@ -340,6 +343,7 @@ class DatabaseService:
         ).fetchone()
         return committed + int(row[0] or 0)
 
+    @timed("db.auto_reservation")
     def reserve_auto_transaction(
         self, tx_id: str, username: str, business_date: str, deposit_amount: int,
         requested_bonus: int, sheet_name: str = "", source_timestamp: str = "",
@@ -539,6 +543,7 @@ class DatabaseService:
                 self._conn.execute("ROLLBACK")
             raise
 
+    @timed("db.processed_insert_or_finalize")
     def finalize_auto_success(self, tx_id: str, classified_outcome: str) -> None:
         """Atomically create the legacy audit row and resolve journal + attempt."""
         if str(classified_outcome) != "SUCCESS":
@@ -826,6 +831,7 @@ class DatabaseService:
                 self._conn.execute("ROLLBACK")
             raise
 
+    @timed("db.processed_insert_or_finalize")
     def bulk_insert(self, rows: List[Tuple], *, require_all: bool = False) -> int:
         """Rows: (tx_id, username, amount, bonus, result, sheet_name, timestamp)."""
         if not rows:

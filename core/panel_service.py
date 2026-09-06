@@ -32,6 +32,7 @@ from playwright.sync_api import (
     TimeoutError as PWTimeout,
     sync_playwright,
 )
+from .performance_telemetry import get_telemetry, timed
 
 
 @dataclass
@@ -272,6 +273,8 @@ class PanelService:
         except Exception as exc:  # pragma: no cover - defensive
             return SubmitResult(False, f"error: {exc}")
 
+    @timed("panel.submit.total", context=lambda self, user_id, bonus, remark, **kw: {
+        "user_id": user_id})
     def submit_deposit_classified(
         self, user_id: str, bonus: int, remark: str,
         phase_hook: Optional[Callable[[str], None]] = None,
@@ -311,10 +314,14 @@ class PanelService:
                 except Exception as exc:
                     raise _AutoPhasePersistenceError(str(exc)) from exc
 
+        telemetry = get_telemetry()
+        phase_started = time.perf_counter()
         current = "FORM_STARTED"
         try:
             phase(current)
             page.wait_for_selector(panel["username"], timeout=field_wait)
+            telemetry.record_since("panel.fields_ready", phase_started)
+            phase_started = time.perf_counter()
             self._fill(page, panel["username"], str(user_id))
             current = "USERNAME_FILLED"; phase(current)
             self._fill(page, panel["amount"], str(int(bonus)))
@@ -323,6 +330,7 @@ class PanelService:
             current = "REMARK_FILLED"; phase(current)
             self._maybe_select(page, panel.get("payment_dropdown"), defaults.get("payment"))
             self._maybe_select(page, panel.get("currency_dropdown"), defaults.get("currency"))
+            telemetry.record_since("panel.form_fill", phase_started)
             current = "READY_TO_CLICK"; phase(current)
 
             # Establish a clean pre-click baseline.  A visible old alert must
@@ -347,6 +355,7 @@ class PanelService:
                           "FAILED_PRE_CLICK", exc, current,
                           accounting_error=isinstance(exc, _AutoPhasePersistenceError))
 
+        phase_started = time.perf_counter()
         try:
             page.click(panel["submit"])
         except Exception as exc:
@@ -361,6 +370,8 @@ class PanelService:
                           "click call did not return; dispatch may have occurred",
                           accounting_error=accounting_error)
 
+        telemetry.record_since("panel.submit_click", phase_started)
+        phase_started = time.perf_counter()
         try:
             current = "CLICK_RETURNED"; phase(current)
         except Exception as exc:
@@ -382,6 +393,8 @@ class PanelService:
                     return result(AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, current,
                                   f"unexpected alert: {text!r}", evidence, crossed=True)
             current = "SUCCESS_OBSERVED"; phase(current)
+            telemetry.record_since("panel.outcome_wait", phase_started,
+                                   result="SUCCESS")
             return result(AutoSubmitOutcome.SUCCESS, current, evidence=evidence,
                           crossed=True)
         except Exception as exc:
@@ -466,6 +479,7 @@ class PanelService:
             return ManualSubmitResult(ManualSubmitOutcome.UNKNOWN, True, current, str(exc))
 
     # ------------------------------------------------------------------
+    @timed("panel.screenshot")
     def screenshot(self, path: str) -> None:
         if self._page and not self._page.is_closed():
             try:

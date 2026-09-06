@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+import time
 from typing import Dict, List, Optional, Tuple
 
 from .database import DatabaseService
@@ -22,6 +23,7 @@ from .sheet_service import MasterRow, SheetService
 from .timestamp_utils import parse_transaction_date
 from .validator import ValidationResult, Validator
 from .source_integrity import SourceIntegrityError, canonical_username_key
+from .performance_telemetry import get_telemetry, timed
 
 
 @dataclass(slots=True)
@@ -72,6 +74,8 @@ class QueueManager:
         self._stats = QueueStats()
 
     # ------------------------------------------------------------------
+    @timed("queue.refill.total", context=lambda self: {
+        "batch_size": self.batch_size, "ready_before": self.ready_count()})
     def refill(self) -> QueueStats:
         """Read next batch, dedup via SQLite, validate, commit skips, keep
         only READY in the worker queue. Preview is fully rebuilt each call
@@ -81,10 +85,15 @@ class QueueManager:
         TRANSACTION DATE parsed from the Google Sheets `TIME STAMP` cell,
         never by adjustment execution time.
         """
+        telemetry = get_telemetry()
+        phase_started = time.perf_counter()
         rows = self.sheet.read_master_rows()
+        telemetry.record_since("queue.refill.sheet_read", phase_started,
+                               master_rows_seen=len(rows))
 
         # Pre-filter: ordinary known transactions remain deduplicated, while
         # the one strictly proven retry state is admitted as a distinct type.
+        phase_started = time.perf_counter()
         already = set()
         retry_ids = set()
         tx_ids = [r.tx_id for r in rows]
@@ -94,9 +103,13 @@ class QueueManager:
             retry_ids = {t for t in known if self.db.is_auto_retry_eligible(t)}
             already = known - retry_ids
         pending = [r for r in rows if r.tx_id not in already]
+        telemetry.record_since("queue.refill.dedup", phase_started,
+                               master_rows_seen=len(rows), tx_ids_checked=len(tx_ids),
+                               pending_count=len(pending))
 
         # Validate/collapse candidate identities before any preview, cache, or
         # database mutation. Known terminal IDs were removed above deliberately.
+        phase_started = time.perf_counter()
         unique = []
         seen = {}
         for r in pending:
@@ -216,6 +229,9 @@ class QueueManager:
         self._ready = ready
         self._last_preview = preview
         self._stats = stats
+        telemetry.record_since("queue.refill.validation_build", phase_started,
+                               pending_count=len(pending), ready_count=len(ready),
+                               batch_size=len(batch))
         return stats
 
     # ------------------------------------------------------------------

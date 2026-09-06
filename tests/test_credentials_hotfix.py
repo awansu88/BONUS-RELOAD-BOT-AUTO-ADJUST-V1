@@ -99,9 +99,50 @@ def test_settings_uses_picker_managed_path_and_prepare_then_commit_contract():
     assert "QFileDialog.getOpenFileName" in settings
     assert '"JSON Files (*.json)"' in settings
     assert "self.creds.setReadOnly(True)" in settings
-    assert "install_service_account_file(source, self.credentials_path)" in settings
+    assert "install_service_account_file(" in settings
+    assert "self._selected_credentials, self.credentials_path" in settings
     assert 'candidate["google_credentials"] = str(self.credentials_path)' in settings
     assert settings.index("install_service_account_file") < settings.index("self.config.clear()")
+
+
+def test_noncredential_save_does_not_install_and_reports_unchanged():
+    source = Path("ui/dashboard.py").read_text(encoding="utf-8")
+    settings = source[source.index("class SettingsDialog"):source.index("class PreviewDialog")]
+    assert "self.credentials_changed = False" in settings
+    assert "if self._selected_credentials is not None:" in settings
+    assert "self.credentials_changed = self._selected_credentials is not None" in settings
+    install_guard = settings.index("if self._selected_credentials is not None:")
+    install = settings.index("install_service_account_file(", install_guard)
+    config_write = settings.index("self._write_config_atomic(candidate)", install)
+    assert install_guard < install < config_write
+
+
+def test_dashboard_resets_sheet_and_manual_ui_only_for_real_replacement():
+    source = Path("ui/dashboard.py").read_text(encoding="utf-8")
+    handler = source[source.index("    def _open_settings"):source.index("    def _open_database")]
+    change_guard = handler.index("if dlg.credentials_changed:")
+    reset = handler.index("self.sheet.set_credentials_path", change_guard)
+    clear_queue = handler.index("self.queue = None", change_guard)
+    manual_sync = handler.index("self.manual_view.set_sheet_connected(False)", change_guard)
+    unchanged = handler.index('self.logger.info("Settings updated")', change_guard)
+    assert change_guard < reset < clear_queue < manual_sync < unchanged
+
+
+@pytest.mark.parametrize("state", ["running", "monitoring", "recovering", "stopping"])
+def test_all_active_auto_states_block_credential_replacement(state):
+    source = Path("ui/dashboard.py").read_text(encoding="utf-8")
+    handler = source[source.index("    def _open_settings"):source.index("    def _open_database")]
+    assert f'"{state}"' in handler
+    assert "and not self._manual_execution_blocks_auto()" in handler
+    assert "credential_replacement_allowed=credential_replacement_allowed" in handler
+
+
+def test_dialog_disables_browse_and_defensively_rejects_replacement():
+    source = Path("ui/dashboard.py").read_text(encoding="utf-8")
+    settings = source[source.index("class SettingsDialog"):source.index("class PreviewDialog")]
+    assert "self.credentials_browse.setEnabled(credential_replacement_allowed)" in settings
+    assert settings.count("if not self.credential_replacement_allowed:") >= 2
+    assert "Stop AUTO / Manual execution before replacing Google credentials." in settings
 
 
 def test_switching_sheet_credentials_clears_all_old_auth_state(tmp_path):

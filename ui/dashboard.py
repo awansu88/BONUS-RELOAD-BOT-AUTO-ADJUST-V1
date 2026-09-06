@@ -281,7 +281,8 @@ class HeaderModeSelector(QComboBox):
 class SettingsDialog(QDialog):
     def __init__(self, config: dict, config_path: Path,
                  parent: Optional[QWidget] = None,
-                 credentials_path: Optional[Path] = None) -> None:
+                 credentials_path: Optional[Path] = None,
+                 credential_replacement_allowed: bool = True) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setMinimumWidth(520)
@@ -290,7 +291,9 @@ class SettingsDialog(QDialog):
         self.credentials_path = Path(
             credentials_path or config.get("google_credentials", "credentials/service_account.json")
         )
+        self.credential_replacement_allowed = credential_replacement_allowed
         self._selected_credentials: Optional[Path] = None
+        self.credentials_changed = False
 
         form = QFormLayout()
 
@@ -330,16 +333,23 @@ class SettingsDialog(QDialog):
         self.creds = QLineEdit(str(self.credentials_path))
         self.creds.setReadOnly(True)
         self.creds.setObjectName("google-credentials-path")
-        browse = QPushButton("Browse...")
-        browse.setObjectName("google-credentials-browse")
-        browse.clicked.connect(self._browse_credentials)
+        self.credentials_browse = QPushButton("Browse...")
+        self.credentials_browse.setObjectName("google-credentials-browse")
+        self.credentials_browse.setEnabled(credential_replacement_allowed)
+        self.credentials_browse.clicked.connect(self._browse_credentials)
         credential_row = QHBoxLayout()
         credential_row.addWidget(self.creds)
-        credential_row.addWidget(browse)
+        credential_row.addWidget(self.credentials_browse)
         form.addRow("Google Credentials", credential_row)
         self.credential_status = QLabel()
         self._refresh_credential_status()
         form.addRow("", self.credential_status)
+        if not credential_replacement_allowed:
+            credential_hint = QLabel(
+                "Stop AUTO / Manual execution before replacing Google credentials."
+            )
+            credential_hint.setWordWrap(True)
+            form.addRow("", credential_hint)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self._save)
@@ -358,6 +368,12 @@ class SettingsDialog(QDialog):
             self.credential_status.setText(status)
 
     def _browse_credentials(self) -> None:
+        if not self.credential_replacement_allowed:
+            QMessageBox.warning(
+                self, "Credential Replacement Unavailable",
+                "Stop AUTO / Manual execution before replacing Google credentials.",
+            )
+            return
         selected, _ = QFileDialog.getOpenFileName(
             self, "Select Google service-account credentials", "", "JSON Files (*.json)"
         )
@@ -405,9 +421,17 @@ class SettingsDialog(QDialog):
         candidate["monitoring_interval_sec"] = int(self.monitoring_iv.value())
         candidate["remark"] = self.remark.text().strip() or "BONUS RELOAD AUTO"
         try:
-            source = self._selected_credentials or self.credentials_path
-            install_service_account_file(source, self.credentials_path)
-            candidate["google_credentials"] = str(self.credentials_path)
+            if self._selected_credentials is not None:
+                if not self.credential_replacement_allowed:
+                    QMessageBox.warning(
+                        self, "Credential Replacement Unavailable",
+                        "Stop AUTO / Manual execution before replacing Google credentials.",
+                    )
+                    return
+                install_service_account_file(
+                    self._selected_credentials, self.credentials_path
+                )
+                candidate["google_credentials"] = str(self.credentials_path)
             self._write_config_atomic(candidate)
         except (CredentialValidationError, OSError) as exc:
             QMessageBox.warning(
@@ -415,6 +439,7 @@ class SettingsDialog(QDialog):
                 f"Settings were not saved. {exc}\n\nChoose a valid service-account JSON with Browse...",
             )
             return
+        self.credentials_changed = self._selected_credentials is not None
         self.config.clear()
         self.config.update(candidate)
         # Preserve the established independent AUTO remark assignment contract.
@@ -2595,24 +2620,33 @@ class Dashboard(QMainWindow):
     # EXPORT + SETTINGS
     # =============================================================
     def _open_settings(self) -> None:
+        credential_replacement_allowed = (
+            self.state not in ("running", "monitoring", "recovering", "stopping")
+            and not self._manual_execution_blocks_auto()
+        )
         dlg = SettingsDialog(
             self.config, self.config_path, self,
             credentials_path=self.credentials_path,
+            credential_replacement_allowed=credential_replacement_allowed,
         )
         if dlg.exec() == QDialog.Accepted:
-            self.sheet.set_credentials_path(str(self.credentials_path))
-            self._set_dot(self.dot_sheet, "idle")
-            self.txt_sheet.setText("Disconnected")
-            self.btn_start.setEnabled(False)
-            self.btn_refresh.setEnabled(False)
-            self.btn_preview.setEnabled(False)
-            self.queue = None
             self.panel.panel_url = self.config.get("panel_url", "")
             self.validator = Validator(self.config["bonus_rules"])
             self._monitoring_interval = int(self.config.get("monitoring_interval_sec", 10))
-            self.logger.info(
-                "Settings and Google credentials updated; reconnect Google Sheet to use them"
-            )
+            if dlg.credentials_changed:
+                self.sheet.set_credentials_path(str(self.credentials_path))
+                self._set_dot(self.dot_sheet, "idle")
+                self.txt_sheet.setText("Disconnected")
+                self.btn_start.setEnabled(False)
+                self.btn_refresh.setEnabled(False)
+                self.btn_preview.setEnabled(False)
+                self.queue = None
+                self.manual_view.set_sheet_connected(False)
+                self.logger.info(
+                    "Google credentials updated; reconnect Google Sheet to use them"
+                )
+            else:
+                self.logger.info("Settings updated")
 
     def _open_database(self) -> None:
         running = self.state in ("running", "monitoring", "recovering", "stopping")

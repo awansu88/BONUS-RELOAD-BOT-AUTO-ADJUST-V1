@@ -146,18 +146,28 @@ def test_case_only_retry_matches_but_real_change_and_attempt_three_do_not(tmp_pa
 def test_header_contract_exact_normalized_and_fixed_position():
     cfg = {"columns": {"user_id": 2, "sheet_data": 4, "time_stamp": 5,
                        "true_amount": 6, "tx_id": 9},
-           "required_headers": {"user_id": "USER ID", "sheet_data": "SHEET DATA",
+           "required_headers": {"user_id": "USER ID", "sheet_data": "KEY_ID",
                                 "time_stamp": "TIME STAMP", "true_amount": "TRUE AMOUNT",
                                 "tx_id": "TX_ID"},
            "sheet_names": {"master": "MASTER", "manual_bonus_reload": "MANUAL"}}
     service = SheetService("unused", cfg)
-    headers = ["", " user   id ", "", "sheet data", "TIME STAMP", "true amount", "", "", "tx_id"]
+    headers = ["", " user   id ", "", "key_id", "TIME STAMP", "true amount", "", "", "tx_id"]
     service._master = SimpleNamespace(row_values=lambda _: headers)
     assert service._validate_headers() == []
     headers[5] = "BALANCE"
     assert "expected 'TRUE AMOUNT'" in service._validate_headers()[0]
     service.cols["tx_id"] = 6
     assert any("duplicates" in error for error in service._validate_headers())
+
+
+@pytest.mark.parametrize("column_d", ["SHEET DATA", "WRONG", ""])
+def test_production_key_id_contract_rejects_stale_wrong_or_blank_column_d(column_d):
+    service = SheetService("unused", sheet_config())
+    headers = ["", "USER ID", "", column_d, "TIME STAMP",
+               "TRUE AMOUNT", "", "", "TX_ID"]
+    service._master = FakeWorksheet("MASTER", headers)
+    errors = service._validate_headers()
+    assert errors and "D expected 'KEY_ID'" in errors[0]
 
 
 @pytest.mark.parametrize("timestamp", ["", "garbage"])
@@ -294,7 +304,7 @@ def test_bulk_insert_failure_does_not_publish_cache_or_queue(monkeypatch, tmp_pa
 def sheet_config():
     return {"columns": {"user_id": 2, "sheet_data": 4, "time_stamp": 5,
                         "true_amount": 6, "tx_id": 9},
-            "required_headers": {"user_id": "USER ID", "sheet_data": "SHEET DATA",
+            "required_headers": {"user_id": "USER ID", "sheet_data": "KEY_ID",
                                  "time_stamp": "TIME STAMP", "true_amount": "TRUE AMOUNT",
                                  "tx_id": "TX_ID"},
             "sheet_names": {"master": "MASTER", "manual_bonus_reload": "MANUAL"}}
@@ -316,7 +326,7 @@ class FakeSpreadsheet:
 
 
 def connect_fake(monkeypatch, tabs=("MASTER", "MANUAL"), headers=None):
-    headers = headers or ["", "USER ID", "", "SHEET DATA", "TIME STAMP",
+    headers = headers or ["", "USER ID", "", "KEY_ID", "TIME STAMP",
                           "TRUE AMOUNT", "", "", "TX_ID"]
     service = SheetService("unused", sheet_config())
     book = FakeSpreadsheet(tabs, headers)
@@ -330,7 +340,7 @@ def connect_fake(monkeypatch, tabs=("MASTER", "MANUAL"), headers=None):
                                               (5, "")])
 def test_wrong_or_blank_required_header_matrix(position, value):
     service = SheetService("unused", sheet_config())
-    headers = ["", "USER ID", "", "SHEET DATA", "TIME STAMP",
+    headers = ["", "USER ID", "", "KEY_ID", "TIME STAMP",
                "TRUE AMOUNT", "", "", "TX_ID"]
     headers[position] = value
     service._master = FakeWorksheet("MASTER", headers)
@@ -340,7 +350,7 @@ def test_wrong_or_blank_required_header_matrix(position, value):
 @pytest.mark.parametrize("mutation", ["missing", "nonnumeric", "zero", "negative", "duplicate"])
 def test_invalid_required_column_matrix(mutation):
     service = SheetService("unused", sheet_config())
-    service._master = FakeWorksheet("MASTER", ["", "USER ID", "", "SHEET DATA",
+    service._master = FakeWorksheet("MASTER", ["", "USER ID", "", "KEY_ID",
                                                      "TIME STAMP", "TRUE AMOUNT", "", "", "TX_ID"])
     if mutation == "missing": service.cols.pop("tx_id")
     elif mutation == "nonnumeric": service.cols["tx_id"] = "nine"
@@ -351,9 +361,9 @@ def test_invalid_required_column_matrix(mutation):
 
 
 def test_failed_header_contract_leaves_sheet_service_disconnected(monkeypatch):
-    headers = ["", "WRONG", "", "SHEET DATA", "TIME STAMP", "TRUE AMOUNT", "", "", "TX_ID"]
+    headers = ["", "WRONG", "", "KEY_ID", "TIME STAMP", "TRUE AMOUNT", "", "", "TX_ID"]
     service, info = connect_fake(monkeypatch, headers=headers)
-    assert not info.ok and not service.is_connected
+    assert not info.ok and not info.retryable and not service.is_connected
     assert service.master_name == "" and service.spreadsheet_id == ""
     with pytest.raises(RuntimeError, match="Not connected"): service.read_master_rows()
     with pytest.raises(RuntimeError, match="Not connected"): service.read_manual_set()
@@ -362,7 +372,7 @@ def test_failed_header_contract_leaves_sheet_service_disconnected(monkeypatch):
 @pytest.mark.parametrize("tabs", [("MANUAL",), ("MASTER",)])
 def test_missing_required_tab_leaves_service_disconnected(monkeypatch, tabs):
     service, info = connect_fake(monkeypatch, tabs=tabs)
-    assert not info.ok and not service.is_connected
+    assert not info.ok and not info.retryable and not service.is_connected
     assert service.master_name == "" and service.spreadsheet_id == ""
 
 

@@ -218,7 +218,7 @@ row is marked `MANUAL BONUS` and skipped.
 | A   | NO           | Ignored                                                    |
 | B   | USER ID      | **Required** header. Filled into panel `#username`         |
 | C   | AMOUNT       | Ignored                                                    |
-| D   | SHEET DATA   | **Required** header. Never written.                        |
+| D   | KEY_ID       | **Required** header. Never written.                        |
 | E   | TIME STAMP   | **Required** header. Stored in SQLite for audit.           |
 | F   | TRUE AMOUNT  | **Required** header. Deposit used for validation.          |
 | G   | STATUS       | Never written.                                             |

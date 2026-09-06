@@ -18,10 +18,6 @@ class FakeLocator:
 
     def wait_for(self, state="visible", **_):
         self.page.events.append(("locator-wait", self.selector, state))
-        if self.selector == "#success" and state == "hidden":
-            if not self.page.stale_clears:
-                raise TimeoutError("stale success remains visible")
-            self.page.stale_visible = False
         if self.page.fail == f"wait:{self.selector}":
             raise TimeoutError(self.selector)
 
@@ -41,11 +37,38 @@ class FakeLocator:
         return self.page.alert_text
 
 
+class FakeNavigationExpectation:
+    def __init__(self, page):
+        self.page = page
+        self.value = None
+
+    def __enter__(self):
+        self.page.navigation_armed = True
+        self.page.events.append(("navigation", "armed"))
+        return self
+
+    def __exit__(self, exc_type, *_):
+        if exc_type is not None:
+            return False
+        if not self.page.main_navigation_observed:
+            raise TimeoutError("main-frame navigation not observed")
+        self.value = None if self.page.same_document_navigation else object()
+        self.page.events.append(("navigation", "observed"))
+        return False
+
+
 class FakePage:
-    def __init__(self, *, fail="", stale_visible=False, stale_clears=False,
+    def __init__(self, *, fail="", stale_visible=False, main_navigation=True,
+                 iframe_navigation=False, same_document_navigation=False,
                  alert_text="Deposit successful"):
-        self.fail, self.stale_visible, self.stale_clears = fail, stale_visible, stale_clears
+        self.fail, self.stale_visible = fail, stale_visible
         self.alert_text, self.events, self.clicks = alert_text, [], 0
+        self.main_navigation = main_navigation
+        self.iframe_navigation = iframe_navigation
+        self.same_document_navigation = same_document_navigation
+        self.navigation_armed = False
+        self.main_navigation_observed = False
+        self.reloads = self.gotos = 0
 
     def is_closed(self): return self.fail == "closed"
     def locator(self, selector): return FakeLocator(self, selector)
@@ -53,9 +76,19 @@ class FakePage:
         self.events.append(("page-wait", selector))
         if self.fail == f"wait:{selector}" or (selector == "#success" and self.fail == "success"):
             raise TimeoutError(selector)
+    def expect_navigation(self, **_):
+        return FakeNavigationExpectation(self)
     def click(self, selector):
         self.events.append(("submit", selector)); self.clicks += 1
         if self.fail == "submit": raise RuntimeError("uncertain click")
+        assert self.navigation_armed, "navigation proof must be armed before click"
+        if self.iframe_navigation:
+            self.events.append(("navigation", "iframe"))
+        if self.main_navigation:
+            self.main_navigation_observed = True
+            self.events.append(("navigation", "main-frame-during-click"))
+    def reload(self): self.reloads += 1
+    def goto(self, *_): self.gotos += 1
 
 
 def service(page, success_text="Deposit successful"):
@@ -84,15 +117,38 @@ def test_pre_click_failures_are_proven_not_submitted(failure):
     assert result.click_crossed is False and page.clicks == 0
 
 
-def test_stale_visible_alert_must_clear_before_click():
-    blocked = FakePage(stale_visible=True)
-    result = service(blocked).submit_deposit_classified("a", 5000, "r")
-    assert result.outcome is AutoSubmitOutcome.FAILED_NOT_SUBMITTED
-    assert result.evidence == "STALE_SUCCESS_NOT_CLEARED" and blocked.clicks == 0
+def test_old_visible_alert_does_not_block_or_wait_and_natural_reload_is_fresh():
+    page = FakePage(stale_visible=True)
+    result = service(page).submit_deposit_classified("a", 5000, "r")
+    assert result.outcome is AutoSubmitOutcome.SUCCESS and page.clicks == 1
+    assert not [event for event in page.events if event[-1:] == ("hidden",)]
+    assert page.reloads == 0 and page.gotos == 0
+    assert page.events.index(("navigation", "armed")) < page.events.index(("submit", "#submit"))
+    assert "fresh navigation observed" in result.evidence
 
-    clears = FakePage(stale_visible=True, stale_clears=True)
-    result = service(clears).submit_deposit_classified("a", 5000, "r")
-    assert result.outcome is AutoSubmitOutcome.SUCCESS and clears.clicks == 1
+
+def test_same_url_fast_main_frame_reload_counts_without_url_comparison():
+    page = FakePage()
+    page.url = "https://panel.example/deposit"
+    result = service(page).submit_deposit_classified("a", 5000, "r")
+    assert result.outcome is AutoSubmitOutcome.SUCCESS
+    assert ("navigation", "main-frame-during-click") in page.events
+    assert page.url == "https://panel.example/deposit"
+
+
+def test_iframe_navigation_does_not_prove_fresh_submission_document():
+    page = FakePage(main_navigation=False, iframe_navigation=True)
+    result = service(page).submit_deposit_classified("a", 5000, "r")
+    assert result.outcome is AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT
+    assert result.click_crossed and result.phase == "WAITING_NAVIGATION"
+    assert "fresh submit navigation was not proven" in result.evidence
+
+
+def test_same_document_navigation_does_not_prove_fresh_document():
+    page = FakePage(same_document_navigation=True)
+    result = service(page).submit_deposit_classified("a", 5000, "r")
+    assert result.outcome is AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT
+    assert result.click_crossed and result.phase == "WAITING_NAVIGATION"
 
 
 def test_click_boundary_order_and_uncertain_exception():
@@ -105,13 +161,15 @@ def test_click_boundary_order_and_uncertain_exception():
 
 
 @pytest.mark.parametrize(("fail", "text", "expected"), [
+    ("navigation", "Deposit successful", AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT),
     ("success", "Deposit successful", AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT),
     ("text", "Deposit successful", AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT),
     ("", "wrong response", AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT),
     ("", "DEPOSIT SUCCESSFUL today", AutoSubmitOutcome.SUCCESS),
 ])
 def test_post_click_requires_fresh_matching_verifiable_success(fail, text, expected):
-    page, phases = FakePage(fail=fail, alert_text=text), []
+    page, phases = FakePage(fail="" if fail == "navigation" else fail,
+                            main_navigation=fail != "navigation", alert_text=text), []
     result = service(page).submit_deposit_classified("a", 5000, "r", phases.append)
     assert page.clicks == 1 and result.click_crossed
     assert result.outcome is expected
@@ -168,6 +226,9 @@ def test_journal_maps_all_three_outcomes_and_success_needs_click_proof(tmp_path)
     ("CLICK_UNCERTAIN", False, "UNKNOWN"),
     ("CLICK_RETURNED", True, "UNKNOWN"),
     ("WAITING_RESULT", True, "UNKNOWN"),
+    ("WAITING_NAVIGATION", True, "UNKNOWN"),
+    ("NAVIGATION_OBSERVED", True, "UNKNOWN"),
+    ("WAITING_FRESH_RESULT", True, "UNKNOWN"),
 ])
 def test_startup_recovery_uses_persisted_click_phase(tmp_path, phase, crossed, expected):
     path = tmp_path / phase

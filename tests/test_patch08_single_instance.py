@@ -194,3 +194,146 @@ def test_production_identity_is_stable_and_not_path_or_environment_derived(monke
     assert after == original == r"Local\BonusReloadBotAutoAdjustV1.SingleInstance"
     assert str(tmp_path) not in after
     assert os.environ["BONUS_RELOAD_DATA_DIR"] not in after
+
+
+def _configure_integrated_lifecycle(monkeypatch, *, failure=None):
+    """Configure actual main/_run_owned execution with lightweight ordered fakes."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    main = _import_main(monkeypatch)
+    events = []
+
+    class Guard:
+        owns_lock = True
+
+        def release(self):
+            assert self.owns_lock
+            events.append("guard-release")
+            self.owns_lock = False
+
+    guard = Guard()
+
+    class Database:
+        def __init__(self, path):
+            events.append("db-open")
+
+        def total_count(self):
+            return 0
+
+        def close(self):
+            assert guard.owns_lock
+            events.append("db-close")
+
+    class CrashStore:
+        def load(self):
+            return SimpleNamespace(clean_exit=True, saved_at=None)
+
+        def mark_dirty(self, **kwargs):
+            events.append("crash-dirty")
+
+        def mark_clean_exit(self):
+            events.append("crash-clean")
+
+    runtime_paths = SimpleNamespace(
+        data_dir=Path("/data"), config_path=Path("/data/config.json"),
+        selectors_path=Path("/data/selectors.json"),
+        crash_state_path=Path("/data/crash_state.json"), logs_dir=Path("/data/logs"),
+        screenshots_dir=Path("/data/screenshots"),
+    )
+    runtime = SimpleNamespace(
+        credentials_path=Path("/data/credentials.json"),
+        database_path=Path("/data/processed.db"),
+        browser_profile_path=Path("/data/browser-profile"),
+    )
+    logger = Mock(file_handler_ok=True, file_handler_error=None)
+    monkeypatch.setattr(main, "_prepare_startup", Mock(
+        side_effect=lambda: (events.append("runtime-prepare") or (
+            runtime_paths, {"hardening": {"auto_startup_maintenance": False}}, {}, runtime
+        ))
+    ))
+    monkeypatch.setattr(main, "_install_uncaught_exception_handler", Mock())
+    monkeypatch.setattr(main, "AppLogger", Mock())
+    main.AppLogger.get.return_value = logger
+    monkeypatch.setattr(main, "CrashStateStore", Mock(return_value=CrashStore()))
+    monkeypatch.setattr(main, "DatabaseService", Database)
+    monkeypatch.setattr(main, "mark_initialized", Mock())
+    diagnostic = Mock(all_ok=True)
+    diagnostic.summary.return_value = ""
+    monkeypatch.setattr(main, "run_diagnostics", Mock(return_value=diagnostic))
+    monkeypatch.setattr(main.SingleInstanceGuard, "acquire", Mock(
+        side_effect=lambda: (events.append("lock-acquired") or guard)
+    ))
+    monkeypatch.setattr(main.QMessageBox, "critical", Mock())
+
+    app = Mock()
+    monkeypatch.setattr(main, "QApplication", Mock(return_value=app))
+
+    def dashboard(*args, **kwargs):
+        if failure == "dashboard":
+            events.append("dashboard-error")
+            raise RuntimeError("dashboard exploded")
+        events.append("dashboard")
+        window = Mock()
+        window.show.side_effect = lambda: events.append("window-show")
+        return window
+
+    monkeypatch.setattr(main, "Dashboard", dashboard)
+
+    def app_exec():
+        events.append("app-exec")
+        if failure == "app-exec":
+            raise RuntimeError("event loop exploded")
+        return 23
+
+    app.exec.side_effect = app_exec
+    return main, app, guard, events
+
+
+def test_integrated_normal_shutdown_orders_db_clean_and_guard_release(monkeypatch):
+    main, _app, guard, events = _configure_integrated_lifecycle(monkeypatch)
+
+    assert main.main() == 23
+    assert events == [
+        "lock-acquired", "runtime-prepare", "crash-dirty", "db-open",
+        "dashboard", "window-show", "app-exec", "db-close", "crash-clean",
+        "guard-release",
+    ]
+    assert events.index("db-close") < events.index("crash-clean") < events.index("guard-release")
+    assert not guard.owns_lock
+
+
+def test_integrated_dashboard_exception_closes_db_before_releasing_guard(monkeypatch):
+    main, _app, guard, events = _configure_integrated_lifecycle(
+        monkeypatch, failure="dashboard",
+    )
+
+    with pytest.raises(RuntimeError, match="dashboard exploded"):
+        main.main()
+    assert events[-4:] == ["db-open", "dashboard-error", "db-close", "guard-release"]
+    assert "crash-clean" not in events
+    assert not guard.owns_lock
+
+
+def test_integrated_app_exec_exception_closes_db_and_leaves_crash_dirty(monkeypatch):
+    main, _app, guard, events = _configure_integrated_lifecycle(
+        monkeypatch, failure="app-exec",
+    )
+
+    with pytest.raises(RuntimeError, match="event loop exploded"):
+        main.main()
+    assert events[-4:] == ["window-show", "app-exec", "db-close", "guard-release"]
+    assert "crash-clean" not in events
+    assert not guard.owns_lock
+
+
+def test_integrated_mark_initialized_failure_closes_db_before_lock_release(monkeypatch):
+    main, _app, guard, events = _configure_integrated_lifecycle(monkeypatch)
+    main.mark_initialized.side_effect = main.RuntimeLayoutError("layout failed")
+
+    assert main.main() == 3
+    assert events[-2:] == ["db-close", "guard-release"]
+    assert "dashboard" not in events
+    assert "crash-clean" not in events
+    main.QMessageBox.critical.assert_called_once()
+    assert not guard.owns_lock

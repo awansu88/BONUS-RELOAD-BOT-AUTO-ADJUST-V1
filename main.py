@@ -183,60 +183,71 @@ def _run_owned(app: QApplication) -> int:
         return 2
 
     try:
-        mark_initialized(runtime_paths, db_path)
-    except RuntimeLayoutError as exc:
-        db.close()
-        QMessageBox.critical(None, "Runtime layout error", str(exc))
-        return 3
+        try:
+            mark_initialized(runtime_paths, db_path)
+        except RuntimeLayoutError as exc:
+            QMessageBox.critical(None, "Runtime layout error", str(exc))
+            return 3
 
-    # Diagnostics run only after migration policy and DatabaseService have
-    # safely selected/opened the authoritative database.
-    try:
-        diag = run_diagnostics(
+        # Diagnostics run only after migration policy and DatabaseService have
+        # safely selected/opened the authoritative database.
+        try:
+            diag = run_diagnostics(
+                app_dir=data_dir, resource_dir=RESOURCE_DIR,
+                config_path=config_path, selectors_path=runtime_paths.selectors_path,
+                credentials_path=cred_path, sqlite_path=db_path,
+                logs_dir=runtime_paths.logs_dir,
+                screenshots_dir=runtime_paths.screenshots_dir,
+                browser_profile_dir=profile_path,
+                logger_file_handler_ok=logger.file_handler_ok,
+                logger_file_handler_error=logger.file_handler_error,
+            )
+            for line in diag.summary().splitlines():
+                (logger.info if diag.all_ok else logger.warn)(line)
+        except Exception as exc:
+            logger.warn(f"Startup diagnostics failed: {exc}")
+
+        AppLogger.get().info(f"SQLite ready: {db_path.name} ({db.total_count():,} rows)")
+
+        # v1.2 C-3: automatic startup maintenance (checkpoint + optimize).
+        # Never blocking, never VACUUM, never interrupts monitoring.
+        if bool(config.get("hardening", {}).get("auto_startup_maintenance", True)):
+            maintenance_startup = MaintenanceService(
+                db=db,
+                logs_dir=runtime_paths.logs_dir,
+                screenshots_dir=runtime_paths.screenshots_dir,
+            )
+            report = safe_run(
+                maintenance_startup.startup_maintenance,
+                module="startup_maintenance",
+                recovery_action="continue without startup optimize",
+                logger=logger,
+            )
+            if report is not None:
+                for line in report.summary().splitlines():
+                    logger.info(line)
+
+        window = Dashboard(
+            config=config, selectors=selectors,
+            config_path=config_path, db=db,
             app_dir=data_dir, resource_dir=RESOURCE_DIR,
-            config_path=config_path, selectors_path=runtime_paths.selectors_path,
-            credentials_path=cred_path, sqlite_path=db_path,
-            logs_dir=runtime_paths.logs_dir,
-            screenshots_dir=runtime_paths.screenshots_dir,
-            browser_profile_dir=profile_path,
-            logger_file_handler_ok=logger.file_handler_ok,
-            logger_file_handler_error=logger.file_handler_error,
+            credentials_path=cred_path,
+            crash_store=crash_store, previous_state=previous_state,
         )
-        for line in diag.summary().splitlines():
-            (logger.info if diag.all_ok else logger.warn)(line)
-    except Exception as exc:
-        logger.warn(f"Startup diagnostics failed: {exc}")
-
-    AppLogger.get().info(f"SQLite ready: {db_path.name} ({db.total_count():,} rows)")
-
-    # v1.2 C-3: automatic startup maintenance (checkpoint + optimize).
-    # Never blocking, never VACUUM, never interrupts monitoring.
-    if bool(config.get("hardening", {}).get("auto_startup_maintenance", True)):
-        maintenance_startup = MaintenanceService(
-            db=db,
-            logs_dir=runtime_paths.logs_dir,
-            screenshots_dir=runtime_paths.screenshots_dir,
-        )
-        report = safe_run(
-            maintenance_startup.startup_maintenance,
-            module="startup_maintenance",
-            recovery_action="continue without startup optimize",
-            logger=logger,
-        )
-        if report is not None:
-            for line in report.summary().splitlines():
-                logger.info(line)
-
-    window = Dashboard(
-        config=config, selectors=selectors,
-        config_path=config_path, db=db,
-        app_dir=data_dir, resource_dir=RESOURCE_DIR,
-        credentials_path=cred_path,
-        crash_store=crash_store, previous_state=previous_state,
-    )
-    window.show()
-    exit_code = app.exec()
-    db.close()
+        window.show()
+        exit_code = app.exec()
+    finally:
+        # Database cleanup is inside the process-ownership boundary.  If another
+        # operation is already failing, retain that original exception while
+        # recording a secondary close failure; otherwise a close failure remains
+        # fatal and the session deliberately stays marked dirty.
+        active_exception = sys.exc_info()[0] is not None
+        try:
+            db.close()
+        except Exception as close_exc:
+            if not active_exception:
+                raise
+            logger.error(f"Database close failed during exception cleanup: {close_exc}")
 
     # v1.2 B-7: graceful shutdown checkpoint. Flushing the crash-state
     # file is what tells the NEXT launch this was a clean exit.

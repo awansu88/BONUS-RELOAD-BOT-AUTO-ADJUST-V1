@@ -70,7 +70,7 @@ from core.credentials import (
 from core.source_integrity import AccountingIntegrityError
 from core.validator import Validator
 from core.recovery import DEFAULT_LADDER, RetryExhausted, retry_with_ladder, safe_run
-from core.health import HealthMonitor, LeakThresholds
+from core.health import HealthMonitor, LeakThresholds, classify_warning_transitions
 from core.maintenance import MaintenanceService
 from core.crash_state import CrashState, CrashStateStore
 from core.manual_adjust_loader import ManualAdjustLoader
@@ -792,7 +792,7 @@ class Dashboard(QMainWindow):
         self.watchdog_timer.setInterval(max(5_000, watchdog_interval))
         self.watchdog_timer.timeout.connect(self._watchdog_tick)
         self.watchdog_timer.start()
-        self._last_watchdog_warnings: list[str] = []
+        self._last_watchdog_warnings: dict[str, str] = {}
 
         self._auto_recover_panel: bool = bool(hardening_cfg.get("auto_recover_panel", True))
 
@@ -832,13 +832,20 @@ class Dashboard(QMainWindow):
         )
         if snap is None:
             return
-        # De-dup warnings so a stable condition doesn't spam the log.
-        new_warnings = [w for w in snap.warnings if w not in self._last_watchdog_warnings]
-        for w in new_warnings:
-            self.logger.warn(f"Watchdog: {w}")
-        if not snap.warnings and self._last_watchdog_warnings:
-            self.logger.info("Watchdog: all metrics back within thresholds")
-        self._last_watchdog_warnings = list(snap.warnings)
+        # De-dup by stable category rather than changing sampled values.
+        previous = self._last_watchdog_warnings
+        current, newly_above, changed, recovered = classify_warning_transitions(
+            previous, snap.warnings
+        )
+        for warning in newly_above:
+            self.logger.warn(f"Watchdog: {warning}")
+        for warning in changed:
+            # Preserve changing resource detail for engineering without
+            # repeating it in the operator-facing Live Log.
+            self.logger.diagnostic_warn(f"Watchdog: {warning}")
+        for category in recovered:
+            self.logger.info(f"Watchdog: {category} back within threshold")
+        self._last_watchdog_warnings = current
 
         # B-2 auto-recover: panel was previously attached but is now
         # dead; try one gentle reopen using the persistent profile so

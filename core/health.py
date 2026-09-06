@@ -40,6 +40,35 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 
+def classify_warning_transitions(
+    previous: Dict[str, str], warnings: List[str]
+) -> tuple[Dict[str, str], List[str], List[str], List[str]]:
+    """Group watchdog samples by category and identify state transitions.
+
+    Returns ``(current, new, changed, recovered)``.  Changed samples are
+    useful persistent diagnostics, but are not new operator warnings.
+    """
+    categories = (
+        "browser contexts", "memory", "threads", "handles", "QTimer", "SQLite"
+    )
+
+    def category_for(warning: str) -> str:
+        text = str(warning).strip()
+        for category in categories:
+            if text.lower().startswith(category.lower()):
+                return category
+        return text.split(maxsplit=1)[0].lower() if text else "unknown"
+
+    current = {category_for(warning): warning for warning in warnings}
+    newly_above = [
+        warning for category, warning in current.items() if category not in previous
+    ]
+    changed = [warning for category, warning in current.items()
+               if category in previous and warning != previous[category]]
+    recovered = [category for category in previous if category not in current]
+    return current, newly_above, changed, recovered
+
+
 # --------------------------------------------------------------------------- psutil (soft)
 def _psutil():  # pragma: no cover - trivial soft import wrapper
     try:

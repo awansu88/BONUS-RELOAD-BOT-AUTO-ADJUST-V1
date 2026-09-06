@@ -54,7 +54,15 @@ class PerformanceTelemetry:
     def _log(self, message: str, warning: bool = False) -> None:
         try:
             if self.logger:
-                fn = getattr(self.logger, "warn" if warning else "info", self.logger)
+                # Performance telemetry is engineering detail: retain it in
+                # the persistent log without consuming operator Live Log
+                # buffer slots.  The fallback preserves compatibility with
+                # simple logger implementations used by integrations/tests.
+                method = "diagnostic_warn" if warning else "diagnostic"
+                fallback = "warn" if warning else "info"
+                fn = getattr(self.logger, method, None)
+                if fn is None:
+                    fn = getattr(self.logger, fallback, self.logger)
                 fn(message)
         except Exception:
             pass

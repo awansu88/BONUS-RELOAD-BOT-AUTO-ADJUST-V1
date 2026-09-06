@@ -127,3 +127,24 @@ class AppLogger:
     def error(self, msg: str) -> None:
         self.logger.error(msg)
         self._emit(f"ERROR  {msg}")
+
+    def diagnostic(self, msg: str) -> None:
+        """Persist an engineering diagnostic without publishing it live.
+
+        Diagnostics deliberately bypass both the bounded operator buffer and
+        its listeners.  They still use the configured Python logging handlers
+        (including the console fallback when the daily file is unavailable).
+        As with listener notification, logging trouble must not escape into
+        production work.
+        """
+        try:
+            self.logger.info(msg)
+        except Exception:
+            pass
+
+    def diagnostic_warn(self, msg: str) -> None:
+        """Persist a warning-level diagnostic without publishing it live."""
+        try:
+            self.logger.warning(msg)
+        except Exception:
+            pass

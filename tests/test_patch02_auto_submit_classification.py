@@ -43,7 +43,9 @@ class FakeNavigationInfo:
 
     @property
     def value(self):
-        return None if self.page.same_document_navigation else object()
+        if self.page.same_document_navigation:
+            return None
+        return getattr(self.page, "navigation_response", object())
 
 
 class FakeNavigationContextManager:

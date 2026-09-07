@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from playwright.sync_api import (
     Browser,
@@ -32,7 +33,115 @@ from playwright.sync_api import (
     TimeoutError as PWTimeout,
     sync_playwright,
 )
+from .logger import AppLogger
 from .performance_telemetry import get_telemetry, timed
+
+
+def _sanitize_url(value: object) -> str:
+    """Return only a URL's scheme, authority, and path for diagnostics."""
+    try:
+        parts = urlsplit(str(value or ""))
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        try:
+            authority = f"{host}:{parts.port}" if parts.port is not None else host
+        except ValueError:
+            authority = host
+        return urlunsplit((parts.scheme, authority, parts.path, "", ""))
+    except Exception:
+        return "<unavailable>"
+
+
+def _evidence_value(value: object) -> str:
+    """Keep evidence single-line and compact without exposing object reprs."""
+    if isinstance(value, bool):
+        return str(value).lower()
+    if value is None:
+        return "unavailable"
+    return str(value).replace("\r", " ").replace("\n", " ")[:200]
+
+
+def _emit_auto_evidence(fields: Dict[str, object], *, warning: bool = False) -> None:
+    """Best-effort persistent-only output; logging can never affect a submit."""
+    try:
+        message = "[AUTO_EVIDENCE] " + " ".join(
+            f"{key}={_evidence_value(value)}" for key, value in fields.items()
+        )
+        logger = AppLogger.get()
+        method = logger.diagnostic_warn if warning else logger.diagnostic
+        method(message)
+    except Exception:
+        pass
+
+
+def _page_evidence(page: Page) -> Dict[str, object]:
+    """Collect only Playwright state documented as locally available.
+
+    Renderer-dependent calls (evaluate/title/locators) are deliberately not
+    made: evidence must never compete with mandatory result verification.
+    """
+    fields: Dict[str, object] = {}
+    try:
+        fields["page_url"] = _sanitize_url(page.url)
+    except Exception as exc:
+        fields["page_url_error"] = type(exc).__name__
+    try:
+        fields["page_closed"] = bool(page.is_closed())
+    except Exception as exc:
+        fields["page_closed_error"] = type(exc).__name__
+    fields["ready_state"] = "not_probed"
+    fields["title"] = "not_probed"
+    return fields
+
+
+def _collect_navigation_evidence(response) -> Dict[str, object]:
+    """Collect non-sensitive main-resource metadata, entirely fail-open."""
+    fields: Dict[str, object] = {}
+    for name in ("status", "ok"):
+        try:
+            fields[name] = getattr(response, name)
+        except Exception as exc:
+            fields[f"{name}_error"] = type(exc).__name__
+    try:
+        fields["final_url"] = _sanitize_url(response.url)
+    except Exception as exc:
+        fields["final_url_error"] = type(exc).__name__
+
+    request = None
+    try:
+        request = response.request
+        fields["method"] = request.method
+        fields["resource_type"] = request.resource_type
+    except Exception as exc:
+        fields["request_error"] = type(exc).__name__
+
+    redirects = 0
+    original = request
+    try:
+        while original is not None and original.redirected_from is not None:
+            redirects += 1
+            original = original.redirected_from
+        fields["redirects"] = redirects
+        if original is not None:
+            fields["original_url"] = _sanitize_url(original.url)
+    except Exception as exc:
+        fields["redirect_error"] = type(exc).__name__
+
+    try:
+        fields["content_type"] = response.header_value("content-type")
+    except Exception as exc:
+        fields["content_type_error"] = type(exc).__name__
+
+    # Sync Playwright exposes no bounded response-body read.  Never call
+    # response.body()/text() here: either may wait on an unhealthy renderer or
+    # network stream and steal time from (or extend) financial verification.
+    fields["body_available"] = False
+    fields["body_len"] = "unavailable"
+    fields["success_text_present"] = "unavailable"
+    fields["body_error"] = "SKIPPED_UNBOUNDED"
+    fields["body_read_ms"] = 0.0
+    return fields
 
 
 @dataclass
@@ -287,6 +396,8 @@ class PanelService:
         hook failure after it returns is an accounting error with an ambiguous
         remote outcome.
         """
+        method_started = time.perf_counter()
+
         def result(outcome, phase, detail="", evidence="", *, crossed=False,
                    accounting_error=False):
             return AutoSubmitResult(outcome, crossed, phase, str(detail),
@@ -346,6 +457,8 @@ class PanelService:
 
         phase_started = time.perf_counter()
         result_deadline = phase_started + (success_wait / 1000.0)
+        submit_started = phase_started
+        click_returned_at: Optional[float] = None
         click_returned = False
         try:
             # Playwright 1.55's expect_navigation waiter is installed when the
@@ -357,15 +470,28 @@ class PanelService:
             ) as navigation_info:
                 page.click(panel["submit"])
                 click_returned = True
+                click_returned_at = time.perf_counter()
                 telemetry.record_since("panel.submit_click", phase_started)
                 current = "CLICK_RETURNED"; phase(current)
                 current = "WAITING_NAVIGATION"; phase(current)
+            navigation_completed_at = time.perf_counter()
             # Playwright also reports same-document History API/hash changes as
             # navigation with a null response.  Require a main-resource
             # response as proof that a new main-frame document was committed;
             # its HTTP status is deliberately irrelevant to classification.
             navigation_response = navigation_info.value
             if navigation_response is None:
+                _emit_auto_evidence({
+                    "user": user_id, "phase": "NAVIGATION",
+                    "response": "NONE",
+                    "click_entered_ms": round(
+                        (submit_started - method_started) * 1000, 1),
+                    "click_returned_ms": round(
+                        ((click_returned_at or submit_started) - method_started) * 1000, 1),
+                    "navigation_completed_ms": round(
+                        (navigation_completed_at - method_started) * 1000, 1),
+                    **_page_evidence(page),
+                }, warning=True)
                 raise RuntimeError("same-document navigation is not a fresh document")
         except Exception as exc:
             if click_returned:
@@ -394,11 +520,22 @@ class PanelService:
                           "fresh navigation observed but durable phase evidence failed",
                           crossed=True, accounting_error=True)
 
+        phase_started = time.perf_counter()
+        selector = panel["success_alert"]
+        remaining_ms = max(1, int((result_deadline - time.perf_counter()) * 1000))
+        selector_started = time.perf_counter()
+        selector_result = "ERROR"
+        selector_error: Optional[str] = None
         try:
             current = "WAITING_FRESH_RESULT"; phase(current)
-            selector = panel["success_alert"]
+            # No diagnostic Playwright or logging calls are permitted before
+            # this mandatory wait.  It receives the same deadline calculation
+            # as PR #19, apart from negligible local Python assignments.
             remaining_ms = max(1, int((result_deadline - time.perf_counter()) * 1000))
+            selector_started = time.perf_counter()
             page.wait_for_selector(selector, timeout=remaining_ms, state="visible")
+            selector_wait_ms = round((time.perf_counter() - selector_started) * 1000, 1)
+            selector_result = "VISIBLE"
             evidence = "fresh navigation observed; success alert visible"
             if success_text:
                 remaining_ms = max(1, int((result_deadline - time.perf_counter()) * 1000))
@@ -407,14 +544,21 @@ class PanelService:
                 if success_text.lower() not in evidence.lower():
                     current = "AMBIGUOUS_RESPONSE"
                     phase(current)
-                    return result(AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, current,
-                                  f"unexpected alert: {text!r}", evidence, crossed=True)
-            current = "SUCCESS_OBSERVED"; phase(current)
-            telemetry.record_since("panel.outcome_wait", phase_started,
-                                   result="SUCCESS")
-            return result(AutoSubmitOutcome.SUCCESS, current, evidence=evidence,
-                          crossed=True)
+                    classified_result = result(
+                        AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, current,
+                        f"unexpected alert: {text!r}", evidence, crossed=True,
+                    )
+            if current != "AMBIGUOUS_RESPONSE":
+                current = "SUCCESS_OBSERVED"; phase(current)
+                telemetry.record_since("panel.outcome_wait", phase_started,
+                                       result="SUCCESS")
+                classified_result = result(
+                    AutoSubmitOutcome.SUCCESS, current, evidence=evidence, crossed=True
+                )
         except Exception as exc:
+            selector_result = "TIMEOUT" if "Timeout" in type(exc).__name__ else "ERROR"
+            selector_error = type(exc).__name__
+            selector_wait_ms = round((time.perf_counter() - selector_started) * 1000, 1)
             # Once page.click returned, every inability to prove fresh success
             # remains quota-bearing UNKNOWN.
             final_phase = current if current == "AMBIGUOUS_RESPONSE" else "AMBIGUOUS_RESPONSE"
@@ -425,9 +569,46 @@ class PanelService:
                 except Exception as phase_exc:
                     accounting_error = True
                     exc = RuntimeError(f"{exc}; phase persistence failed: {phase_exc}")
-            return result(AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, final_phase,
-                          exc, "fresh success could not be verified", crossed=True,
-                          accounting_error=accounting_error)
+            classified_result = result(
+                AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, final_phase, exc,
+                "fresh success could not be verified", crossed=True,
+                accounting_error=accounting_error,
+            )
+
+        # Classification and all mandatory Playwright verification are now
+        # complete.  Only bounded/local metadata and persistent diagnostics
+        # follow; renderer-dependent optional probes remain explicitly skipped.
+        navigation_fields = _collect_navigation_evidence(navigation_response)
+        navigation_fields.update({
+            "user": user_id, "phase": "NAVIGATION",
+            "click_entered_ms": round((submit_started - method_started) * 1000, 1),
+            "click_returned_ms": round(
+                ((click_returned_at or submit_started) - method_started) * 1000, 1),
+            "navigation_completed_ms": round(
+                (navigation_completed_at - method_started) * 1000, 1),
+            **_page_evidence(page),
+        })
+        navigation_fields = {
+            "user": navigation_fields.pop("user"),
+            "phase": navigation_fields.pop("phase"),
+            **navigation_fields,
+        }
+        _emit_auto_evidence(navigation_fields)
+        result_fields: Dict[str, object] = {
+            "user": user_id, "phase": "RESULT_WAIT", "selector": selector,
+            "pre_count": "not_probed", "pre_visible": "not_probed",
+            "wait_timeout_ms": remaining_ms, "result": selector_result,
+            "selector_wait_ms": selector_wait_ms,
+            "total_submit_ms": round((time.perf_counter() - method_started) * 1000, 1),
+            **_page_evidence(page),
+        }
+        if selector_error is not None:
+            result_fields["error"] = selector_error
+        _emit_auto_evidence(
+            result_fields,
+            warning=classified_result.outcome is AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT,
+        )
+        return classified_result
 
     def submit_adjustment(self, user_id: str, amount: int, remark: str,
                           phase_hook=None) -> ManualSubmitResult:

@@ -35,12 +35,14 @@ class Response:
         self.request = Request(self.url, previous=previous)
         self._body = body
         self._body_error = body_error
+        self.body_calls = 0
 
     def header_value(self, name):
         assert name == "content-type"
         return "text/html; charset=UTF-8"
 
     def body(self):
+        self.body_calls += 1
         if self._body_error:
             raise self._body_error
         return self._body
@@ -65,36 +67,43 @@ def joined(records):
     return "\n".join(records)
 
 
-def test_normal_success_records_navigation_body_and_visible_selector(evidence):
-    result = submit(Response())
+def test_normal_success_records_skipped_body_and_visible_selector(evidence):
+    response = Response()
+    result = submit(response)
     log = joined(evidence)
     assert result.outcome is AutoSubmitOutcome.SUCCESS
     assert "phase=NAVIGATION" in log and "status=200" in log and "ok=true" in log
     assert "method=GET" in log and "resource_type=document" in log
     assert "content_type=text/html; charset=UTF-8" in log
-    assert "body_available=true" in log and "success_text_present=true" in log
+    assert "body_available=false" in log and "body_error=SKIPPED_UNBOUNDED" in log
+    assert "success_text_present=unavailable" in log and response.body_calls == 0
     assert "phase=RESULT_WAIT" in log and "result=VISIBLE" in log
 
 
-def test_body_success_is_only_evidence_when_dom_times_out(evidence):
-    result = submit(Response(), fail="success")
+def test_body_success_is_not_probed_and_dom_timeout_remains_unknown(evidence):
+    response = Response()
+    result = submit(response, fail="success")
     log = joined(evidence)
     assert result.outcome is AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT
-    assert "success_text_present=true" in log
+    assert "success_text_present=unavailable" in log and response.body_calls == 0
     assert "phase=RESULT_WAIT" in log and "result=TIMEOUT" in log
 
 
-def test_body_without_success_and_dom_timeout_remains_unknown(evidence):
-    result = submit(Response(body=b"ordinary form"), fail="success")
+def test_body_content_cannot_change_dom_timeout_classification(evidence):
+    response = Response(body=b"ordinary form")
+    result = submit(response, fail="success")
     assert result.outcome is AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT
-    assert "success_text_present=false" in joined(evidence)
+    assert "success_text_present=unavailable" in joined(evidence)
+    assert response.body_calls == 0
 
 
-def test_body_read_failure_is_recorded_without_changing_success(evidence):
-    result = submit(Response(body_error=OSError("do not log this secret")))
+def test_body_read_failure_is_avoided_without_changing_success(evidence):
+    response = Response(body_error=OSError("do not log this secret"))
+    result = submit(response)
     log = joined(evidence)
     assert result.outcome is AutoSubmitOutcome.SUCCESS
-    assert "body_available=false" in log and "body_error=OSError" in log
+    assert "body_available=false" in log and "body_error=SKIPPED_UNBOUNDED" in log
+    assert response.body_calls == 0
     assert "do not log" not in log
 
 
@@ -135,3 +144,66 @@ def test_diagnostic_logging_failure_cannot_change_classification(monkeypatch):
 
     monkeypatch.setattr(panel_service.AppLogger, "get", classmethod(fail))
     assert submit(Response()).outcome is AutoSubmitOutcome.SUCCESS
+
+
+def test_unbounded_body_probe_cannot_reduce_selector_budget(evidence):
+    class TimingPage(FakePage):
+        selector_timeout = None
+
+        def wait_for_selector(self, selector, **kwargs):
+            if selector == "#success":
+                self.selector_timeout = kwargs["timeout"]
+            return super().wait_for_selector(selector, **kwargs)
+
+    response = Response()
+    page = TimingPage(alert_text="Deposit telah disubmit")
+    page.navigation_response = response
+    panel = service(page, "Deposit telah disubmit")
+    panel.timeouts["success_wait_ms"] = 15_000
+
+    result = panel.submit_deposit_classified("010414", 5000, "r")
+
+    assert result.outcome is AutoSubmitOutcome.SUCCESS
+    assert page.selector_timeout >= 14_900
+    assert response.body_calls == 0
+
+
+def test_renderer_dependent_page_and_preselector_probes_are_not_called(evidence):
+    class RendererTrapPage(FakePage):
+        evaluate_calls = title_calls = visibility_calls = count_calls = 0
+
+        def evaluate(self, *_):
+            self.evaluate_calls += 1
+            raise RuntimeError("renderer hung")
+
+        def title(self):
+            self.title_calls += 1
+            raise RuntimeError("renderer hung")
+
+        def locator(self, selector):
+            locator = super().locator(selector)
+
+            def count():
+                self.count_calls += 1
+                raise RuntimeError("renderer hung")
+
+            def is_visible():
+                self.visibility_calls += 1
+                raise RuntimeError("renderer hung")
+
+            locator.count = count
+            locator.is_visible = is_visible
+            return locator
+
+    page = RendererTrapPage(alert_text="Deposit telah disubmit")
+    page.navigation_response = Response()
+    result = service(page, "Deposit telah disubmit").submit_deposit_classified(
+        "010414", 5000, "r"
+    )
+    log = joined(evidence)
+
+    assert result.outcome is AutoSubmitOutcome.SUCCESS
+    assert page.evaluate_calls == page.title_calls == 0
+    assert page.count_calls == page.visibility_calls == 0
+    assert "ready_state=not_probed" in log and "title=not_probed" in log
+    assert "pre_count=not_probed" in log and "pre_visible=not_probed" in log

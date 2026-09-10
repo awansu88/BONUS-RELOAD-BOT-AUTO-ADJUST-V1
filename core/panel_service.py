@@ -235,6 +235,8 @@ class PanelService:
                 frame = source.get("frame") if isinstance(source, dict) else source.frame
                 if not attempt or page is not attempt["page"] or frame != page.main_frame:
                     return
+                if payload.get("attempt_id") != attempt["id"]:
+                    return
                 if self._document_generation.get(id(page), 0) <= attempt["generation"]:
                     return
                 if urlsplit(str(payload.get("url", ""))).path != "/deposit/manual":
@@ -250,25 +252,60 @@ class PanelService:
                 # response and latched payload are jointly validated below.
                 pass
 
+        def document_attempt(source) -> Optional[str]:
+            """Snapshot ownership when an init script starts, never at capture time."""
+            try:
+                attempt = self._auto_attempt
+                page = source.get("page") if isinstance(source, dict) else source.page
+                frame = source.get("frame") if isinstance(source, dict) else source.frame
+                if attempt and page is attempt["page"] and frame == page.main_frame:
+                    return str(attempt["id"])
+            except Exception:
+                pass
+            return None
+
+        self._context.expose_binding("__patch10DocumentAttempt", document_attempt)
         self._context.expose_binding("__patch10Capture", captured)
         config_json = json.dumps({"selector": selector, "phrase": phrase})
         script = """(() => {
           const {selector, phrase} = CONFIG;
+          let attemptReady = false;
+          let documentAttempt = null;
+          const pending = [];
+          const send = (text) => {
+            if (!attemptReady) pending.push(text);
+            else window.__patch10Capture({
+              attempt_id: documentAttempt, url: location.href, text
+            });
+          };
           const report = (node) => {
-            if (!(node instanceof Element)) return;
-            const matches = node.matches(selector) ? [node] : node.querySelectorAll(selector);
+            const root = node instanceof Element ? node : node.parentElement;
+            if (!root) return;
+            const matches = new Set(root.querySelectorAll(selector));
+            const owner = root.closest(selector);
+            if (owner) matches.add(owner);
             for (const el of matches) {
               const text = el.textContent || '';
               if (!phrase || text.toLocaleLowerCase().includes(phrase.toLocaleLowerCase()))
-                window.__patch10Capture({url: location.href, text});
+                send(text);
             }
           };
           const start = () => {
             if (document.documentElement) report(document.documentElement);
-            new MutationObserver(ms => ms.forEach(m => m.addedNodes.forEach(report)))
-              .observe(document, {subtree: true, childList: true});
+            new MutationObserver(ms => ms.forEach(m => {
+              if (m.type === 'characterData') report(m.target);
+              else {
+                m.addedNodes.forEach(report);
+                report(m.target);
+              }
+            })).observe(document, {subtree: true, childList: true, characterData: true});
           };
           start();
+          Promise.resolve(window.__patch10DocumentAttempt()).then(attemptId => {
+            documentAttempt = attemptId;
+            attemptReady = true;
+            pending.splice(0).forEach(send);
+          });
         })();""".replace("CONFIG", config_json)
         self._context.add_init_script(script=script)
         for page in self._context.pages:
@@ -627,6 +664,7 @@ class PanelService:
         selector_started = time.perf_counter()
         selector_result = "ERROR"
         selector_error: Optional[str] = None
+        capture = None
         try:
             current = "WAITING_FRESH_RESULT"; phase(current)
             # No diagnostic Playwright or logging calls are permitted before
@@ -636,9 +674,12 @@ class PanelService:
             selector_started = time.perf_counter()
             capture = attempt.get("capture")
             if capture is None:
-                page.wait_for_selector(selector, timeout=remaining_ms, state="attached")
+                locator = page.locator(selector)
+                if success_text:
+                    locator = locator.filter(has_text=success_text)
+                locator.first.wait_for(state="attached", timeout=remaining_ms)
                 remaining_ms = max(1, int((result_deadline - time.perf_counter()) * 1000))
-                text = page.locator(selector).first.text_content(timeout=remaining_ms) or ""
+                text = locator.first.text_content(timeout=remaining_ms) or ""
                 capture = {"text": text, "at": time.perf_counter(), "source": "fresh_dom_attached"}
             selector_wait_ms = round((time.perf_counter() - selector_started) * 1000, 1)
             selector_result = "ATTACHED"

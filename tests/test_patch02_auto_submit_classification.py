@@ -18,8 +18,13 @@ class FakeLocator:
 
     def wait_for(self, state="visible", **_):
         self.page.events.append(("locator-wait", self.selector, state))
-        if self.page.fail == f"wait:{self.selector}":
+        if (self.page.fail == f"wait:{self.selector}" or
+                (self.selector == "#success" and self.page.fail == "success")):
             raise TimeoutError(self.selector)
+
+    def filter(self, *, has_text):
+        self.page.filtered_text = has_text
+        return self
 
     def is_visible(self):
         return self.selector == "#success" and self.page.stale_visible

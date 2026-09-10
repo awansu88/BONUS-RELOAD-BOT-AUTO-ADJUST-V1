@@ -150,10 +150,15 @@ def test_unbounded_body_probe_cannot_reduce_selector_budget(evidence):
     class TimingPage(FakePage):
         selector_timeout = None
 
-        def wait_for_selector(self, selector, **kwargs):
-            if selector == "#success":
-                self.selector_timeout = kwargs["timeout"]
-            return super().wait_for_selector(selector, **kwargs)
+        def locator(self, selector):
+            locator = super().locator(selector)
+            original_wait = locator.wait_for
+            def wait_for(**kwargs):
+                if selector == "#success":
+                    self.selector_timeout = kwargs["timeout"]
+                return original_wait(**kwargs)
+            locator.wait_for = wait_for
+            return locator
 
     response = Response()
     page = TimingPage(alert_text="Deposit telah disubmit")

@@ -30,6 +30,7 @@ class Page:
         self.wait_error = wait_error
         self.goto_error = goto_error
         self.events = []
+        self.main_frame = object()
 
     def is_closed(self): return self.closed
     def goto(self, url, **kwargs):
@@ -40,6 +41,7 @@ class Page:
         if self.wait_error: raise self.wait_error
     def fill(self, *_): raise AssertionError("recovery filled a field")
     def click(self, *_): raise AssertionError("recovery clicked")
+    def on(self, *_): pass
 
 
 class Context:
@@ -49,6 +51,9 @@ class Context:
     def new_page(self):
         page = Page(); self.pages.append(page); return page
     def close(self): self.closed += 1
+    def expose_binding(self, *_): pass
+    def add_init_script(self, **_): pass
+    def on(self, *_): pass
 
 
 class DeadContext:

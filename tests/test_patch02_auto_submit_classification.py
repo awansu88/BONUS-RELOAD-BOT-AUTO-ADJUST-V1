@@ -35,6 +35,9 @@ class FakeLocator:
     def inner_text(self, **_):
         if self.page.fail == "text": raise TimeoutError("text")
         return self.page.alert_text
+    def text_content(self, **_):
+        if self.page.fail == "text": raise TimeoutError("text")
+        return self.page.alert_text
 
 
 class FakeNavigationInfo:
@@ -45,7 +48,10 @@ class FakeNavigationInfo:
     def value(self):
         if self.page.same_document_navigation:
             return None
-        return getattr(self.page, "navigation_response", object())
+        return getattr(
+            self.page, "navigation_response",
+            SimpleNamespace(url="https://panel.example/deposit/manual"),
+        )
 
 
 class FakeNavigationContextManager:
@@ -87,7 +93,7 @@ class FakePage:
             raise TimeoutError(selector)
     def expect_navigation(self, **_):
         return FakeNavigationContextManager(self)
-    def click(self, selector):
+    def click(self, selector, **kwargs):
         self.events.append(("submit", selector)); self.clicks += 1
         if self.fail == "submit": raise RuntimeError("uncertain click")
         assert self.navigation_armed, "navigation proof must be armed before click"

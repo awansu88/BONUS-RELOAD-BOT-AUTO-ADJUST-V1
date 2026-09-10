@@ -67,7 +67,7 @@ def joined(records):
     return "\n".join(records)
 
 
-def test_normal_success_records_skipped_body_and_visible_selector(evidence):
+def test_normal_success_records_skipped_body_and_attached_selector(evidence):
     response = Response()
     result = submit(response)
     log = joined(evidence)
@@ -77,7 +77,7 @@ def test_normal_success_records_skipped_body_and_visible_selector(evidence):
     assert "content_type=text/html; charset=UTF-8" in log
     assert "body_available=false" in log and "body_error=SKIPPED_UNBOUNDED" in log
     assert "success_text_present=unavailable" in log and response.body_calls == 0
-    assert "phase=RESULT_WAIT" in log and "result=VISIBLE" in log
+    assert "phase=RESULT_WAIT" in log and "result=ATTACHED" in log
 
 
 def test_body_success_is_not_probed_and_dom_timeout_remains_unknown(evidence):

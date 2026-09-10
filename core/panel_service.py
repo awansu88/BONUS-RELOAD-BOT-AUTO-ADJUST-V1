@@ -38,6 +38,8 @@ from playwright.sync_api import (
 from .logger import AppLogger
 from .performance_telemetry import get_telemetry, timed
 
+_AUTO_ATTEMPT_STORAGE_KEY = "__idcash88_patch10_auto_attempt"
+
 
 def _sanitize_url(value: object) -> str:
     """Return only a URL's scheme, authority, and path for diagnostics."""
@@ -207,7 +209,6 @@ class PanelService:
         # init-script callback can therefore latch a short-lived alert even if
         # that document is immediately replaced.
         self._auto_attempt: Optional[Dict[str, object]] = None
-        self._document_generation: Dict[int, int] = {}
         self._early_verifier_installed = False
 
     def _install_early_submit_verifier(self) -> None:
@@ -217,17 +218,6 @@ class PanelService:
         selector = self.selectors["panel"]["success_alert"]
         phrase = self.selectors.get("success_text", "")
 
-        def navigated(frame) -> None:
-            try:
-                page = frame.page
-                if frame == page.main_frame:
-                    key = id(page)
-                    self._document_generation[key] = (
-                        self._document_generation.get(key, 0) + 1
-                    )
-            except Exception:
-                pass
-
         def captured(source, payload) -> None:
             try:
                 attempt = self._auto_attempt
@@ -236,8 +226,6 @@ class PanelService:
                 if not attempt or page is not attempt["page"] or frame != page.main_frame:
                     return
                 if payload.get("attempt_id") != attempt["id"]:
-                    return
-                if self._document_generation.get(id(page), 0) <= attempt["generation"]:
                     return
                 if urlsplit(str(payload.get("url", ""))).path != "/deposit/manual":
                     return
@@ -252,29 +240,20 @@ class PanelService:
                 # response and latched payload are jointly validated below.
                 pass
 
-        def document_attempt(source) -> Optional[str]:
-            """Snapshot ownership when an init script starts, never at capture time."""
-            try:
-                attempt = self._auto_attempt
-                page = source.get("page") if isinstance(source, dict) else source.page
-                frame = source.get("frame") if isinstance(source, dict) else source.frame
-                if attempt and page is attempt["page"] and frame == page.main_frame:
-                    return str(attempt["id"])
-            except Exception:
-                pass
-            return None
-
-        self._context.expose_binding("__patch10DocumentAttempt", document_attempt)
         self._context.expose_binding("__patch10Capture", captured)
-        config_json = json.dumps({"selector": selector, "phrase": phrase})
+        config_json = json.dumps({
+            "selector": selector,
+            "phrase": phrase,
+            "storageKey": _AUTO_ATTEMPT_STORAGE_KEY,
+        })
         script = """(() => {
-          const {selector, phrase} = CONFIG;
-          let attemptReady = false;
-          let documentAttempt = null;
-          const pending = [];
+          const {selector, phrase, storageKey} = CONFIG;
+          const documentAttempt = (() => {
+            try { return sessionStorage.getItem(storageKey); }
+            catch (_) { return null; }
+          })();
           const send = (text) => {
-            if (!attemptReady) pending.push(text);
-            else window.__patch10Capture({
+            window.__patch10Capture({
               attempt_id: documentAttempt, url: location.href, text
             });
           };
@@ -301,21 +280,8 @@ class PanelService:
             })).observe(document, {subtree: true, childList: true, characterData: true});
           };
           start();
-          Promise.resolve(window.__patch10DocumentAttempt()).then(attemptId => {
-            documentAttempt = attemptId;
-            attemptReady = true;
-            pending.splice(0).forEach(send);
-          });
         })();""".replace("CONFIG", config_json)
         self._context.add_init_script(script=script)
-        for page in self._context.pages:
-            self._document_generation.setdefault(id(page), 0)
-            page.on("framenavigated", navigated)
-        def page_created(page) -> None:
-            self._document_generation.setdefault(id(page), 0)
-            page.on("framenavigated", navigated)
-
-        self._context.on("page", page_created)
         self._early_verifier_installed = True
 
     # ------------------------------------------------------------------
@@ -367,7 +333,6 @@ class PanelService:
         self._page = None
         self._pw = None
         self._auto_attempt = None
-        self._document_generation.clear()
         self._early_verifier_installed = False
 
     # ------------------------------------------------------------------
@@ -565,6 +530,22 @@ class PanelService:
             telemetry.record_since("panel.form_fill", phase_started)
             current = "READY_TO_CLICK"; phase(current)
 
+            # Prepare immutable ownership while failure is still provably
+            # pre-click.  Each subsequent same-tab document snapshots this
+            # value synchronously in the BrowserContext init script.
+            phase_started = time.perf_counter()
+            result_deadline = phase_started + (success_wait / 1000.0)
+            submit_started = phase_started
+            attempt = {
+                "id": uuid.uuid4().hex, "page": page,
+                "capture": None,
+            }
+            self._auto_attempt = attempt
+            page.locator("html").evaluate(
+                "(element, value) => sessionStorage.setItem(value.key, value.attempt)",
+                {"key": _AUTO_ATTEMPT_STORAGE_KEY, "attempt": attempt["id"]},
+                timeout=max(1, int((result_deadline - time.perf_counter()) * 1000)),
+            )
             current = "SUBMIT_CLICK_BOUNDARY"; phase(current)
         except Exception as exc:
             # No call to page.click has been entered.
@@ -576,17 +557,9 @@ class PanelService:
                           "FAILED_PRE_CLICK", exc, current,
                           accounting_error=isinstance(exc, _AutoPhasePersistenceError))
 
-        phase_started = time.perf_counter()
-        result_deadline = phase_started + (success_wait / 1000.0)
-        submit_started = phase_started
+        phase_started = submit_started
         click_returned_at: Optional[float] = None
         click_returned = False
-        attempt = {
-            "id": uuid.uuid4().hex, "page": page,
-            "generation": self._document_generation.get(id(page), 0),
-            "capture": None,
-        }
-        self._auto_attempt = attempt
         try:
             # Playwright 1.55's expect_navigation waiter is installed when the
             # context manager is entered, before the click can trigger a fast
@@ -677,10 +650,22 @@ class PanelService:
                 locator = page.locator(selector)
                 if success_text:
                     locator = locator.filter(has_text=success_text)
-                locator.first.wait_for(state="attached", timeout=remaining_ms)
-                remaining_ms = max(1, int((result_deadline - time.perf_counter()) * 1000))
-                text = locator.first.text_content(timeout=remaining_ms) or ""
-                capture = {"text": text, "at": time.perf_counter(), "source": "fresh_dom_attached"}
+                try:
+                    locator.first.wait_for(state="attached", timeout=remaining_ms)
+                    capture = attempt.get("capture")
+                    if capture is None:
+                        remaining_ms = max(
+                            1, int((result_deadline - time.perf_counter()) * 1000)
+                        )
+                        text = locator.first.text_content(timeout=remaining_ms) or ""
+                        capture = attempt.get("capture") or {
+                            "text": text, "at": time.perf_counter(),
+                            "source": "fresh_dom_attached",
+                        }
+                except Exception:
+                    capture = attempt.get("capture")
+                    if capture is None:
+                        raise
             selector_wait_ms = round((time.perf_counter() - selector_started) * 1000, 1)
             selector_result = "ATTACHED"
             text = str(capture["text"])

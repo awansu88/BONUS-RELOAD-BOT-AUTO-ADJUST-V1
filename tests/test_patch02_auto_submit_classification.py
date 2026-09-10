@@ -35,7 +35,10 @@ class FakeLocator:
     def fill(self, value):
         if value and self.page.fail == f"fill:{self.selector}": raise RuntimeError("fill")
         self.page.events.append(("fill", self.selector, value))
-    def evaluate(self, _): return ""
+    def evaluate(self, _, arg=None, **__):
+        if isinstance(arg, dict) and "attempt" in arg:
+            self.page.session_attempt = arg["attempt"]
+        return ""
     def select_option(self, **_): return None
     def inner_text(self, **_):
         if self.page.fail == "text": raise TimeoutError("text")

@@ -67,7 +67,7 @@ def joined(records):
     return "\n".join(records)
 
 
-def test_normal_success_records_skipped_body_and_visible_selector(evidence):
+def test_normal_success_records_skipped_body_and_attached_selector(evidence):
     response = Response()
     result = submit(response)
     log = joined(evidence)
@@ -77,7 +77,7 @@ def test_normal_success_records_skipped_body_and_visible_selector(evidence):
     assert "content_type=text/html; charset=UTF-8" in log
     assert "body_available=false" in log and "body_error=SKIPPED_UNBOUNDED" in log
     assert "success_text_present=unavailable" in log and response.body_calls == 0
-    assert "phase=RESULT_WAIT" in log and "result=VISIBLE" in log
+    assert "phase=RESULT_WAIT" in log and "result=ATTACHED" in log
 
 
 def test_body_success_is_not_probed_and_dom_timeout_remains_unknown(evidence):
@@ -150,10 +150,15 @@ def test_unbounded_body_probe_cannot_reduce_selector_budget(evidence):
     class TimingPage(FakePage):
         selector_timeout = None
 
-        def wait_for_selector(self, selector, **kwargs):
-            if selector == "#success":
-                self.selector_timeout = kwargs["timeout"]
-            return super().wait_for_selector(selector, **kwargs)
+        def locator(self, selector):
+            locator = super().locator(selector)
+            original_wait = locator.wait_for
+            def wait_for(**kwargs):
+                if selector == "#success":
+                    self.selector_timeout = kwargs["timeout"]
+                return original_wait(**kwargs)
+            locator.wait_for = wait_for
+            return locator
 
     response = Response()
     page = TimingPage(alert_text="Deposit telah disubmit")

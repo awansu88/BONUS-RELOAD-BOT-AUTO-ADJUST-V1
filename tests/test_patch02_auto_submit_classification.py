@@ -18,8 +18,13 @@ class FakeLocator:
 
     def wait_for(self, state="visible", **_):
         self.page.events.append(("locator-wait", self.selector, state))
-        if self.page.fail == f"wait:{self.selector}":
+        if (self.page.fail == f"wait:{self.selector}" or
+                (self.selector == "#success" and self.page.fail == "success")):
             raise TimeoutError(self.selector)
+
+    def filter(self, *, has_text):
+        self.page.filtered_text = has_text
+        return self
 
     def is_visible(self):
         return self.selector == "#success" and self.page.stale_visible
@@ -30,9 +35,15 @@ class FakeLocator:
     def fill(self, value):
         if value and self.page.fail == f"fill:{self.selector}": raise RuntimeError("fill")
         self.page.events.append(("fill", self.selector, value))
-    def evaluate(self, _): return ""
+    def evaluate(self, _, arg=None, **__):
+        if isinstance(arg, dict) and "attempt" in arg:
+            self.page.session_attempt = arg["attempt"]
+        return ""
     def select_option(self, **_): return None
     def inner_text(self, **_):
+        if self.page.fail == "text": raise TimeoutError("text")
+        return self.page.alert_text
+    def text_content(self, **_):
         if self.page.fail == "text": raise TimeoutError("text")
         return self.page.alert_text
 
@@ -45,7 +56,10 @@ class FakeNavigationInfo:
     def value(self):
         if self.page.same_document_navigation:
             return None
-        return getattr(self.page, "navigation_response", object())
+        return getattr(
+            self.page, "navigation_response",
+            SimpleNamespace(url="https://panel.example/deposit/manual"),
+        )
 
 
 class FakeNavigationContextManager:
@@ -87,7 +101,7 @@ class FakePage:
             raise TimeoutError(selector)
     def expect_navigation(self, **_):
         return FakeNavigationContextManager(self)
-    def click(self, selector):
+    def click(self, selector, **kwargs):
         self.events.append(("submit", selector)); self.clicks += 1
         if self.fail == "submit": raise RuntimeError("uncertain click")
         assert self.navigation_armed, "navigation proof must be armed before click"

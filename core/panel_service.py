@@ -18,7 +18,9 @@ Operator flow:
 
 from __future__ import annotations
 
+import json
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -35,6 +37,8 @@ from playwright.sync_api import (
 )
 from .logger import AppLogger
 from .performance_telemetry import get_telemetry, timed
+
+_AUTO_ATTEMPT_STORAGE_KEY = "__idcash88_patch10_auto_attempt"
 
 
 def _sanitize_url(value: object) -> str:
@@ -201,6 +205,84 @@ class PanelService:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._attached: bool = False
+        # PATCH-10 verification state lives in Python, not in a renderer.  The
+        # init-script callback can therefore latch a short-lived alert even if
+        # that document is immediately replaced.
+        self._auto_attempt: Optional[Dict[str, object]] = None
+        self._early_verifier_installed = False
+
+    def _install_early_submit_verifier(self) -> None:
+        """Install the new-document watcher once on the persistent context."""
+        if self._early_verifier_installed or self._context is None:
+            return
+        selector = self.selectors["panel"]["success_alert"]
+        phrase = self.selectors.get("success_text", "")
+
+        def captured(source, payload) -> None:
+            try:
+                attempt = self._auto_attempt
+                page = source.get("page") if isinstance(source, dict) else source.page
+                frame = source.get("frame") if isinstance(source, dict) else source.frame
+                if not attempt or page is not attempt["page"] or frame != page.main_frame:
+                    return
+                if payload.get("attempt_id") != attempt["id"]:
+                    return
+                if urlsplit(str(payload.get("url", ""))).path != "/deposit/manual":
+                    return
+                text = str(payload.get("text", ""))
+                if phrase and phrase.casefold() not in text.casefold():
+                    return
+                attempt["capture"] = {
+                    "text": text, "at": time.perf_counter(), "source": "context_init_observer"
+                }
+            except Exception:
+                # Verification callbacks are best effort until the navigation
+                # response and latched payload are jointly validated below.
+                pass
+
+        self._context.expose_binding("__patch10Capture", captured)
+        config_json = json.dumps({
+            "selector": selector,
+            "phrase": phrase,
+            "storageKey": _AUTO_ATTEMPT_STORAGE_KEY,
+        })
+        script = """(() => {
+          const {selector, phrase, storageKey} = CONFIG;
+          const documentAttempt = (() => {
+            try { return sessionStorage.getItem(storageKey); }
+            catch (_) { return null; }
+          })();
+          const send = (text) => {
+            window.__patch10Capture({
+              attempt_id: documentAttempt, url: location.href, text
+            });
+          };
+          const report = (node) => {
+            const root = node instanceof Element ? node : node.parentElement;
+            if (!root) return;
+            const matches = new Set(root.querySelectorAll(selector));
+            const owner = root.closest(selector);
+            if (owner) matches.add(owner);
+            for (const el of matches) {
+              const text = el.textContent || '';
+              if (!phrase || text.toLocaleLowerCase().includes(phrase.toLocaleLowerCase()))
+                send(text);
+            }
+          };
+          const start = () => {
+            if (document.documentElement) report(document.documentElement);
+            new MutationObserver(ms => ms.forEach(m => {
+              if (m.type === 'characterData') report(m.target);
+              else {
+                m.addedNodes.forEach(report);
+                report(m.target);
+              }
+            })).observe(document, {subtree: true, childList: true, characterData: true});
+          };
+          start();
+        })();""".replace("CONFIG", config_json)
+        self._context.add_init_script(script=script)
+        self._early_verifier_installed = True
 
     # ------------------------------------------------------------------
     @property
@@ -250,6 +332,8 @@ class PanelService:
         self._context = None
         self._page = None
         self._pw = None
+        self._auto_attempt = None
+        self._early_verifier_installed = False
 
     # ------------------------------------------------------------------
     def open_panel(self, panel_url: Optional[str] = None) -> None:
@@ -278,6 +362,7 @@ class PanelService:
                 args=["--disable-blink-features=AutomationControlled"],
             )
             self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
+            self._install_early_submit_verifier()
         elif self._page is None or self._page.is_closed():
             # Context alive but last page gone — spin up a new one.
             self._page = self._context.new_page()
@@ -400,6 +485,7 @@ class PanelService:
 
         def result(outcome, phase, detail="", evidence="", *, crossed=False,
                    accounting_error=False):
+            self._auto_attempt = None
             return AutoSubmitResult(outcome, crossed, phase, str(detail),
                                     str(evidence), accounting_error)
 
@@ -444,6 +530,22 @@ class PanelService:
             telemetry.record_since("panel.form_fill", phase_started)
             current = "READY_TO_CLICK"; phase(current)
 
+            # Prepare immutable ownership while failure is still provably
+            # pre-click.  Each subsequent same-tab document snapshots this
+            # value synchronously in the BrowserContext init script.
+            phase_started = time.perf_counter()
+            result_deadline = phase_started + (success_wait / 1000.0)
+            submit_started = phase_started
+            attempt = {
+                "id": uuid.uuid4().hex, "page": page,
+                "capture": None,
+            }
+            self._auto_attempt = attempt
+            page.locator("html").evaluate(
+                "(element, value) => sessionStorage.setItem(value.key, value.attempt)",
+                {"key": _AUTO_ATTEMPT_STORAGE_KEY, "attempt": attempt["id"]},
+                timeout=max(1, int((result_deadline - time.perf_counter()) * 1000)),
+            )
             current = "SUBMIT_CLICK_BOUNDARY"; phase(current)
         except Exception as exc:
             # No call to page.click has been entered.
@@ -455,9 +557,7 @@ class PanelService:
                           "FAILED_PRE_CLICK", exc, current,
                           accounting_error=isinstance(exc, _AutoPhasePersistenceError))
 
-        phase_started = time.perf_counter()
-        result_deadline = phase_started + (success_wait / 1000.0)
-        submit_started = phase_started
+        phase_started = submit_started
         click_returned_at: Optional[float] = None
         click_returned = False
         try:
@@ -466,9 +566,13 @@ class PanelService:
             # same-URL document reload.  Page navigation is main-frame only;
             # iframe navigations do not satisfy this expectation.
             with page.expect_navigation(
-                wait_until="domcontentloaded", timeout=success_wait
+                wait_until="commit",
+                timeout=max(1, int((result_deadline - time.perf_counter()) * 1000)),
             ) as navigation_info:
-                page.click(panel["submit"])
+                page.click(
+                    panel["submit"],
+                    timeout=max(1, int((result_deadline - time.perf_counter()) * 1000)),
+                )
                 click_returned = True
                 click_returned_at = time.perf_counter()
                 telemetry.record_since("panel.submit_click", phase_started)
@@ -493,29 +597,36 @@ class PanelService:
                     **_page_evidence(page),
                 }, warning=True)
                 raise RuntimeError("same-document navigation is not a fresh document")
+            if urlsplit(str(navigation_response.url)).path != "/deposit/manual":
+                raise RuntimeError("fresh navigation did not commit /deposit/manual")
         except Exception as exc:
             if click_returned:
-                return result(
+                classified = result(
                     AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, current, exc,
                     "click returned but fresh submit navigation was not proven",
                     crossed=True,
                     accounting_error=isinstance(exc, _AutoPhasePersistenceError),
                 )
+                self._auto_attempt = None
+                return classified
             accounting_error = False
             try:
                 phase("CLICK_UNCERTAIN")
             except Exception as phase_exc:
                 accounting_error = True
                 exc = RuntimeError(f"{exc}; CLICK_UNCERTAIN persistence failed: {phase_exc}")
-            return result(AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT,
+            classified = result(AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT,
                           "CLICK_UNCERTAIN", exc,
                           "click call did not return; dispatch may have occurred",
                           accounting_error=accounting_error)
+            self._auto_attempt = None
+            return classified
 
         phase_started = time.perf_counter()
         try:
             current = "NAVIGATION_OBSERVED"; phase(current)
         except Exception as exc:
+            self._auto_attempt = None
             return result(AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT, current, exc,
                           "fresh navigation observed but durable phase evidence failed",
                           crossed=True, accounting_error=True)
@@ -526,6 +637,7 @@ class PanelService:
         selector_started = time.perf_counter()
         selector_result = "ERROR"
         selector_error: Optional[str] = None
+        capture = None
         try:
             current = "WAITING_FRESH_RESULT"; phase(current)
             # No diagnostic Playwright or logging calls are permitted before
@@ -533,14 +645,32 @@ class PanelService:
             # as PR #19, apart from negligible local Python assignments.
             remaining_ms = max(1, int((result_deadline - time.perf_counter()) * 1000))
             selector_started = time.perf_counter()
-            page.wait_for_selector(selector, timeout=remaining_ms, state="visible")
+            capture = attempt.get("capture")
+            if capture is None:
+                locator = page.locator(selector)
+                if success_text:
+                    locator = locator.filter(has_text=success_text)
+                try:
+                    locator.first.wait_for(state="attached", timeout=remaining_ms)
+                    capture = attempt.get("capture")
+                    if capture is None:
+                        remaining_ms = max(
+                            1, int((result_deadline - time.perf_counter()) * 1000)
+                        )
+                        text = locator.first.text_content(timeout=remaining_ms) or ""
+                        capture = attempt.get("capture") or {
+                            "text": text, "at": time.perf_counter(),
+                            "source": "fresh_dom_attached",
+                        }
+                except Exception:
+                    capture = attempt.get("capture")
+                    if capture is None:
+                        raise
             selector_wait_ms = round((time.perf_counter() - selector_started) * 1000, 1)
-            selector_result = "VISIBLE"
-            evidence = "fresh navigation observed; success alert visible"
+            selector_result = "ATTACHED"
+            text = str(capture["text"])
+            evidence = f"fresh navigation observed; success alert attached: {text}"
             if success_text:
-                remaining_ms = max(1, int((result_deadline - time.perf_counter()) * 1000))
-                text = page.locator(selector).first.inner_text(timeout=min(1000, remaining_ms))
-                evidence = f"fresh navigation observed; success alert: {text or ''}"
                 if success_text.lower() not in evidence.lower():
                     current = "AMBIGUOUS_RESPONSE"
                     phase(current)
@@ -599,6 +729,11 @@ class PanelService:
             "pre_count": "not_probed", "pre_visible": "not_probed",
             "wait_timeout_ms": remaining_ms, "result": selector_result,
             "selector_wait_ms": selector_wait_ms,
+            "navigation_commit_ms": round((navigation_completed_at - submit_started) * 1000, 1),
+            "success_capture_ms": round((capture["at"] - submit_started) * 1000, 1) if capture else "unavailable",
+            "success_verify_ms": selector_wait_ms,
+            "verification_total_ms": round((time.perf_counter() - submit_started) * 1000, 1),
+            "success_capture_source": capture["source"] if capture else "unavailable",
             "total_submit_ms": round((time.perf_counter() - method_started) * 1000, 1),
             **_page_evidence(page),
         }
@@ -608,6 +743,7 @@ class PanelService:
             result_fields,
             warning=classified_result.outcome is AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT,
         )
+        self._auto_attempt = None
         return classified_result
 
     def submit_adjustment(self, user_id: str, amount: int, remark: str,

@@ -123,6 +123,10 @@ class Worksheet:
     def get_all_values(self):
         if self.error: raise self.error
         return self.values
+    def col_values(self, column):
+        assert column == 2
+        if self.error: raise self.error
+        return [row[1] if len(row) > 1 else "" for row in self.values]
 
 
 def test_master_instrumentation_preserves_value_and_exception():

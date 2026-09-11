@@ -264,14 +264,8 @@ class SheetService:
         """Manual bonus list — USER IDs live in Column B only."""
         if not self._manual:
             raise RuntimeError("Not connected")
-        values = self._manual.get_all_values()
-        out: Set[str] = set()
-        for row in values[1:]:
-            if len(row) >= 2:
-                uid = row[1].strip()
-                if uid:
-                    out.add(uid)
-        return out
+        values = self._manual.col_values(2)
+        return {uid.strip() for uid in values[1:] if uid.strip()}
 
     def read_manual_adjust_snapshot(self) -> List[RawManualAdjustRow]:
         """Bulk-read raw MASTER B/F/I values once for Manual Adjust.

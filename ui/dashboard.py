@@ -1814,7 +1814,7 @@ class Dashboard(QMainWindow):
         self.cache.set_daily_bonus(self.db.daily_bonus_map())
         try:
             manual = self.sheet.read_manual_set()
-            self.cache.set_manual(manual)
+            self._install_manual_snapshot(manual)
             self.logger.info(f"Manual bonus list: {len(manual)} users")
         except Exception as exc:
             self.logger.error(f"Failed reading manual list: {exc}")
@@ -1843,7 +1843,7 @@ class Dashboard(QMainWindow):
             return
         try:
             manual = self.sheet.read_manual_set()
-            self.cache.set_manual(manual)
+            self._install_manual_snapshot(manual)
             self._stamp_sync()
             self.logger.info(f"Manual list refreshed ({len(manual)})")
         except Exception as exc:
@@ -1853,6 +1853,11 @@ class Dashboard(QMainWindow):
     # adjustment. Cheap enough that we can afford one API call per submit
     # in the worst case, but usually amortised by the TTL below.
     _MANUAL_FRESH_TTL_SEC = 2.0
+
+    def _install_manual_snapshot(self, manual: set[str]) -> None:
+        """Install a successful read and start freshness at completion."""
+        self.cache.set_manual(manual)
+        self._manual_last_refresh_ts = time.monotonic()
 
     @__import__("core.performance_telemetry", fromlist=["timed"]).timed(
         "auto.manual_preflight")
@@ -1869,8 +1874,7 @@ class Dashboard(QMainWindow):
             return
         try:
             manual = self.sheet.read_manual_set()
-            self.cache.set_manual(manual)
-            self._manual_last_refresh_ts = now
+            self._install_manual_snapshot(manual)
         except Exception as exc:
             # Do NOT crash the worker on a transient Google API blip; the
             # queue-refill path will retry on the next monitoring cycle.

@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from core.performance_telemetry import configure, get_telemetry
-from tests.test_patch00_auto_baseline import queue, row, run_worker, worker_dashboard
+from core.panel_service import PanelService
+from tests.test_patch00_auto_baseline import (
+    dashboard_method, queue, row, run_worker, worker_dashboard,
+)
 
 
 def test_ready_transaction_uses_cache_and_never_reads_manual_sheet(tmp_path):
@@ -83,3 +87,89 @@ def test_empty_queue_enters_slow_monitoring_without_refill(tmp_path):
     assert fake.state == "monitoring"
     assert submits == []
     db.close()
+
+
+class OptionalLocator:
+    def __init__(self, present):
+        self.present = present
+        self.selections = []
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return int(self.present)
+
+    def select_option(self, **kwargs):
+        if not self.present:
+            raise AssertionError("absent dropdown entered select autowait")
+        self.selections.append(kwargs)
+
+
+class OptionalPage:
+    def __init__(self, present):
+        self.loc = OptionalLocator(present)
+
+    def locator(self, _selector):
+        return self.loc
+
+
+def test_optional_dropdown_absence_returns_before_select_wait():
+    page = OptionalPage(present=False)
+    PanelService._maybe_select(page, "#optional", "Bank Transfer")
+    assert page.loc.selections == []
+
+
+def test_present_dropdown_keeps_selection_with_bounded_timeout():
+    page = OptionalPage(present=True)
+    PanelService._maybe_select(page, "#payment", "Bank Transfer")
+    assert page.loc.selections == [{"label": "Bank Transfer", "timeout": 500}]
+
+
+def test_two_consecutive_ready_transactions_record_exactly_one_gap(tmp_path):
+    telemetry = configure({"performance_telemetry_enabled": True,
+                           "performance_slow_threshold_ms": 9999})
+    db, manager = queue(tmp_path, [row("A", "alice", 50_000),
+                                   row("B", "bob", 50_000)])
+    manager.refill()
+    fake, _, _ = worker_dashboard(db, manager)
+    fake._last_auto_tx_completed_at = None
+
+    run_worker(fake)
+    run_worker(fake)
+
+    assert telemetry.snapshot()["auto.inter_transaction_gap"]["count"] == 1
+    db.close()
+
+
+def _monitoring_host():
+    label = SimpleNamespace(setText=lambda *_: None, setStyleSheet=lambda *_: None)
+    return SimpleNamespace(
+        state="running", _last_auto_tx_completed_at=1.0,
+        worker_timer=SimpleNamespace(setInterval=lambda *_: None),
+        _set_dot=lambda *_: None, dot_bot=None, txt_bot=label,
+        cur_status=label, cur_user=label, cur_deposit=label, cur_bonus=label,
+        prog_label=label, _monitoring_interval=10, _next_refresh_ts=None,
+        _update_countdown_label=lambda: None,
+        logger=SimpleNamespace(info=lambda *_: None),
+    )
+
+
+def test_entering_monitoring_discards_previous_batch_gap():
+    host = _monitoring_host()
+    enter = dashboard_method("_enter_monitoring", {"time": __import__("time")})
+    enter(host)
+    assert host.state == "monitoring"
+    assert host._last_auto_tx_completed_at is None
+
+
+def test_session_reset_discards_stale_gap_before_first_transaction():
+    label = SimpleNamespace(setText=lambda *_: None)
+    host = SimpleNamespace(
+        _last_auto_tx_completed_at=1.0, stat_bonus_paid=label, stat_rate=label,
+        stat_avg_submit=label, stat_elapsed=label,
+    )
+    reset = dashboard_method("_reset_session", {"time": __import__("time")})
+    reset(host)
+    assert host._last_auto_tx_completed_at is None

@@ -1673,6 +1673,9 @@ class Dashboard(QMainWindow):
     # ---------------- session metrics ----------------
     def _reset_session(self) -> None:
         self._run_start_ts = time.monotonic()
+        # A new START is a new READY batch; never attribute stopped/idle time
+        # to the next inter-transaction scheduler sample.
+        self._last_auto_tx_completed_at = None
         self._processed_count = 0
         self._bonus_paid_total = 0
         self._submit_duration_sum = 0.0
@@ -2479,6 +2482,9 @@ class Dashboard(QMainWindow):
     def _enter_monitoring(self, reason: str = "Queue empty") -> None:
         """Switch the running worker into a low-noise waiting mode."""
         self.state = "monitoring"
+        # Monitoring breaks READY-to-READY continuity.  The first transaction
+        # after a refill establishes a new telemetry boundary.
+        self._last_auto_tx_completed_at = None
         self.worker_timer.setInterval(500)
         self._set_dot(self.dot_bot, "warn")
         self.txt_bot.setText("Monitoring")

@@ -240,8 +240,8 @@ def test_normal_auto_panel_sequence_and_frozen_defaults():
         ("fill", "#user", "alice"),
         ("fill", "#amount", "5000"),
         ("fill", "#remark", "BONUS RELOAD AUTO"),
-        ("select", "#payment", {"label": "Bank Transfer"}),
-        ("select", "#currency", {"label": "Indonesia Rupiah"}),
+        ("select", "#payment", {"label": "Bank Transfer", "timeout": 500}),
+        ("select", "#currency", {"label": "Indonesia Rupiah", "timeout": 500}),
         ("submit", "#submit"), ("wait", "#success"),
     ]
 

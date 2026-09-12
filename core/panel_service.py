@@ -39,6 +39,7 @@ from .logger import AppLogger
 from .performance_telemetry import get_telemetry, timed
 
 _AUTO_ATTEMPT_STORAGE_KEY = "__idcash88_patch10_auto_attempt"
+_OPTIONAL_SELECT_TIMEOUT_MS = 500
 
 
 def _sanitize_url(value: object) -> str:
@@ -839,10 +840,15 @@ class PanelService:
             return
         try:
             loc = page.locator(selector).first
+            # These selectors are deliberately optional/composite.  count()
+            # is a non-waiting DOM query, so an absent control cannot enter
+            # either select_option autowait path.
+            if loc.count() == 0:
+                return
             try:
-                loc.select_option(label=value)
+                loc.select_option(label=value, timeout=_OPTIONAL_SELECT_TIMEOUT_MS)
             except Exception:
-                loc.select_option(value=value)
+                loc.select_option(value=value, timeout=_OPTIONAL_SELECT_TIMEOUT_MS)
         except Exception:
             # Dropdown not present or not a <select>; ignore silently
             return

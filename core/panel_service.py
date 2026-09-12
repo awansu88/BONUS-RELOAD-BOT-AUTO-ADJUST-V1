@@ -39,6 +39,7 @@ from .logger import AppLogger
 from .performance_telemetry import get_telemetry, timed
 
 _AUTO_ATTEMPT_STORAGE_KEY = "__idcash88_patch10_auto_attempt"
+_OPTIONAL_SELECT_TIMEOUT_MS = 500
 
 
 def _sanitize_url(value: object) -> str:
@@ -516,14 +517,12 @@ class PanelService:
         current = "FORM_STARTED"
         try:
             phase(current)
-            page.wait_for_selector(panel["username"], timeout=field_wait)
+            self._fill(page, panel["username"], str(user_id), timeout=field_wait)
             telemetry.record_since("panel.fields_ready", phase_started)
-            phase_started = time.perf_counter()
-            self._fill(page, panel["username"], str(user_id))
             current = "USERNAME_FILLED"; phase(current)
-            self._fill(page, panel["amount"], str(int(bonus)))
+            self._fill(page, panel["amount"], str(int(bonus)), timeout=field_wait)
             current = "AMOUNT_FILLED"; phase(current)
-            self._fill(page, panel["remark"], remark)
+            self._fill(page, panel["remark"], remark, timeout=field_wait)
             current = "REMARK_FILLED"; phase(current)
             self._maybe_select(page, panel.get("payment_dropdown"), defaults.get("payment"))
             self._maybe_select(page, panel.get("currency_dropdown"), defaults.get("currency"))
@@ -829,16 +828,11 @@ class PanelService:
     # Helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _fill(page: Page, selector: str, value: str) -> None:
+    def _fill(page: Page, selector: str, value: str, timeout: int = 8000) -> None:
         loc = page.locator(selector).first
-        loc.wait_for(state="visible", timeout=8000)
-        loc.click()
-        # Clear any pre-existing value before typing.
-        try:
-            loc.fill("")
-        except Exception:
-            pass
-        loc.fill(value)
+        # Playwright fill provides actionability/autowait, replaces the old
+        # value, and dispatches the page's normal input events in one action.
+        loc.fill(value, timeout=timeout)
 
     @staticmethod
     def _maybe_select(page: Page, selector: Optional[str], value: Optional[str]) -> None:
@@ -846,15 +840,15 @@ class PanelService:
             return
         try:
             loc = page.locator(selector).first
+            # These selectors are deliberately optional/composite.  count()
+            # is a non-waiting DOM query, so an absent control cannot enter
+            # either select_option autowait path.
             if loc.count() == 0:
                 return
-            current = loc.evaluate("el => el.value || el.textContent || ''")
-            if current and value.lower() in str(current).lower():
-                return
             try:
-                loc.select_option(label=value)
+                loc.select_option(label=value, timeout=_OPTIONAL_SELECT_TIMEOUT_MS)
             except Exception:
-                loc.select_option(value=value)
+                loc.select_option(value=value, timeout=_OPTIONAL_SELECT_TIMEOUT_MS)
         except Exception:
             # Dropdown not present or not a <select>; ignore silently
             return

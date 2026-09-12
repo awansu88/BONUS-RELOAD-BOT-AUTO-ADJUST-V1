@@ -215,7 +215,8 @@ def test_manual_bonus_added_before_retry_blocks_remote_and_future_retry(tmp_path
     failed_once(db)
     q = manager(db, [row("tx", "alice", 100_000)])
     q.refill()
-    worker, calls, _ = worker_dashboard(db, q, refresh=lambda: worker.cache.set_manual({"alice"}))
+    worker, calls, _ = worker_dashboard(db, q)
+    worker.cache.set_manual({"alice"})
     run_worker(worker)
     assert calls == [] and db.has_tx("tx") and not db.is_auto_retry_eligible("tx")
 

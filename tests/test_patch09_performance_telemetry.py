@@ -187,7 +187,7 @@ def test_queue_instrumentation_preserves_ready_order_and_content(tmp_path):
 
 @pytest.mark.parametrize(("failure", "expected"), [
     ("", AutoSubmitOutcome.SUCCESS),
-    ("wait:#user", AutoSubmitOutcome.FAILED_NOT_SUBMITTED),
+    ("fill:#user", AutoSubmitOutcome.FAILED_NOT_SUBMITTED),
     ("success", AutoSubmitOutcome.UNKNOWN_AFTER_SUBMIT),
 ])
 def test_panel_telemetry_preserves_submit_classification(failure, expected):

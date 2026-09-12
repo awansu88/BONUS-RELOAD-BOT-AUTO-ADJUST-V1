@@ -72,9 +72,8 @@ def test_fresh_worker_manual_check_is_canonical_and_makes_no_panel_call(tmp_path
     db = DatabaseService(str(tmp_path / "db"))
     q = queue(db, [row("tx", "Alice")])
     q.refill()
-    dashboard, submissions, _ = worker_dashboard(
-        db, q, refresh=lambda: dashboard.cache.set_manual({"ALICE"})
-    )
+    dashboard, submissions, _ = worker_dashboard(db, q)
+    dashboard.cache.set_manual({"alice"})
     run_worker(dashboard)
     assert submissions == []
     assert db._conn.execute(

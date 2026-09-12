@@ -77,7 +77,7 @@ from core.manual_adjust_loader import ManualAdjustLoader
 from core.manual_adjust_repository import ManualAdjustRepository
 from core.manual_adjust_controller import ManualAdjustController
 from core.performance_telemetry import (
-    EventLoopStallDetector, configure as configure_performance,
+    EventLoopStallDetector, configure as configure_performance, get_telemetry,
 )
 from ui.manual_adjust_state import (ManualPreviewState, OperatingMode,
                                     manual_execution_blocks_auto,
@@ -684,6 +684,9 @@ class Dashboard(QMainWindow):
         self.manual_timer.timeout.connect(self._reload_manual_list)
 
         self.worker_timer = QTimer(self)
+        # A repeating zero-interval timer yields to Qt between financial
+        # transactions without imposing an artificial cadence.  Monitoring
+        # switches this same timer to a low-frequency interval below.
         self.worker_timer.setSingleShot(False)
         self.worker_timer.timeout.connect(self._worker_step)
         self.recovery_timer = QTimer(self)
@@ -740,6 +743,7 @@ class Dashboard(QMainWindow):
         self._queue_start_size: int = 0     # ready count when this queue was loaded
         self._session_total: int = 0        # cumulative READY seen across refills
         self._current_submit_ts: Optional[float] = None
+        self._last_auto_tx_completed_at: Optional[float] = None
 
         # Continuous monitoring
         self._monitoring_interval: int = int(
@@ -1669,6 +1673,9 @@ class Dashboard(QMainWindow):
     # ---------------- session metrics ----------------
     def _reset_session(self) -> None:
         self._run_start_ts = time.monotonic()
+        # A new START is a new READY batch; never attribute stopped/idle time
+        # to the next inter-transaction scheduler sample.
+        self._last_auto_tx_completed_at = None
         self._processed_count = 0
         self._bonus_paid_total = 0
         self._submit_duration_sum = 0.0
@@ -2021,10 +2028,9 @@ class Dashboard(QMainWindow):
         if self.queue.ready_count() == 0:
             self._enter_monitoring(reason="No READY yet")
 
-        # Fast tick — the panel submit itself is what paces us during
-        # processing, and 500 ms is enough to keep the monitoring countdown
-        # visually smooth without wasting CPU.
-        self.worker_timer.start(500)
+        # READY work runs on consecutive Qt event-loop opportunities.  Empty
+        # queue monitoring remains deliberately slower and cannot busy-spin.
+        self.worker_timer.start(500 if self.state == "monitoring" else 0)
 
     def _on_stop(self) -> None:
         if self.state not in ("running", "monitoring", "recovering"):
@@ -2128,13 +2134,19 @@ class Dashboard(QMainWindow):
         if self.state == "monitoring":
             self._exit_monitoring()
 
+        previous_completed = getattr(self, "_last_auto_tx_completed_at", None)
+        if previous_completed is not None:
+            get_telemetry().record_since(
+                "auto.inter_transaction_gap", previous_completed,
+                tx_id=item.tx_id,
+            )
+
         # ----------------------------------------------------------
         # FINAL PRE-SUBMIT VALIDATION SEQUENCE  (BUG-012 + BUG-015)
         #
         # The order below is contractual — do NOT reorder:
         #   1. SQLite duplicate validation.
-        #   2. Latest Manual Bonus validation (fresh read from Google
-        #      Sheets, TTL-throttled) — closes the queue-vs-manual race.
+        #   2. Cached Manual Bonus validation (MemoryCache only).
         #   3. Daily bonus validation, keyed by the ORIGINAL TRANSACTION
         #      DATE from Google Sheets (never `processed_at`).
         #   4. Submit adjustment.
@@ -2179,12 +2191,15 @@ class Dashboard(QMainWindow):
                     self._finalise_stop()
                 return
 
-        # (2) Latest Manual Bonus validation — BUG-012.
-        # The operator may have added this user to MANUAL BONUS RELOAD
-        # AFTER the queue was refilled. Re-read the list (short TTL) so a
-        # concurrent addition wins before we submit.
-        self._refresh_manual_list_now()
+        # (2) PATCH-12 ultra-fast lane: use the snapshot loaded before this
+        # READY batch.  The operator explicitly accepts that additions made
+        # after queue construction become visible only at the next refill.
+        manual_check_started = time.perf_counter()
         manual_set = self.cache.manual_set()
+        get_telemetry().record_since(
+            "auto.local_manual_check", manual_check_started,
+            tx_id=item.tx_id,
+        )
         from core.source_integrity import canonical_username_key
         if item.username and canonical_username_key(item.username) in manual_set:
             try:
@@ -2208,7 +2223,7 @@ class Dashboard(QMainWindow):
                 return
             self.queue.mark_processed(item, False)
             self.logger.info(
-                f"{item.username}  MANUAL BONUS (fresh-check) - skipped"
+                f"{item.username}  MANUAL BONUS (cached) - skipped"
             )
             self._refresh_stats()
             if self.stop_requested:
@@ -2333,6 +2348,7 @@ class Dashboard(QMainWindow):
         )
 
         submit_start = time.monotonic()
+        tx_finalized_at: Optional[float] = None
         try:
             result = self.panel.submit_deposit_classified(
                 user_id=item.username,
@@ -2345,6 +2361,7 @@ class Dashboard(QMainWindow):
         except Exception as exc:
             try:
                 self.db.mark_auto_unknown(item.tx_id, str(exc))
+                tx_finalized_at = time.perf_counter()
             except Exception as db_exc:
                 self.logger.error(
                     f"{item.username}  UNKNOWN finalization failed; worker halted: {db_exc}"
@@ -2358,6 +2375,7 @@ class Dashboard(QMainWindow):
             self.current_item = None
             self._refresh_metrics()
             self._refresh_stats()
+            self._last_auto_tx_completed_at = tx_finalized_at
             if self.stop_requested:
                 self._finalise_stop()
             elif (not self.panel.is_alive()
@@ -2374,6 +2392,7 @@ class Dashboard(QMainWindow):
             # gives us a final duplicate barrier via the PRIMARY KEY.
             try:
                 self.db.finalize_auto_success(item.tx_id, outcome)
+                tx_finalized_at = time.perf_counter()
                 self.cache.add_bonus(item.username, item.bonus)
                 self.queue.mark_processed(item, True)
                 self._processed_count += 1
@@ -2400,6 +2419,7 @@ class Dashboard(QMainWindow):
                     item.tx_id, reservation["attempt_id"], outcome,
                     result.detail, result.phase, result.evidence,
                 )
+                tx_finalized_at = time.perf_counter()
             except Exception as exc:
                 self.logger.error(f"{item.username}  FAILED_NOT_SUBMITTED finalization failed; worker halted: {exc}")
                 self.stop_requested = True
@@ -2420,6 +2440,7 @@ class Dashboard(QMainWindow):
                     item.tx_id, result.detail, result.phase, result.evidence,
                     proven_click_crossed=result.click_crossed,
                 )
+                tx_finalized_at = time.perf_counter()
             except Exception as exc:
                 self.logger.error(f"{item.username}  UNKNOWN finalization failed; worker halted: {exc}")
                 self.stop_requested = True
@@ -2444,6 +2465,7 @@ class Dashboard(QMainWindow):
         self.current_item = None
         self._refresh_metrics()
         self._refresh_stats()
+        self._last_auto_tx_completed_at = tx_finalized_at
 
         if self.stop_requested:
             self._finalise_stop()
@@ -2460,6 +2482,10 @@ class Dashboard(QMainWindow):
     def _enter_monitoring(self, reason: str = "Queue empty") -> None:
         """Switch the running worker into a low-noise waiting mode."""
         self.state = "monitoring"
+        # Monitoring breaks READY-to-READY continuity.  The first transaction
+        # after a refill establishes a new telemetry boundary.
+        self._last_auto_tx_completed_at = None
+        self.worker_timer.setInterval(500)
         self._set_dot(self.dot_bot, "warn")
         self.txt_bot.setText("Monitoring")
         self.cur_status.setText("MONITORING")
@@ -2477,6 +2503,7 @@ class Dashboard(QMainWindow):
 
     def _exit_monitoring(self) -> None:
         self.state = "running"
+        self.worker_timer.setInterval(0)
         self._set_dot(self.dot_bot, "ok")
         self.txt_bot.setText("Running")
         self._next_refresh_ts = None

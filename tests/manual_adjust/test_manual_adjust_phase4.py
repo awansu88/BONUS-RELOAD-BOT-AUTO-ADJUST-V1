@@ -320,7 +320,7 @@ class FakeLocator:
     def wait_for(self, **kwargs):
         if self.page.field_failure == self.selector: raise PWTimeout("field")
     def click(self): pass
-    def fill(self, value): self.page.fills[self.selector] = value
+    def fill(self, value, **kwargs): self.page.fills[self.selector] = value
     def count(self): return 0
     def inner_text(self, **kwargs): return self.page.alert
 

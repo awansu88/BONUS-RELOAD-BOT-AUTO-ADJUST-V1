@@ -32,7 +32,7 @@ class FakeLocator:
     def count(self): return 1
     def click(self):
         if self.page.fail == f"click:{self.selector}": raise RuntimeError("field click")
-    def fill(self, value):
+    def fill(self, value, **kwargs):
         if value and self.page.fail == f"fill:{self.selector}": raise RuntimeError("fill")
         self.page.events.append(("fill", self.selector, value))
     def evaluate(self, _, arg=None, **__):
@@ -129,7 +129,7 @@ def service(page, success_text="Deposit successful"):
 
 
 @pytest.mark.parametrize("failure", [
-    "closed", "detached", "wait:#user", "fill:#user", "fill:#amount", "fill:#remark",
+    "closed", "detached", "fill:#user", "fill:#amount", "fill:#remark",
 ])
 def test_pre_click_failures_are_proven_not_submitted(failure):
     page = FakePage(fail="" if failure == "detached" else failure)

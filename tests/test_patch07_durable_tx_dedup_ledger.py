@@ -343,12 +343,8 @@ def test_worker_manual_terminal_write_failure_halts_before_following_tx(
         [worker_row("manual", "alice", 100_000), worker_row("next", "bob", 50_000)],
     )
     manager.refill()
-    fake = None
-
-    def refresh():
-        fake.cache.set_manual({"alice"})
-
-    fake, submissions, finalised = worker_dashboard(db, manager, refresh=refresh)
+    fake, submissions, finalised = worker_dashboard(db, manager)
+    fake.cache.set_manual({"alice"})
     monkeypatch.setattr(db, "insert", lambda *args, **kwargs: (_ for _ in ()).throw(
         sqlite3.OperationalError("ledger write failed")
     ))

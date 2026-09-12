@@ -17,6 +17,7 @@ import pytest
 from core.database import DatabaseService
 from core.memory_cache import MemoryCache
 from core.panel_service import AutoSubmitOutcome, AutoSubmitResult, PanelService
+from core.performance_telemetry import get_telemetry
 from core.queue_manager import QueueManager
 from core.sheet_service import MasterRow
 from core.validator import Validator
@@ -158,7 +159,7 @@ class Locator:
 
     def wait_for(self, **kwargs): self.events.append(("visible", self.selector))
     def click(self): self.events.append(("field-click", self.selector))
-    def fill(self, value): self.events.append(("fill", self.selector, value))
+    def fill(self, value, **kwargs): self.events.append(("fill", self.selector, value))
     def count(self): return 1
     def evaluate(self, _script): return ""
     def select_option(self, **choice): self.events.append(("select", self.selector, choice))
@@ -224,7 +225,8 @@ def worker_dashboard(db, manager, *, panel=None, state="running", refresh=None):
 def run_worker(dashboard):
     mode = SimpleNamespace(MANUAL=object())
     dashboard_method(
-        "_worker_step", {"OperatingMode": mode, "time": __import__("time")}
+        "_worker_step", {"OperatingMode": mode, "time": __import__("time"),
+                         "get_telemetry": get_telemetry, "Optional": __import__("typing").Optional}
     )(dashboard)
 
 
@@ -235,9 +237,9 @@ def test_normal_auto_panel_sequence_and_frozen_defaults():
     significant = [event for event in page.events if event[0] in {"fill", "select", "submit", "wait"}]
     assert significant == [
         ("wait", "#user"),
-        ("fill", "#user", ""), ("fill", "#user", "alice"),
-        ("fill", "#amount", ""), ("fill", "#amount", "5000"),
-        ("fill", "#remark", ""), ("fill", "#remark", "BONUS RELOAD AUTO"),
+        ("fill", "#user", "alice"),
+        ("fill", "#amount", "5000"),
+        ("fill", "#remark", "BONUS RELOAD AUTO"),
         ("select", "#payment", {"label": "Bank Transfer"}),
         ("select", "#currency", {"label": "Indonesia Rupiah"}),
         ("submit", "#submit"), ("wait", "#success"),
@@ -313,19 +315,15 @@ def test_stop_requested_processes_one_boundary_then_finalises(tmp_path):
     db.close()
 
 
-def test_actual_worker_fresh_manual_race_skips_before_submit(tmp_path):
+def test_actual_worker_cached_manual_skips_before_submit(tmp_path):
     db, manager = queue(tmp_path, [row("manual-race", "alice", 100_000)])
     manager.refill()
     refreshes = []
-    fake = None
-
-    def refresh():
-        refreshes.append("fresh")
-        fake.cache.set_manual({"alice"})
-
-    fake, submits, _ = worker_dashboard(db, manager, refresh=refresh)
+    fake, submits, _ = worker_dashboard(
+        db, manager, refresh=lambda: refreshes.append("fresh"))
+    fake.cache.set_manual({"alice"})
     run_worker(fake)
-    assert refreshes == ["fresh"] and submits == []
+    assert refreshes == [] and submits == []
     assert db._conn.execute(
         "SELECT result, bonus FROM processed_transactions WHERE tx_id='manual-race'"
     ).fetchone() == ("MANUAL BONUS", 0)
@@ -352,7 +350,7 @@ def test_actual_worker_revalidates_daily_quota_before_submit(tmp_path):
     refreshes = []
     fake, submits, _ = worker_dashboard(db, manager, refresh=lambda: refreshes.append("fresh"))
     run_worker(fake)
-    assert refreshes == ["fresh"]
+    assert refreshes == []
     assert submits == [{"user_id": "alice", "bonus": 5_000, "remark": "BONUS RELOAD AUTO"}]
     assert db.daily_bonus_for_transaction_date("alice", "2025-08-01") == 10_000
     db.close()

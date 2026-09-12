@@ -200,19 +200,19 @@ def test_bug012_dedup_takes_priority_over_manual(tmp_path):
 
 
 def test_bug012_worker_step_sequence_in_dashboard():
-    """Statically verifies that `_worker_step` in the shipped dashboard
-    code performs the fresh manual-list refresh + uses
-    the AUTO daily exposure primitive — i.e. the code and this test
-    file cannot silently diverge in production."""
+    """PATCH-12 intentionally replaces BUG-012's network preflight with the
+    already-loaded cache while retaining the surrounding validation order."""
     src = (ROOT / "ui" / "dashboard.py").read_text(encoding="utf-8")
-    # dedup must come first, then fresh manual, then transaction-date DB call.
+    # Dedup must come first, then local manual, then transaction-date DB call.
     idx_has_tx = src.find("self.db.has_known_auto_tx(item.tx_id)")
-    idx_fresh = src.find("_refresh_manual_list_now()")
+    worker = src[src.find("def _worker_step"):src.find("def _log_queue_summary")]
+    idx_manual = src.find("manual_set = self.cache.manual_set()", idx_has_tx)
     idx_daily = src.find("daily_bonus_exposure_for_transaction_date")
     # PATCH-02 replaces only the binary panel call with the classified AUTO
     # boundary; the BUG-012 validation ordering remains contractual.
     idx_submit = src.find("self.panel.submit_deposit_classified(")
-    assert 0 < idx_has_tx < idx_fresh < idx_daily < idx_submit, (
+    assert 0 < idx_has_tx < idx_manual < idx_daily < idx_submit, (
         "Validation sequence in _worker_step is not "
-        "has_tx → manual-fresh → daily-bonus-by-tx-date → submit"
+        "has_tx → cached-manual → daily-bonus-by-tx-date → submit"
     )
+    assert "_refresh_manual_list_now()" not in worker
